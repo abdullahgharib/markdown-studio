@@ -40,7 +40,7 @@ codegen-units = 1
 strip = "symbols"
 
 [dev-dependencies]
-zip = "2.2"
+zip = "8.6"
 quick-xml = "0.37"
 criterion = "0.5"
 tempfile = "3"
