@@ -6183,18 +6183,74 @@ fn test_paste_image_png_bytes_inserts_markdown_image_and_respects_reader_guard()
     assert_eq!(created_files.len(), 1);
 }
 
+#[test]
+fn test_open_repo_readme_async_images_and_table_gallery_never_freeze() {
+    let ctx = egui::Context::default();
+    let (_dir, mut app) = new_isolated_app(&ctx);
+    let readme_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md");
+    assert!(readme_path.is_file(), "README.md must exist at repo root");
 
+    app.open_specific_file(&readme_path);
+    app.dispatch_action(&ctx, ToolbarAction::SetViewMode(ViewMode::Wysiwyg));
 
+    let mut t = 1.0_f64;
+    let mut last_out = ui_step(&ctx, &mut app, t, vec![]);
 
+    // Step across frames for up to 3s while >256 KB demo.gif & PNGs decode off-thread
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        t += 0.05;
+        last_out = ui_step(&ctx, &mut app, t, vec![]);
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
 
+    // Remote shields.io badges should render cleanly as compact badge pills, not raw [Image: ...] boxes
+    assert!(
+        !find_rendered_text_shapes(&last_out, "License: AGPL v3").is_empty(),
+        "remote badge alt label should render in badge pill"
+    );
+    assert!(
+        find_rendered_text_shapes(&last_out, "[Image: License: AGPL v3]").is_empty(),
+        "remote badges must not render missing-local-image fallback box"
+    );
 
+    // Switch to Reader mode and scroll down to the Screenshots section & table gallery
+    app.dispatch_action(&ctx, ToolbarAction::SetViewMode(ViewMode::Reader));
+    for _ in 0..8 {
+        t += 0.05;
+        let _ = ui_step(
+            &ctx,
+            &mut app,
+            t,
+            vec![Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -320.0),
+                modifiers: Modifiers::NONE,
+            }],
+        );
+    }
 
+    // Step frames until demo.gif and table PNGs finish off-thread decode (without deadlocking)
+    let img_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut reader_out = ui_step(&ctx, &mut app, t, vec![]);
+    while std::time::Instant::now() < img_deadline
+        && !find_rendered_text_shapes(&reader_out, "Loading ").is_empty()
+    {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        t += 0.05;
+        reader_out = ui_step(&ctx, &mut app, t, vec![]);
+    }
 
-
-
-
-
-
-
-
-
+    assert!(
+        find_rendered_text_shapes(&reader_out, "Loading ").is_empty(),
+        "async images in README.md should finish loading cleanly without hanging"
+    );
+    assert!(
+        find_rendered_text_shapes(&reader_out, "[Image: WYSIWYG Light]").is_empty(),
+        "table gallery local screenshot should render texture, not unavailable placeholder"
+    );
+    assert!(
+        find_rendered_text_shapes(&reader_out, "[Image: Markdown Studio Demo]").is_empty(),
+        "hero demo.gif should render texture, not unavailable placeholder"
+    );
+}

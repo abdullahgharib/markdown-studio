@@ -15,7 +15,7 @@ use caches::{
     evict_oldest_half, hash_inline_runs, CachedMathPreview, EvaluatedTableGrid, GalleyLinkSpan,
     NavTarget, ReaderGalleyCache, TableEvalCache,
 };
-use images::load_cached_image_texture;
+use images::{load_cached_image_state, ImageLoadState};
 
 use crate::document::ast::{is_math_code_info, is_mermaid_code_info};
 use crate::document::calc::{
@@ -5269,6 +5269,7 @@ fn render_doc_block(
                 let table_needles = build_block_search_needles(buf, state, source_lines);
                 let whole_word = state.search_whole_word;
                 let suppress_clicks = state.autoscroll_active;
+                let base_dir_owned = state.base_dir.clone();
                 let galley_cache = &mut state.galley_cache;
                 let large_table = rows.len() > 80;
                 let table_scroll_id = ui.id().with(("md_table_hscroll", source_lines.start));
@@ -5323,6 +5324,8 @@ fn render_doc_block(
                                                 wysiwyg && show_markup,
                                                 read_only,
                                                 suppress_clicks,
+                                                base_dir_owned.as_deref(),
+                                                buf.file_path.as_deref(),
                                                 &table_needles,
                                                 whole_word,
                                                 galley_cache,
@@ -5376,6 +5379,8 @@ fn render_doc_block(
                                                 wysiwyg && show_markup,
                                                 read_only,
                                                 suppress_clicks,
+                                                base_dir_owned.as_deref(),
+                                                buf.file_path.as_deref(),
                                                 &table_needles,
                                                 whole_word,
                                                 galley_cache,
@@ -6154,78 +6159,287 @@ fn render_runs_with_images(
             }
         };
 
-        for run in runs {
-            if let Some(ref url) = run.image_url {
+        let mut img_action: Option<ReaderAction> = None;
+        let mut idx = 0;
+        while idx < runs.len() {
+            if let Some(ref url) = runs[idx].image_url {
                 if !text_chunk.is_empty() {
                     flush_text_chunk(ui, &text_chunk);
                     text_chunk.clear();
                 }
 
-                if let Some(tex) =
-                    load_cached_image_texture(ui.ctx(), url, base_dir, buf.file_path.as_deref())
-                {
-                    let [tw, th] = tex.size();
-                    let max_w = content_w.clamp(80.0, 640.0);
-                    let max_h = 420.0_f32;
-                    let mut draw_w = tw as f32;
-                    let mut draw_h = th as f32;
-                    if draw_w > max_w {
-                        let scale = max_w / draw_w;
-                        draw_w *= scale;
-                        draw_h *= scale;
+                if is_remote_image_url(url) {
+                    let group_start = idx;
+                    let mut group_end = idx + 1;
+                    let mut scan = group_end;
+                    while scan < runs.len() {
+                        if let Some(ref next_url) = runs[scan].image_url {
+                            if is_remote_image_url(next_url) {
+                                group_end = scan + 1;
+                                scan += 1;
+                                continue;
+                            }
+                            break;
+                        }
+                        if !runs[scan].is_math && runs[scan].text.trim().is_empty() {
+                            scan += 1;
+                            continue;
+                        }
+                        break;
                     }
-                    if draw_h > max_h {
-                        let scale = max_h / draw_h;
-                        draw_w *= scale;
-                        draw_h *= scale;
-                    }
-                    egui::Frame::new()
-                        .fill(theme.paper_bg)
-                        .stroke(Stroke::new(1.0_f32, theme.border))
-                        .corner_radius(CornerRadius::same(6))
-                        .inner_margin(egui::Margin::same(4))
-                        .show(ui, |ui| {
-                            ui.image((tex.id(), Vec2::new(draw_w, draw_h)));
-                        });
-                    if !run.text.is_empty() {
-                        ui.label(
-                            RichText::new(&run.text)
-                                .size(11.5)
-                                .italics()
-                                .color(theme.text_muted),
-                        );
-                    }
-                    if show_inline_markup {
-                        ui.label(
-                            RichText::new(format!("![{}]({})", run.text, url))
-                                .monospace()
-                                .size(11.0)
-                                .color(theme.accent),
-                        );
-                    }
-                } else {
-                    egui::Frame::new()
-                        .fill(theme.code_bg)
-                        .stroke(Stroke::new(1.0_f32, theme.border))
-                        .corner_radius(CornerRadius::same(6))
-                        .inner_margin(egui::Margin::symmetric(12, 8))
-                        .show(ui, |ui| {
-                            let caption = if run.text.is_empty() {
-                                format!("[Image: {url}]")
-                            } else {
-                                format!("[Image: {}] ({url})", run.text)
-                            };
-                            ui.label(RichText::new(caption).size(12.5).color(theme.text_muted));
-                        });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                        for (offset, badge_run) in runs[group_start..group_end].iter().enumerate() {
+                            if let Some(ref badge_url) = badge_run.image_url {
+                                if let Some(act) = render_remote_badge_pill(
+                                    ui,
+                                    badge_run,
+                                    badge_url,
+                                    group_start + offset,
+                                    theme,
+                                    show_inline_markup,
+                                    read_only,
+                                    suppress_clicks,
+                                    cmd_down,
+                                ) {
+                                    img_action = Some(act);
+                                }
+                            }
+                        }
+                    });
+                    idx = group_end;
+                    continue;
+                }
+
+                if let Some(act) = render_image_run(
+                    ui,
+                    &runs[idx],
+                    url,
+                    idx,
+                    content_w.clamp(80.0, 640.0),
+                    420.0_f32,
+                    true,
+                    show_inline_markup,
+                    base_dir,
+                    buf.file_path.as_deref(),
+                    theme,
+                    read_only,
+                    suppress_clicks,
+                    cmd_down,
+                ) {
+                    img_action = Some(act);
                 }
             } else {
-                text_chunk.push(run.clone());
+                text_chunk.push(runs[idx].clone());
             }
+            idx += 1;
         }
 
         flush_text_chunk(ui, &text_chunk);
+        drop(flush_text_chunk);
+        if let Some(act) = img_action {
+            outcome = RunsClickOutcome::Action(act);
+        }
     });
     RunsRenderResult { outcome, hitboxes }
+}
+
+fn is_remote_image_url(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+fn image_run_nav_target(link_url: Option<&str>, fallback_url: Option<&str>) -> Option<NavTarget> {
+    let raw = link_url.or(fallback_url)?.trim();
+    let classified = classify_link_url(raw)?;
+    Some(NavTarget::Link(raw.to_string(), classified))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_remote_badge_pill(
+    ui: &mut egui::Ui,
+    run: &InlineRun,
+    url: &str,
+    run_idx: usize,
+    theme: &WordTheme,
+    show_inline_markup: bool,
+    read_only: bool,
+    suppress_clicks: bool,
+    cmd_down: bool,
+) -> Option<ReaderAction> {
+    let label_text = if !run.text.trim().is_empty() {
+        run.text.trim().to_string()
+    } else {
+        url.trim()
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .split('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("Remote Badge")
+            .to_string()
+    };
+
+    let nav_target = image_run_nav_target(run.link_url.as_deref(), Some(url));
+    let btn = egui::Button::new(
+        RichText::new(&label_text)
+            .size(11.5)
+            .strong()
+            .color(theme.accent),
+    )
+    .fill(theme.accent_soft)
+    .stroke(Stroke::new(1.0_f32, theme.border))
+    .corner_radius(CornerRadius::same(10));
+    let resp = ui.add(btn);
+
+    let mut action = None;
+    if let Some(ref target) = nav_target {
+        if resp.hovered() {
+            let tip = nav_target_tooltip(target, read_only);
+            show_link_hover_tooltip(ui, resp.id.with(("badge_tip", run_idx)), &tip);
+            if !suppress_clicks && (read_only || cmd_down) {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+        }
+        if !suppress_clicks && (read_only || cmd_down) && resp.clicked() {
+            action = Some(nav_target_action(target));
+        }
+    }
+
+    if show_inline_markup {
+        ui.label(
+            RichText::new(format!("![{}]({})", run.text, url))
+                .monospace()
+                .size(11.0)
+                .color(theme.accent),
+        );
+    }
+    action
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_image_run(
+    ui: &mut egui::Ui,
+    run: &InlineRun,
+    url: &str,
+    run_idx: usize,
+    max_w: f32,
+    max_h: f32,
+    show_caption: bool,
+    show_inline_markup: bool,
+    base_dir: Option<&Path>,
+    doc_path: Option<&Path>,
+    theme: &WordTheme,
+    read_only: bool,
+    suppress_clicks: bool,
+    cmd_down: bool,
+) -> Option<ReaderAction> {
+    if is_remote_image_url(url) {
+        return render_remote_badge_pill(
+            ui,
+            run,
+            url,
+            run_idx,
+            theme,
+            show_inline_markup,
+            read_only,
+            suppress_clicks,
+            cmd_down,
+        );
+    }
+
+    let mut action = None;
+    match load_cached_image_state(ui.ctx(), url, base_dir, doc_path) {
+        ImageLoadState::Loaded(tex) => {
+            let [tw, th] = tex.size();
+            let mut draw_w = tw.max(1) as f32;
+            let mut draw_h = th.max(1) as f32;
+            if draw_w > max_w {
+                let scale = max_w / draw_w;
+                draw_w *= scale;
+                draw_h *= scale;
+            }
+            if draw_h > max_h {
+                let scale = max_h / draw_h;
+                draw_w *= scale;
+                draw_h *= scale;
+            }
+            let frame_resp = egui::Frame::new()
+                .fill(theme.paper_bg)
+                .stroke(Stroke::new(1.0_f32, theme.border))
+                .corner_radius(CornerRadius::same(6))
+                .inner_margin(egui::Margin::same(4))
+                .show(ui, |ui| ui.image((tex.id(), Vec2::new(draw_w, draw_h))));
+
+            if let Some(target) = image_run_nav_target(run.link_url.as_deref(), None) {
+                let click_resp = frame_resp.inner.interact(Sense::click());
+                if click_resp.hovered() {
+                    let tip = nav_target_tooltip(&target, read_only);
+                    show_link_hover_tooltip(ui, click_resp.id.with(("img_link", run_idx)), &tip);
+                    if !suppress_clicks && (read_only || cmd_down) {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                }
+                if !suppress_clicks && (read_only || cmd_down) && click_resp.clicked() {
+                    action = Some(nav_target_action(&target));
+                }
+            } else if !run.text.is_empty() && !show_caption && frame_resp.inner.hovered() {
+                show_link_hover_tooltip(
+                    ui,
+                    frame_resp.inner.id.with(("img_alt", run_idx)),
+                    &run.text,
+                );
+            }
+
+            if show_caption && !run.text.is_empty() {
+                ui.label(
+                    RichText::new(&run.text)
+                        .size(11.5)
+                        .italics()
+                        .color(theme.text_muted),
+                );
+            }
+            if show_inline_markup {
+                ui.label(
+                    RichText::new(format!("![{}]({})", run.text, url))
+                        .monospace()
+                        .size(11.0)
+                        .color(theme.accent),
+                );
+            }
+        }
+        ImageLoadState::Loading => {
+            egui::Frame::new()
+                .fill(theme.code_bg)
+                .stroke(Stroke::new(1.0_f32, theme.border))
+                .corner_radius(CornerRadius::same(6))
+                .inner_margin(egui::Margin::symmetric(10, 6))
+                .show(ui, |ui| {
+                    let label = if run.text.trim().is_empty() {
+                        format!("Loading image ({url})...")
+                    } else {
+                        format!("Loading {}...", run.text.trim())
+                    };
+                    ui.label(RichText::new(label).size(12.0).color(theme.text_muted));
+                });
+        }
+        ImageLoadState::Unavailable => {
+            egui::Frame::new()
+                .fill(theme.code_bg)
+                .stroke(Stroke::new(1.0_f32, theme.border))
+                .corner_radius(CornerRadius::same(6))
+                .inner_margin(egui::Margin::symmetric(12, 8))
+                .show(ui, |ui| {
+                    let caption = if run.text.is_empty() {
+                        format!("[Image: {url}]")
+                    } else {
+                        format!("[Image: {}] ({url})", run.text)
+                    };
+                    ui.label(RichText::new(caption).size(12.5).color(theme.text_muted));
+                });
+        }
+    }
+    action
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6241,6 +6455,8 @@ fn render_table_cell(
     show_inline_markup: bool,
     read_only: bool,
     suppress_clicks: bool,
+    base_dir: Option<&Path>,
+    doc_path: Option<&Path>,
     search_needles: &[(String, bool)],
     whole_word: bool,
     galley_cache: &mut ReaderGalleyCache,
@@ -6274,6 +6490,78 @@ fn render_table_cell(
         } else {
             theme.text_primary
         };
+        if eval_text.is_none() && runs.iter().any(|r| r.image_url.is_some()) {
+            let max_img_w = (col_w - 8.0).max(40.0);
+            let mut text_chunk: Vec<InlineRun> = Vec::new();
+            let flush_cell_text = |ui: &mut egui::Ui, chunk: &[InlineRun]| -> Option<ReaderAction> {
+                if chunk.is_empty() || chunk.iter().all(|r| r.text.trim().is_empty()) {
+                    return None;
+                }
+                let (mut job, link_spans) = build_runs_layout_job(
+                    chunk,
+                    13.5,
+                    1.32,
+                    is_header,
+                    color,
+                    cell_dir,
+                    theme,
+                    show_inline_markup,
+                    None,
+                    search_needles,
+                    whole_word,
+                );
+                job.halign = egui_align;
+                job.wrap.max_width = col_w;
+                let galley = ui.fonts(|f| f.layout_job(job));
+                let mut dummy_hitboxes = Vec::new();
+                match present_galley_text_chunk(
+                    ui,
+                    galley,
+                    Arc::new(link_spans),
+                    src_lines,
+                    true,
+                    read_only,
+                    suppress_clicks,
+                    cmd_down,
+                    &mut dummy_hitboxes,
+                ) {
+                    RunsClickOutcome::Action(a) => Some(a),
+                    RunsClickOutcome::None => None,
+                }
+            };
+            for (idx, run) in runs.iter().enumerate() {
+                if let Some(ref url) = run.image_url {
+                    if let Some(a) = flush_cell_text(ui, &text_chunk) {
+                        cell_action = Some(a);
+                    }
+                    text_chunk.clear();
+                    if let Some(a) = render_image_run(
+                        ui,
+                        run,
+                        url,
+                        idx,
+                        max_img_w,
+                        220.0_f32,
+                        false,
+                        show_inline_markup,
+                        base_dir,
+                        doc_path,
+                        theme,
+                        read_only,
+                        suppress_clicks,
+                        cmd_down,
+                    ) {
+                        cell_action = Some(a);
+                    }
+                } else {
+                    text_chunk.push(run.clone());
+                }
+            }
+            if let Some(a) = flush_cell_text(ui, &text_chunk) {
+                cell_action = Some(a);
+            }
+            return;
+        }
         if eval_text.is_none() && runs.iter().any(|r| r.is_math) {
             let mut dummy_hitboxes = Vec::new();
             let outcome = render_inline_math_wrapped_runs(
@@ -7206,5 +7494,57 @@ mod tests {
         assert!(cache.len() >= TableEvalCache::MAX_ENTRIES / 2);
         assert!(cache.get(0).is_some(), "hot entry must survive LRU eviction");
         assert!(cache.get(9999).is_some(), "newly inserted entry must be present");
+    }
+
+    #[test]
+    fn async_large_image_load_completes_without_deadlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let large_path = dir.path().join("large_async.png");
+        // Pseudo-random pixels resist PNG DEFLATE compression so file_len > 256 KB
+        let mut img = image::RgbaImage::new(512, 512);
+        let mut seed: u32 = 0x1234_5678;
+        for px in img.pixels_mut() {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            let r = (seed >> 24) as u8;
+            let g = (seed >> 16) as u8;
+            let b = (seed >> 8) as u8;
+            *px = image::Rgba([r, g, b, 255]);
+        }
+        img.save(&large_path).unwrap();
+        let file_len = std::fs::metadata(&large_path).unwrap().len();
+        assert!(
+            file_len > 256 * 1024,
+            "test fixture must exceed async threshold, got {file_len} bytes"
+        );
+
+        let ctx = egui::Context::default();
+        let url = large_path.to_str().unwrap();
+        let mut first_was_loading = false;
+        let mut loaded_size = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            let mut state_out = ImageLoadState::Unavailable;
+            let _ = ctx.run(Default::default(), |ctx| {
+                state_out = load_cached_image_state(ctx, url, None, None);
+            });
+            match state_out {
+                ImageLoadState::Loading => {
+                    first_was_loading = true;
+                }
+                ImageLoadState::Loaded(tex) => {
+                    loaded_size = Some(tex.size());
+                    break;
+                }
+                ImageLoadState::Unavailable => {}
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        assert!(first_was_loading, "large image must enqueue on async pool");
+        assert_eq!(
+            loaded_size,
+            Some([512, 512]),
+            "async worker result must upload texture without deadlocking"
+        );
     }
 }

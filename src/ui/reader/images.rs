@@ -142,18 +142,37 @@ impl ImageDecodePool {
     }
 }
 
-pub(super) fn load_cached_image_texture(
+#[derive(Clone)]
+pub(super) enum ImageLoadState {
+    Loaded(TextureHandle),
+    Loading,
+    Unavailable,
+}
+
+enum ImageCachePoll {
+    Miss,
+    Ready {
+        state: ImageLoadState,
+        need_stat_check: bool,
+    },
+    DecodedFromWorker {
+        key_str: String,
+        color_image: Option<ColorImage>,
+    },
+}
+
+pub(super) fn load_cached_image_state(
     ctx: &egui::Context,
     url: &str,
     base_dir: Option<&Path>,
     doc_path: Option<&Path>,
-) -> Option<TextureHandle> {
+) -> ImageLoadState {
     let trimmed = url.trim();
     if trimmed.starts_with("http://")
         || trimmed.starts_with("https://")
         || trimmed.starts_with("data:")
     {
-        return None;
+        return ImageLoadState::Unavailable;
     }
     let key = (
         trimmed.to_string(),
@@ -165,49 +184,95 @@ pub(super) fn load_cached_image_texture(
     const STAT_TTL: Duration = Duration::from_secs(2);
     const ASYNC_IMAGE_BYTES_THRESHOLD: u64 = 256 * 1024;
 
-    // 1) Fast path: return cached texture without filesystem syscalls within STAT_TTL
-    let need_stat_check = ctx.data_mut(|d| {
+    // 1) Fast path: poll cache state without holding `ctx.data_mut` while calling `ctx.load_texture`
+    let poll = ctx.data_mut(|d| {
         let cache = d.get_temp_mut_or_default::<ImageTextureCache>(cache_id);
         cache.tick = cache.tick.wrapping_add(1);
         let cur_tick = cache.tick;
         let Some(entry) = cache.entries.get_mut(&key) else {
-            return Err(());
+            return ImageCachePoll::Miss;
         };
         entry.last_tick = cur_tick;
         if let Some(rx_arc) = entry.loading_rx.clone() {
             let recv_res = rx_arc.lock().map(|rx| rx.try_recv());
             match recv_res {
                 Ok(Ok(img_opt)) => {
-                    if let Some(color_image) = img_opt {
-                        let key_str = entry.resolved_path.to_string_lossy().to_string();
-                        entry.texture = Some(ctx.load_texture(
-                            key_str,
-                            color_image,
-                            egui::TextureOptions::LINEAR,
-                        ));
-                    } else {
-                        entry.texture = None;
-                    }
                     entry.loading_rx = None;
+                    let key_str = entry.resolved_path.to_string_lossy().to_string();
+                    return ImageCachePoll::DecodedFromWorker {
+                        key_str,
+                        color_image: img_opt,
+                    };
                 }
-                Ok(Err(mpsc::TryRecvError::Empty)) => {}
+                Ok(Err(mpsc::TryRecvError::Empty)) => {
+                    let state = match &entry.texture {
+                        Some(tex) => ImageLoadState::Loaded(tex.clone()),
+                        None => ImageLoadState::Loading,
+                    };
+                    return ImageCachePoll::Ready {
+                        state,
+                        need_stat_check: false,
+                    };
+                }
                 Ok(Err(mpsc::TryRecvError::Disconnected)) | Err(_) => {
                     // Reset stat timestamp so a dropped/evicted queue job retries when visible again
                     entry.loading_rx = None;
                     entry.last_stat_check = None;
                     entry.mtime = None;
+                    let state = match &entry.texture {
+                        Some(tex) => ImageLoadState::Loaded(tex.clone()),
+                        None => ImageLoadState::Unavailable,
+                    };
+                    return ImageCachePoll::Ready {
+                        state,
+                        need_stat_check: false,
+                    };
                 }
             }
-            return Ok((false, entry.texture.clone()));
         }
         let fresh = entry
             .last_stat_check
             .is_some_and(|t| now.saturating_duration_since(t) < STAT_TTL);
-        Ok((!fresh, entry.texture.clone()))
+        let state = match &entry.texture {
+            Some(tex) => ImageLoadState::Loaded(tex.clone()),
+            None => ImageLoadState::Unavailable,
+        };
+        ImageCachePoll::Ready {
+            state,
+            need_stat_check: !fresh,
+        }
     });
 
-    if let Ok((false, tex)) = need_stat_check {
-        return tex;
+    match poll {
+        ImageCachePoll::DecodedFromWorker {
+            key_str,
+            color_image,
+        } => {
+            // Upload texture OUTSIDE `ctx.data_mut` to avoid re-entrant egui Context RwLock deadlock
+            let tex = color_image
+                .map(|img| ctx.load_texture(key_str, img, egui::TextureOptions::LINEAR));
+            ctx.data_mut(|d| {
+                let cache = d.get_temp_mut_or_default::<ImageTextureCache>(cache_id);
+                if let Some(entry) = cache.entries.get_mut(&key) {
+                    entry.texture = tex.clone();
+                }
+            });
+            return match tex {
+                Some(t) => ImageLoadState::Loaded(t),
+                None => ImageLoadState::Unavailable,
+            };
+        }
+        ImageCachePoll::Ready {
+            state,
+            need_stat_check: false,
+        } => {
+            return state;
+        }
+        ImageCachePoll::Ready {
+            need_stat_check: true,
+            ..
+        }
+        | ImageCachePoll::Miss => {}
     }
 
     // 2) Miss or TTL expired: resolve path & check mtime once
@@ -216,30 +281,38 @@ pub(super) fn load_cached_image_texture(
     let mtime = meta.as_ref().and_then(|m| m.modified().ok());
     let file_len = meta.as_ref().map(|m| m.len()).unwrap_or(0);
 
-    let unchanged_tex = ctx.data_mut(|d| {
+    let unchanged_state = ctx.data_mut(|d| {
         let cache = d.get_temp_mut_or_default::<ImageTextureCache>(cache_id);
         if let Some(entry) = cache.entries.get_mut(&key) {
             if entry.resolved_path == resolved && entry.mtime == mtime {
                 entry.last_stat_check = Some(now);
-                return Some(entry.texture.clone());
+                return Some(match &entry.texture {
+                    Some(tex) => ImageLoadState::Loaded(tex.clone()),
+                    None if entry.loading_rx.is_some() => ImageLoadState::Loading,
+                    None => ImageLoadState::Unavailable,
+                });
             }
         }
         None
     });
-    if let Some(tex) = unchanged_tex {
-        return tex;
+    if let Some(state) = unchanged_state {
+        return state;
     }
 
     // 3) Decode small images synchronously (zero frame delay) and large images via bounded worker pool
-    let (loaded_tex, pending_rx) = if file_len <= ASYNC_IMAGE_BYTES_THRESHOLD {
+    let (loaded_tex, pending_rx, result_state) = if file_len <= ASYNC_IMAGE_BYTES_THRESHOLD {
         let tex = decode_color_image(&resolved).map(|color_image| {
             let key_str = resolved.to_string_lossy().to_string();
             ctx.load_texture(key_str, color_image, egui::TextureOptions::LINEAR)
         });
-        (tex, None)
+        let state = match &tex {
+            Some(t) => ImageLoadState::Loaded(t.clone()),
+            None => ImageLoadState::Unavailable,
+        };
+        (tex, None, state)
     } else {
         let rx = ImageDecodePool::global().enqueue(resolved.clone(), ctx.clone());
-        (None, Some(Arc::new(Mutex::new(rx))))
+        (None, Some(Arc::new(Mutex::new(rx))), ImageLoadState::Loading)
     };
 
     ctx.data_mut(|d| {
@@ -262,11 +335,24 @@ pub(super) fn load_cached_image_texture(
                 resolved_path: resolved,
                 last_stat_check: Some(now),
                 mtime,
-                texture: loaded_tex.clone(),
+                texture: loaded_tex,
                 loading_rx: pending_rx,
                 last_tick: t,
             },
         );
     });
-    loaded_tex
+    result_state
+}
+
+#[allow(dead_code)]
+pub(super) fn load_cached_image_texture(
+    ctx: &egui::Context,
+    url: &str,
+    base_dir: Option<&Path>,
+    doc_path: Option<&Path>,
+) -> Option<TextureHandle> {
+    match load_cached_image_state(ctx, url, base_dir, doc_path) {
+        ImageLoadState::Loaded(tex) => Some(tex),
+        ImageLoadState::Loading | ImageLoadState::Unavailable => None,
+    }
 }

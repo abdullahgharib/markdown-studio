@@ -5,6 +5,14 @@ For architecture, features, shortcuts, and build instructions, see [README.md](R
 
 ---
 
+### `v0.7.10` (2026-11-22) — Fix Async Image Deadlock, Table Cell Images & Remote Badge Pills
+- **Async Image Loading Deadlock Fix (`src/ui/reader/images.rs`)**:
+  - Fixed a UI freeze/deadlock when opening documents containing images `> 256 KB` (such as animated GIFs or high-res PNGs): moved `ctx.load_texture(...)` outside `ctx.data_mut(|d| ...)` using `ImageLoadState::{Loaded, Loading, Unavailable}` (`load_cached_image_state`) so worker-decoded textures upload without re-entering `egui::Context`'s `RwLock`.
+- **GFM Table Cell Images & Remote Badge UX (`src/ui/reader/mod.rs`)**:
+  - Added native scaled image rendering inside `render_table_cell` (e.g., side-by-side image galleries in Markdown tables) using a shared `render_image_run` helper.
+  - Grouped consecutive remote `http(s)://` badge images (`shields.io`, GitHub CI badges) into wrapping horizontal rows of clickable badge pills (`render_remote_badge_pill`) and added a subtle `"Loading ..."` placeholder while large local images decode asynchronously.
+- **Verification**: Full test suite passes (**173 tests**: `84` unit, `14` export, `11` roundtrip, `64` UI integration) with **0 Clippy warnings** (`cargo clippy --all-targets -- -D warnings`).
+
 ### `v0.7.9` (2026-11-22) — Performance Pack, Reader Modularization, Bug Fixes, PDF Headers/Footers, External Diff Modal & Clipboard Image Paste
 - **Performance & Memory Efficiency Pack (`src/document/search.rs`, `src/document/viewport.rs`, `src/document/ast.rs`, `src/document/mod.rs`, `benches/editor_bench.rs`)**:
   - Added zero-full-copy streaming ASCII case-insensitive literal search (`find_all_literal_ci_ascii_streaming` with SIMD `memchr::memchr2`) and line-by-line single-line regex streaming (`find_all_regex_streaming_lines` for scopes `>= 256 KB`), eliminating full-buffer heap string copies during Find/Replace.
