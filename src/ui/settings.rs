@@ -154,10 +154,9 @@ impl AppSettings {
         }
         let mut migrated = Self::load_from(legacy_path);
         if let Some(ref exe) = migrated.custom_exe_path {
-            let is_legacy_exe = exe
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.eq_ignore_ascii_case("Markdown Word Studio.exe"));
+            let exe_str = exe.to_string_lossy();
+            let file_name = exe_str.rsplit(['/', '\\']).next().unwrap_or("");
+            let is_legacy_exe = file_name.eq_ignore_ascii_case("Markdown Word Studio.exe");
             if is_legacy_exe && !exe.exists() {
                 migrated.custom_exe_path = None;
             }

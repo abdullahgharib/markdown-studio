@@ -4574,6 +4574,7 @@ fn core_fonts() -> &'static FontDefinitions {
         for path in [
             r"C:\Windows\Fonts\segoeui.ttf",
             "/System/Library/Fonts/Supplemental/Arial.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         ] {
             if let Ok(bytes) = std::fs::read(path) {
@@ -4618,6 +4619,19 @@ fn core_fonts() -> &'static FontDefinitions {
                 break;
             }
         }
+        for path in [
+            "/System/Library/Fonts/ZapfDingbats.ttf",
+            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+            "/System/Library/Fonts/LucidaGrande.ttc",
+        ] {
+            if let Ok(bytes) = std::fs::read(path) {
+                fonts
+                    .font_data
+                    .insert("system_dingbats".to_owned(), FontData::from_owned(bytes).into());
+                extra_fallbacks.push("system_dingbats".to_owned());
+                break;
+            }
+        }
 
         if let Some(list) = fonts.families.get_mut(&FontFamily::Proportional) {
             let insert_at = usize::from(reg_inserted).min(list.len());
@@ -4631,6 +4645,7 @@ fn core_fonts() -> &'static FontDefinitions {
             r"C:\Windows\Fonts\CascadiaMono.ttf",
             r"C:\Windows\Fonts\consola.ttf",
             "/System/Library/Fonts/Menlo.ttc",
+            "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
         ] {
             if let Ok(bytes) = std::fs::read(path) {
@@ -4663,6 +4678,7 @@ fn core_fonts() -> &'static FontDefinitions {
             r"C:\Windows\Fonts\segoeuib.ttf",
             r"C:\Windows\Fonts\arialbd.ttf",
             "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         ] {
             if let Ok(bytes) = std::fs::read(path) {

@@ -5,6 +5,14 @@ For architecture, features, shortcuts, and build instructions, see [README.md](R
 
 ---
 
+### `v0.7.14` (2026-11-22) — Linux Font Metrics, macOS Checkmark Glyph & Unix Migration Fix
+- **Cross-Platform Legacy Exe Path Detection (`src/ui/settings.rs`)**:
+  - Updated `AppSettings::migrate_legacy_settings_if_needed` to split `custom_exe_path` on both `/` and `\` so legacy Windows paths (`Markdown Word Studio.exe`) are detected and cleaned reliably on Linux and macOS.
+- **Linux Liberation Font Metrics & CI Packaging (`src/ui/mod.rs`, `src/document/math.rs`, `.github/workflows/ci.yml`, `.github/workflows/release.yml`, `README.md`, `CONTRIBUTING.md`)**:
+  - Prioritized `LiberationSans-Regular.ttf`, `LiberationSans-Bold.ttf`, and `LiberationMono-Regular.ttf` before DejaVu fallbacks on Linux and added `fonts-liberation` to Linux setup instructions and CI workflows so toolbar spacing matches Windows metrics and avoids unexpected multi-row wrapping.
+- **macOS Checkmark Glyph Fallback (`src/ui/mod.rs`, `src/document/math.rs`)**:
+  - Added `/System/Library/Fonts/ZapfDingbats.ttf`, `Arial Unicode.ttf`, and `LucidaGrande.ttc` (`system_dingbats` / `offscreen_dingbats`) fallbacks so `'✓'` (`U+2713`) and UI chrome symbols render reliably on macOS.
+
 ### `v0.7.13` (2026-11-22) — Cross-Platform CI & macOS Symbol Font Fixes
 - **Ubuntu 24.04 (`ubuntu-latest`) CI & Linux Packaging Fix (`.github/workflows/ci.yml`, `.github/workflows/release.yml`, `README.md`, `CONTRIBUTING.md`)**:
   - Updated `libgdk-pixbuf2.0-dev` to `libgdk-pixbuf-2.0-dev` for Ubuntu 24.04 compatibility and added `fonts-dejavu-core` so DejaVu system fonts are present on headless Linux runners.

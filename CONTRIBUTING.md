@@ -41,7 +41,8 @@ sudo apt-get install -y \
   libgdk-pixbuf-2.0-dev \
   libpango1.0-dev \
   libcairo2-dev \
-  fonts-dejavu-core
+  fonts-dejavu-core \
+  fonts-liberation
 ```
 
 #### macOS

@@ -7,7 +7,7 @@
 [![Platforms](https://img.shields.io/badge/Platforms-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#installation)
 [![CI](https://github.com/abdullahgharib/markdown-studio/actions/workflows/ci.yml/badge.svg)](https://github.com/abdullahgharib/markdown-studio/actions/workflows/ci.yml)
 
-**Current Version:** `0.7.13` (`markdown_studio`)
+**Current Version:** `0.7.14` (`markdown_studio`)
 
 ---
 
@@ -103,7 +103,7 @@ sudo apt-get update
 sudo apt-get install -y \
   libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
   libxkbcommon-dev libssl-dev libgtk-3-dev libatk1.0-dev \
-  libgdk-pixbuf-2.0-dev libpango1.0-dev libcairo2-dev fonts-dejavu-core
+  libgdk-pixbuf-2.0-dev libpango1.0-dev libcairo2-dev fonts-dejavu-core fonts-liberation
 
 cargo build --release
 # Output: target/release/markdown_studio
@@ -121,7 +121,7 @@ cargo build --release
 ## Documentation & Internals
 
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** — System architecture diagram, core performance invariants, module map, settings schema, environment variables, and Criterion benchmark results.
-- **[changelog.md](changelog.md)** — Full version history (`v0.1.0` through `v0.7.13`).
+- **[changelog.md](changelog.md)** — Full version history (`v0.1.0` through `v0.7.14`).
 - **[CONTRIBUTING.md](CONTRIBUTING.md)** — Development setup, testing commands, and pull request guidelines.
 
 ---
