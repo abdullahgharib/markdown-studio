@@ -7,7 +7,7 @@
 [![Platforms](https://img.shields.io/badge/Platforms-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#installation)
 [![CI](https://github.com/abdullahgharib/markdown-studio/actions/workflows/ci.yml/badge.svg)](https://github.com/abdullahgharib/markdown-studio/actions/workflows/ci.yml)
 
-**Current Version:** `0.7.9` (`markdown_studio`)
+**Current Version:** `0.7.10` (`markdown_studio`)
 
 ---
 
@@ -120,7 +120,7 @@ cargo build --release
 ## Documentation & Internals
 
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** — System architecture diagram, core performance invariants, module map, settings schema, environment variables, and Criterion benchmark results.
-- **[changelog.md](changelog.md)** — Full version history (`v0.1.0` through `v0.7.9`).
+- **[changelog.md](changelog.md)** — Full version history (`v0.1.0` through `v0.7.10`).
 - **[CONTRIBUTING.md](CONTRIBUTING.md)** — Development setup, testing commands, and pull request guidelines.
 
 ---
