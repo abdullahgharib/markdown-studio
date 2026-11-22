@@ -13,10 +13,3 @@
 Thumbs.db
 Desktop.ini
 .DS_Store
-
-# Local AI workflow files (excluded from public repo)
-/agents.md
-/context.md
-/cortex.md
-/plan.md
-/history.md

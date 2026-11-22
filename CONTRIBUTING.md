@@ -38,9 +38,10 @@ sudo apt-get install -y \
   libssl-dev \
   libgtk-3-dev \
   libatk1.0-dev \
-  libgdk-pixbuf2.0-dev \
+  libgdk-pixbuf-2.0-dev \
   libpango1.0-dev \
-  libcairo2-dev
+  libcairo2-dev \
+  fonts-dejavu-core
 ```
 
 #### macOS

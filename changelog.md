@@ -5,6 +5,14 @@ For architecture, features, shortcuts, and build instructions, see [README.md](R
 
 ---
 
+### `v0.7.13` (2026-11-22) — Cross-Platform CI & macOS Symbol Font Fixes
+- **Ubuntu 24.04 (`ubuntu-latest`) CI & Linux Packaging Fix (`.github/workflows/ci.yml`, `.github/workflows/release.yml`, `README.md`, `CONTRIBUTING.md`)**:
+  - Updated `libgdk-pixbuf2.0-dev` to `libgdk-pixbuf-2.0-dev` for Ubuntu 24.04 compatibility and added `fonts-dejavu-core` so DejaVu system fonts are present on headless Linux runners.
+- **macOS (`macos-latest`) Symbol & Bold Font Fallbacks (`src/ui/mod.rs`, `src/document/math.rs`)**:
+  - Added `/System/Library/Fonts/Apple Symbols.ttf` and `/System/Library/Fonts/Supplemental/Arial Unicode.ttf` to `system_symbols` / `offscreen_symbols`, plus macOS/Linux fallbacks (`Arial Bold.ttf`, `DejaVuSans-Bold.ttf`) for `system_arabic_bold` so UI chrome glyphs (`✓`, `▾`, `▴`, `▶`, `◀`, `◇`, `∑`, arrows) render reliably across macOS and Linux.
+- **Repository Hygiene (`.gitignore`, `changelog.md`)**:
+  - Removed obsolete documentation bullet and local-only ignore patterns from tracked repository metadata.
+
 ### `v0.7.12` (2026-11-22) — Reader Mode Image Lightbox
 - **Reader Mode Click-to-Enlarge Image Lightbox (`src/ui/reader/mod.rs`, `src/ui/mod.rs`)**:
   - Added `ImageLightboxState` and `render_image_lightbox` so clicking any image in **Reader Mode**—whether inline, inside a GFM table cell, list, or blockquote—opens a dimmed centered inspection modal with native resolution badge, zoom controls (`−`, `%`, `+`, `Fit`, `50%–400%`, keyboard `+`/`-`/`0`), live animated GIF & crisp 2× SVG rendering, optional `"Open Link ↗"` button for linked images (`Ctrl+Click` still opens links directly), and `Esc` / backdrop click dismissal without exiting Focus Mode.
@@ -198,7 +206,6 @@ For architecture, features, shortcuts, and build instructions, see [README.md](R
 - **Undo / Redo History Lists**: Added `[Undo][▾]` and `[Redo][▾]` split buttons with numbered history popups and multi-step jump (`DocumentBuffer::undo_steps` / `redo_steps`, `EditOp::describe`).
 - **Universal Text File Drag-and-Drop & Open Dialog**: Expanded `DocumentBuffer::is_likely_text_file` and `open_file` to support UTF-8, UTF-16 LE/BE, code, config, logs, and extensionless text files while rejecting binary blobs.
 - **Windows Explorer Integration (`src/ui/os_integration.rs`)**: Added per-user (`HKCU\Software\Classes`) registration for **Right-Click -> New -> Markdown Document (.md)** and **Right-Click -> Open with Markdown Word Studio**, plus `OsIntegrationModal` (`OS Menu` button) with configurable `.exe` path (`custom_exe_path`) and startup auto-sync (`auto_sync_exe_path`).
-- **Ground-of-Truth Docs**: Added `context.md`, `agents.md`, and `plan.md`.
 
 ### `v0.2.0` — Link Navigation, PDF Outline Bookmarks, WYSIWYG Code Blocks & Codebase Hardening
 

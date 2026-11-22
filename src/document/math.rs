@@ -324,6 +324,8 @@ fn build_offscreen_font_definitions() -> FontDefinitions {
 
     for path in [
         r"C:\Windows\Fonts\seguisym.ttf",
+        "/System/Library/Fonts/Apple Symbols.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     ] {
         if let Ok(bytes) = std::fs::read(path) {

@@ -1,6 +1,6 @@
 [package]
 name = "markdown_studio"
-version = "0.7.12"
+version = "0.7.13"
 edition = "2021"
 description = "Ultra-fast native desktop Markdown reader and studio editor in Rust"
 license = "AGPL-3.0-or-later"
