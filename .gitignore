@@ -1,0 +1,22 @@
+# Rust build output
+/target/
+**/*.rs.bk
+*.pdb
+
+# Built release binary (rebuild with `cargo build --release`)
+/Markdown Studio.exe
+
+# Editor / OS files
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Local AI workflow files (excluded from public repo)
+/agents.md
+/context.md
+/cortex.md
+/plan.md
+/history.md
