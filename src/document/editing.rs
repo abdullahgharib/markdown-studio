@@ -1309,6 +1309,237 @@ pub fn insert_image(buf: &mut DocumentBuffer, alt: &str, url: &str) {
     }
 }
 
+fn sanitize_markdown_image_alt(raw: &str) -> String {
+    raw.replace(['\r', '\n'], " ")
+        .trim()
+        .replace('\\', "\\\\")
+        .replace('[', "\\[")
+        .replace(']', "\\]")
+}
+
+fn unescape_alt_for_match(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(&next) = chars.peek() {
+                if matches!(next, '\\' | '[' | ']' | '*' | '_' | '`') {
+                    out.push(next);
+                    chars.next();
+                    continue;
+                }
+            }
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn image_dest_matches(raw_dest: &str, target_url: &str) -> bool {
+    fn norm(s: &str) -> &str {
+        s.trim()
+            .trim_start_matches('<')
+            .trim_end_matches('>')
+            .trim()
+    }
+    let a = norm(raw_dest);
+    let b = norm(target_url);
+    a == b || a.replace("%20", " ") == b.replace("%20", " ")
+}
+
+fn find_image_alt_span_in_slice(
+    slice: &str,
+    target_url: &str,
+    old_alt: &str,
+) -> Option<Range<usize>> {
+    let bytes = slice.as_bytes();
+    let len = bytes.len();
+    let mut first_url_match: Option<Range<usize>> = None;
+    let mut i = 0usize;
+
+    while i + 3 < len {
+        if bytes[i] == b'!' && bytes[i + 1] == b'[' {
+            // Skip escaped `\![`
+            let mut bs = 0usize;
+            let mut k = i;
+            while k > 0 && bytes[k - 1] == b'\\' {
+                bs += 1;
+                k -= 1;
+            }
+            if bs % 2 == 1 {
+                i += 1;
+                continue;
+            }
+
+            let alt_start = i + 2;
+            let mut j = alt_start;
+            let mut alt_end = None;
+            while j < len {
+                if bytes[j] == b'\\' && j + 1 < len {
+                    j += 2;
+                    continue;
+                }
+                if bytes[j] == b']' {
+                    alt_end = Some(j);
+                    break;
+                }
+                if bytes[j] == b'\n' {
+                    break;
+                }
+                j += 1;
+            }
+
+            if let Some(ae) = alt_end {
+                if ae + 1 < len && bytes[ae + 1] == b'(' {
+                    let mut p = ae + 2;
+                    while p < len && matches!(bytes[p], b' ' | b'\t') {
+                        p += 1;
+                    }
+                    let (dest_opt, after_dest) = if p < len && bytes[p] == b'<' {
+                        let d_start = p + 1;
+                        let mut q = d_start;
+                        let mut found = None;
+                        while q < len {
+                            if bytes[q] == b'\\' && q + 1 < len {
+                                q += 2;
+                                continue;
+                            }
+                            if bytes[q] == b'>' {
+                                found = Some((&slice[d_start..q], q + 1));
+                                break;
+                            }
+                            if bytes[q] == b'\n' {
+                                break;
+                            }
+                            q += 1;
+                        }
+                        match found {
+                            Some((d, next)) => (Some(d), next),
+                            None => (None, p),
+                        }
+                    } else {
+                        let d_start = p;
+                        let mut q = d_start;
+                        let mut paren_depth = 0usize;
+                        while q < len {
+                            if bytes[q] == b'\\' && q + 1 < len {
+                                q += 2;
+                                continue;
+                            }
+                            if bytes[q] == b'(' {
+                                paren_depth += 1;
+                            } else if bytes[q] == b')' {
+                                if paren_depth == 0 {
+                                    break;
+                                }
+                                paren_depth -= 1;
+                            } else if bytes[q].is_ascii_whitespace() {
+                                break;
+                            }
+                            q += 1;
+                        }
+                        if q > d_start {
+                            (Some(&slice[d_start..q]), q)
+                        } else {
+                            (None, p)
+                        }
+                    };
+
+                    if let Some(dest) = dest_opt {
+                        // Verify closing ')' for the image destination/optional title
+                        let mut close_scan = after_dest;
+                        let mut has_close = false;
+                        while close_scan < len {
+                            if bytes[close_scan] == b'\\' && close_scan + 1 < len {
+                                close_scan += 2;
+                                continue;
+                            }
+                            if bytes[close_scan] == b')' {
+                                has_close = true;
+                                break;
+                            }
+                            if bytes[close_scan] == b'\n' {
+                                break;
+                            }
+                            close_scan += 1;
+                        }
+                        if has_close && image_dest_matches(dest, target_url) {
+                            let raw_alt = &slice[alt_start..ae];
+                            let unescaped = unescape_alt_for_match(raw_alt);
+                            let span = alt_start..ae;
+                            if unescaped == old_alt
+                                || raw_alt == old_alt
+                                || (raw_alt.trim().is_empty() && image_dest_matches(old_alt, target_url))
+                            {
+                                return Some(span);
+                            }
+                            if first_url_match.is_none() {
+                                first_url_match = Some(span);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+
+    first_url_match
+}
+
+/// Updates the alt label of a Markdown image (`![alt](url)` or `![alt](<url>)`) within
+/// `line_range` whose destination matches `image_url`, preserving surrounding links, tables,
+/// titles, and `<...>` destination formatting, and recording a single undoable edit.
+pub fn update_image_alt_text(
+    buf: &mut DocumentBuffer,
+    line_range: &Range<usize>,
+    image_url: &str,
+    old_alt: &str,
+    new_alt: &str,
+) -> bool {
+    let total_lines = buf.len_lines();
+    if total_lines == 0 {
+        return false;
+    }
+    let start_line = line_range.start.min(total_lines);
+    let end_line = line_range.end.min(total_lines);
+    if start_line >= end_line {
+        return false;
+    }
+    let block_start_char = buf.line_to_char(start_line);
+    let block_end_char = if end_line < total_lines {
+        buf.line_to_char(end_line)
+    } else {
+        buf.len_chars()
+    };
+    if block_start_char >= block_end_char {
+        return false;
+    }
+
+    let slice = buf
+        .rope()
+        .slice(block_start_char..block_end_char)
+        .to_string();
+    let Some(byte_span) = find_image_alt_span_in_slice(&slice, image_url, old_alt) else {
+        return false;
+    };
+
+    let sanitized = sanitize_markdown_image_alt(new_alt);
+    if slice[byte_span.clone()] == sanitized {
+        return false;
+    }
+
+    let rel_start_char = slice[..byte_span.start].chars().count();
+    let rel_end_char = rel_start_char + slice[byte_span.start..byte_span.end].chars().count();
+    let abs_start = block_start_char + rel_start_char;
+    let abs_end = block_start_char + rel_end_char;
+
+    buf.break_undo_coalescing();
+    buf.replace_range(abs_start..abs_end, &sanitized);
+    buf.set_cursor(abs_start + sanitized.chars().count(), false);
+    true
+}
+
 /// Inserts a Markdown hyperlink `[text](url)` at the cursor or replaces the active selection.
 pub fn insert_link(buf: &mut DocumentBuffer, text: &str, url: &str) {
     buf.restore_cached_selection();
@@ -1711,5 +1942,51 @@ mod tests {
         let mut buf_only = DocumentBuffer::from_str("$$\nx=1\n$$");
         assert!(delete_block_lines(&mut buf_only, &(0..3)));
         assert_eq!(buf_only.as_string(), "");
+    }
+
+    #[test]
+    fn update_image_alt_text_edits_standalone_linked_table_and_undoes_cleanly() {
+        // 1. Standalone image + undo
+        let mut buf = DocumentBuffer::from_str("# Title\n\n![Old Caption](assets/shot.png \"tip\")\n");
+        assert!(update_image_alt_text(
+            &mut buf,
+            &(2..3),
+            "assets/shot.png",
+            "Old Caption",
+            "New [Caption]",
+        ));
+        assert_eq!(
+            buf.as_string(),
+            "# Title\n\n![New \\[Caption\\]](assets/shot.png \"tip\")\n"
+        );
+        assert!(buf.undo());
+        assert_eq!(
+            buf.as_string(),
+            "# Title\n\n![Old Caption](assets/shot.png \"tip\")\n"
+        );
+
+        // 2. Empty alt fallback (AST sets run.text = url) + <...> path with spaces
+        let mut buf_empty = DocumentBuffer::from_str("![](<assets/my image.png>)");
+        assert!(update_image_alt_text(
+            &mut buf_empty,
+            &(0..1),
+            "assets/my%20image.png",
+            "assets/my%20image.png",
+            "Added Label",
+        ));
+        assert_eq!(buf_empty.as_string(), "![Added Label](<assets/my image.png>)");
+
+        // 3. Linked image inside table row preserves surrounding link & pipe columns
+        let mut buf_tbl = DocumentBuffer::from_str(
+            "| A | B |\n| :--- | :--- |\n| [![Badge](https://example.com/b.svg)](https://example.com) | ![Shot](docs/s.png) |\n",
+        );
+        assert!(update_image_alt_text(
+            &mut buf_tbl,
+            &(0..3),
+            "docs/s.png",
+            "Shot",
+            "Updated Shot",
+        ));
+        assert!(buf_tbl.as_string().contains("| [![Badge](https://example.com/b.svg)](https://example.com) | ![Updated Shot](docs/s.png) |"));
     }
 }
