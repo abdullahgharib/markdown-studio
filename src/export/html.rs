@@ -255,8 +255,8 @@ fn render_block_html(
             out.push_str("</blockquote>\n");
         }
         DocBlock::CodeBlock { info, code, .. } => {
-            if is_mermaid_code_info(info) && !code.trim().is_empty() {
-                if let Some((png_bytes, _, _)) = mermaid::render_mermaid_to_png_bytes(code, 2.0) {
+            if is_mermaid_code_info(info) && !code.trim().is_empty()
+                && let Some((png_bytes, _, _)) = mermaid::render_mermaid_to_png_bytes(code, 2.0) {
                     let b64 = encode_base64(&png_bytes);
                     let _ = writeln!(
                         out,
@@ -264,7 +264,6 @@ fn render_block_html(
                     );
                     return;
                 }
-            }
             if is_math_code_info(info) {
                 let trimmed = code.trim();
                 if trimmed.is_empty() {
@@ -414,8 +413,8 @@ fn render_runs_html(
     known_slugs: &HashSet<String>,
 ) {
     for run in runs {
-        if let Some(ref img_url) = run.image_url {
-            if !is_unsafe_scheme(img_url) {
+        if let Some(ref img_url) = run.image_url
+            && !is_unsafe_scheme(img_url) {
                 let src = resolve_html_image_src(img_url, base_dir);
                 let _ = write!(
                     out,
@@ -425,7 +424,6 @@ fn render_runs_html(
                 );
                 continue;
             }
-        }
 
         if run.is_footnote_ref {
             let name = run.text.trim_matches(|c| matches!(c, '[' | ']' | '^'));
@@ -474,8 +472,8 @@ fn render_runs_html(
             wrapped = format!("<del>{wrapped}</del>");
         }
 
-        if let Some(ref raw_url) = run.link_url {
-            if let Some((href, external)) = classify_html_href(raw_url, known_slugs) {
+        if let Some(ref raw_url) = run.link_url
+            && let Some((href, external)) = classify_html_href(raw_url, known_slugs) {
                 if external {
                     let _ = write!(
                         out,
@@ -491,7 +489,6 @@ fn render_runs_html(
                 }
                 continue;
             }
-        }
 
         out.push_str(&wrapped);
     }

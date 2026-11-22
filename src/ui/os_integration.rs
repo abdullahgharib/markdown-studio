@@ -133,7 +133,7 @@ fn reg_query_value(key: &str, value_name: Option<&str>) -> Option<String> {
 #[cfg(target_os = "windows")]
 fn notify_shell_assoc_changed() {
     #[link(name = "shell32")]
-    extern "system" {
+    unsafe extern "system" {
         fn SHChangeNotify(wEventId: i32, uFlags: u32, dwItem1: *const u8, dwItem2: *const u8);
     }
     const SHCNE_ASSOCCHANGED: i32 = 0x0800_0000;
@@ -559,25 +559,21 @@ impl OsIntegrationModal {
                         .button("Current .exe")
                         .on_hover_text("Use the currently running executable path")
                         .clicked()
-                    {
-                        if let Ok(cur) = std::env::current_exe() {
+                        && let Ok(cur) = std::env::current_exe() {
                             self.exe_path_input = cur.to_string_lossy().to_string();
                             self.feedback = None;
                         }
-                    }
                     if ui
                         .button("Browse...")
                         .on_hover_text("Pick Markdown Studio.exe from disk")
                         .clicked()
-                    {
-                        if let Some(picked) = rfd::FileDialog::new()
+                        && let Some(picked) = rfd::FileDialog::new()
                             .add_filter("Windows Executable", &["exe"])
                             .pick_file()
                         {
                             self.exe_path_input = picked.to_string_lossy().to_string();
                             self.feedback = None;
                         }
-                    }
                 });
 
                 let typed_path = PathBuf::from(self.exe_path_input.trim());

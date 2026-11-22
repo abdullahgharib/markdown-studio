@@ -184,12 +184,12 @@ impl FileExplorerState {
             return;
         };
         match rx.try_recv() {
-            Ok((root, show_hidden, gen, entries, truncated)) => {
+            Ok((root, show_hidden, generation, entries, truncated)) => {
                 self.scan_rx = None;
                 self.scan_in_flight = None;
                 if self.root_dir.as_deref() == Some(root.as_path())
                     && self.show_hidden == show_hidden
-                    && self.scan_gen == gen
+                    && self.scan_gen == generation
                 {
                     self.search_cache = Some((root, show_hidden, entries, truncated));
                     self.filtered_cache = None;
@@ -213,11 +213,10 @@ impl FileExplorerState {
         if self.search_cache_matches(&root) {
             return true;
         }
-        if let Some((in_root, in_hidden, in_gen)) = &self.scan_in_flight {
-            if in_root == &root && *in_hidden == self.show_hidden && *in_gen == self.scan_gen {
+        if let Some((in_root, in_hidden, in_gen)) = &self.scan_in_flight
+            && in_root == &root && *in_hidden == self.show_hidden && *in_gen == self.scan_gen {
                 return false;
             }
-        }
         match scan_tree_with_budget(
             &root,
             self.show_hidden,
@@ -244,16 +243,16 @@ impl FileExplorerState {
         remaining_stack: Vec<(PathBuf, usize)>,
         repaint_ctx: Option<egui::Context>,
     ) {
-        let gen = self.scan_gen;
+        let generation = self.scan_gen;
         let (tx, rx) = mpsc::channel();
         self.scan_rx = Some(rx);
-        self.scan_in_flight = Some((root.clone(), show_hidden, gen));
+        self.scan_in_flight = Some((root.clone(), show_hidden, generation));
         let _ = thread::Builder::new()
             .name("md-explorer-scan".to_string())
             .spawn(move || {
                 let (entries, truncated) =
                     finish_scan_tree(&root, show_hidden, partial_entries, remaining_stack);
-                let _ = tx.send((root, show_hidden, gen, entries, truncated));
+                let _ = tx.send((root, show_hidden, generation, entries, truncated));
                 if let Some(c) = repaint_ctx {
                     c.request_repaint();
                 }
@@ -342,11 +341,10 @@ fn should_skip_entry_name(name: &str, is_dir: bool, show_hidden: bool) -> bool {
 }
 
 fn make_rel_path(path: &Path, root: Option<&Path>) -> String {
-    if let Some(r) = root {
-        if let Ok(rel) = path.strip_prefix(r) {
+    if let Some(r) = root
+        && let Ok(rel) = path.strip_prefix(r) {
             return rel.to_string_lossy().replace('\\', "/");
         }
-    }
     path.file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| path.to_string_lossy().to_string())
@@ -600,11 +598,10 @@ pub fn render_explorer_panel(
             if up_btn.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
-            if up_btn.clicked() {
-                if let Some(parent) = state.root_dir.as_ref().and_then(|p| p.parent()) {
+            if up_btn.clicked()
+                && let Some(parent) = state.root_dir.as_ref().and_then(|p| p.parent()) {
                     action = ExplorerAction::SetRoot(parent.to_path_buf());
                 }
-            }
         });
     });
 

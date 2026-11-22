@@ -235,16 +235,14 @@ pub(super) fn decode_image_bytes(bytes: &[u8], hint_name: &str) -> Option<Decode
     if bytes.is_empty() {
         return None;
     }
-    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        if let Some(gif) = decode_gif_bytes(bytes) {
+    if (bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"))
+        && let Some(gif) = decode_gif_bytes(bytes) {
             return Some(gif);
         }
-    }
-    if looks_like_svg(bytes, hint_name) {
-        if let Some(svg) = decode_svg_bytes(bytes) {
+    if looks_like_svg(bytes, hint_name)
+        && let Some(svg) = decode_svg_bytes(bytes) {
             return Some(svg);
         }
-    }
     decode_static_raster_bytes(bytes)
 }
 
@@ -658,8 +656,8 @@ pub(super) fn load_cached_image_state(
     }
     let unchanged = ctx.data_mut(|d| {
         let cache = d.get_temp_mut_or_default::<ImageTextureCache>(cache_id);
-        if let Some(entry) = cache.entries.get_mut(&key) {
-            if !entry.is_remote && entry.resolved_path == resolved && entry.mtime == mtime {
+        if let Some(entry) = cache.entries.get_mut(&key)
+            && !entry.is_remote && entry.resolved_path == resolved && entry.mtime == mtime {
                 entry.last_stat_check = Some(now);
                 return match entry.current_frame(now) {
                     Some((tex, next)) => LocalCheck::Unchanged(ImageLoadState::Loaded(tex), next),
@@ -669,7 +667,6 @@ pub(super) fn load_cached_image_state(
                     None => LocalCheck::Unchanged(ImageLoadState::Unavailable, None),
                 };
             }
-        }
         LocalCheck::Changed
     });
     if let LocalCheck::Unchanged(state, repaint_after) = unchanged {
@@ -748,8 +745,8 @@ fn evict_oldest_if_full(
     cache: &mut ImageTextureCache,
     incoming_key: &(String, Option<PathBuf>, Option<PathBuf>),
 ) {
-    if cache.entries.len() >= 64 && !cache.entries.contains_key(incoming_key) {
-        if let Some(oldest_key) = cache
+    if cache.entries.len() >= 64 && !cache.entries.contains_key(incoming_key)
+        && let Some(oldest_key) = cache
             .entries
             .iter()
             .min_by_key(|(_, e)| e.last_tick)
@@ -757,7 +754,6 @@ fn evict_oldest_if_full(
         {
             cache.entries.remove(&oldest_key);
         }
-    }
 }
 
 #[allow(dead_code)]

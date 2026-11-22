@@ -102,11 +102,10 @@ impl Default for AppSettings {
 impl AppSettings {
     /// Returns the configured custom `.exe` path if set, or falls back to the currently running executable path.
     pub fn effective_exe_path(&self) -> PathBuf {
-        if let Some(ref p) = self.custom_exe_path {
-            if !p.as_os_str().is_empty() {
+        if let Some(ref p) = self.custom_exe_path
+            && !p.as_os_str().is_empty() {
                 return p.clone();
             }
-        }
         std::env::current_exe().unwrap_or_else(|_| PathBuf::from("Markdown Studio.exe"))
     }
     /// Adds or promotes `path` to the front of `recent_files` (capped at 10 entries).
@@ -174,11 +173,10 @@ impl AppSettings {
 
     /// Persists preferences synchronously as UTF-8 JSON, creating parent directories if needed.
     pub fn save_to(&self, path: &Path) -> io::Result<()> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent)?;
             }
-        }
         fs::write(path, self.to_json_string().as_bytes())
     }
 
@@ -394,13 +392,11 @@ pub(crate) fn parse_json_string_at(s: &str) -> Option<(String, &str)> {
                             hex.push(h);
                         }
                     }
-                    if hex.len() == 4 {
-                        if let Ok(cp) = u32::from_str_radix(&hex, 16) {
-                            if let Some(decoded) = char::from_u32(cp) {
+                    if hex.len() == 4
+                        && let Ok(cp) = u32::from_str_radix(&hex, 16)
+                            && let Some(decoded) = char::from_u32(cp) {
                                 out.push(decoded);
                             }
-                        }
-                    }
                 }
                 other => out.push(other),
             }
@@ -490,16 +486,14 @@ fn custom_settings_path_override() -> Option<PathBuf> {
 }
 
 fn platform_settings_path(win_dir: &str, unix_dir: &str) -> PathBuf {
-    if let Ok(appdata) = std::env::var("APPDATA") {
-        if !appdata.trim().is_empty() {
+    if let Ok(appdata) = std::env::var("APPDATA")
+        && !appdata.trim().is_empty() {
             return PathBuf::from(appdata).join(win_dir).join("settings.json");
         }
-    }
-    if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
-        if !home.trim().is_empty() {
+    if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE"))
+        && !home.trim().is_empty() {
             return PathBuf::from(home).join(unix_dir).join("settings.json");
         }
-    }
     std::env::temp_dir().join(win_dir).join("settings.json")
 }
 

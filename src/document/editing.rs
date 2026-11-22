@@ -911,8 +911,8 @@ fn line_cursor_inside_marker(line_str: &str, col: usize, open_m: &str, close_m: 
                 continue;
             }
         }
-        if !active && line_str[i..].starts_with(open_m) {
-            if let Some(rel_close) = line_str[i + open_m.len()..].find(close_m) {
+        if !active && line_str[i..].starts_with(open_m)
+            && let Some(rel_close) = line_str[i + open_m.len()..].find(close_m) {
                 let end_inner = i + open_m.len() + rel_close;
                 if col_b >= i + open_m.len() && col_b <= end_inner {
                     return true;
@@ -920,7 +920,6 @@ fn line_cursor_inside_marker(line_str: &str, col: usize, open_m: &str, close_m: 
                 i = end_inner + close_m.len();
                 continue;
             }
-        }
         let ch_len = line_str[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
         i += ch_len;
     }
@@ -930,8 +929,8 @@ fn line_cursor_inside_marker(line_str: &str, col: usize, open_m: &str, close_m: 
 /// Queries all active inline marks and block-level attributes at the selection or cursor.
 pub fn query_active_format(buf: &DocumentBuffer) -> ActiveFormatState {
     let eff_sel = buf.selection_range().or_else(|| {
-        if buf.cached_selection_version == buf.version {
-            if let Some((a, c)) = buf.cached_selection {
+        if buf.cached_selection_version == buf.version
+            && let Some((a, c)) = buf.cached_selection {
                 let len = buf.len_chars();
                 let a = a.min(len);
                 let c = c.min(len);
@@ -939,7 +938,6 @@ pub fn query_active_format(buf: &DocumentBuffer) -> ActiveFormatState {
                     return Some(a.min(c)..a.max(c));
                 }
             }
-        }
         None
     });
 
@@ -980,13 +978,12 @@ pub fn query_active_format(buf: &DocumentBuffer) -> ActiveFormatState {
         .map(|sel| buf.rope().slice(sel.clone()).to_string());
 
     let check_marker = |open_m: &str, close_m: &str| -> bool {
-        if let (Some(ref sel), Some(ref text)) = (&single_line_sel, &sel_text) {
-            if is_wrapped_inside(text, open_m, close_m)
-                || find_surrounding_marker_layer(buf, sel.clone(), open_m, close_m).is_some()
+        if let (Some(sel), Some(text)) = (&single_line_sel, &sel_text)
+            && (is_wrapped_inside(text, open_m, close_m)
+                || find_surrounding_marker_layer(buf, sel.clone(), open_m, close_m).is_some())
             {
                 return true;
             }
-        }
         line_cursor_inside_marker(&raw_line, col, open_m, close_m)
     };
 
@@ -1321,15 +1318,13 @@ fn unescape_alt_for_match(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut chars = raw.chars().peekable();
     while let Some(c) = chars.next() {
-        if c == '\\' {
-            if let Some(&next) = chars.peek() {
-                if matches!(next, '\\' | '[' | ']' | '*' | '_' | '`') {
+        if c == '\\'
+            && let Some(&next) = chars.peek()
+                && matches!(next, '\\' | '[' | ']' | '*' | '_' | '`') {
                     out.push(next);
                     chars.next();
                     continue;
                 }
-            }
-        }
         out.push(c);
     }
     out
@@ -1389,8 +1384,8 @@ fn find_image_alt_span_in_slice(
                 j += 1;
             }
 
-            if let Some(ae) = alt_end {
-                if ae + 1 < len && bytes[ae + 1] == b'(' {
+            if let Some(ae) = alt_end
+                && ae + 1 < len && bytes[ae + 1] == b'(' {
                     let mut p = ae + 2;
                     while p < len && matches!(bytes[p], b' ' | b'\t') {
                         p += 1;
@@ -1479,7 +1474,6 @@ fn find_image_alt_span_in_slice(
                         }
                     }
                 }
-            }
         }
         i += 1;
     }
@@ -1779,11 +1773,10 @@ impl TableData {
                 }
             }
             Some(r) => {
-                if let Some(row) = self.rows.get_mut(r) {
-                    if col < row.len() {
+                if let Some(row) = self.rows.get_mut(r)
+                    && col < row.len() {
                         row[col] = value;
                     }
-                }
             }
         }
     }

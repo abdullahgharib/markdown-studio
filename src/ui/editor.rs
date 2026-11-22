@@ -410,9 +410,9 @@ pub fn render_virtual_editor(
             let cmd_down = ui.input(|i| i.modifiers.command || i.modifiers.ctrl);
             let mut hovered_link_url: Option<String> = None;
 
-            if cmd_down && response.hovered() && !state.dragging {
-                if let Some(hover_pos) = ui.input(|i| i.pointer.hover_pos()) {
-                    if rect.contains(hover_pos) && hover_pos.x >= rect.left() + gutter_w {
+            if cmd_down && response.hovered() && !state.dragging
+                && let Some(hover_pos) = ui.input(|i| i.pointer.hover_pos())
+                    && rect.contains(hover_pos) && hover_pos.x >= rect.left() + gutter_w {
                         let rel_y = (hover_pos.y - rect.top()).max(0.0);
                         let line_offset = (rel_y / row_height).floor() as usize;
                         let h_line = (row_range.start + line_offset).min(total_lines - 1);
@@ -421,8 +421,8 @@ pub fn render_virtual_editor(
                                 state.get_or_build_line(ui, buf, h_line, &font_id, theme);
                             (s.is_empty(), bm, g)
                         };
-                        if !line_empty {
-                            if let Some(ref h_galley) = h_galley_opt {
+                        if !line_empty
+                            && let Some(ref h_galley) = h_galley_opt {
                                 let line_str = &state.line_cache.entries[&h_line].text;
                                 let galley_w = h_galley.size().x;
                                 let galley_origin_x = match bidi_map.base_dir {
@@ -443,19 +443,14 @@ pub fn render_virtual_editor(
                                     let log_col = bidi_map.logical_col_for_visual(line_str, vis_col);
                                     if let Some(raw_url) =
                                         extract_markdown_link_at_char(line_str, log_col)
-                                    {
-                                        if classify_link_url(&raw_url).is_some() {
+                                        && classify_link_url(&raw_url).is_some() {
                                             ui.ctx()
                                                 .set_cursor_icon(egui::CursorIcon::PointingHand);
                                             hovered_link_url = Some(raw_url);
                                         }
-                                    }
                                 }
                             }
-                        }
                     }
-                }
-            }
 
             // Mouse click / double-click / triple-click / drag positioning mapped directly via exact Galley font metrics + BiDi/Grapheme snapping.
             if let Some(pointer_pos) = response.interact_pointer_pos() {
@@ -701,8 +696,8 @@ pub fn render_virtual_editor(
             }
 
             // Selection highlight on this line
-            if let Some(sel) = &selection {
-                if sel.end > line_start_char && sel.start <= line_end_char {
+            if let Some(sel) = &selection
+                && sel.end > line_start_char && sel.start <= line_end_char {
                     let s_col = sel.start.saturating_sub(line_start_char).min(layout_line_len);
                     let e_col = sel.end.saturating_sub(line_start_char).min(layout_line_len);
                     for vr in bidi_map.visual_ranges_for_logical_span(s_col, e_col) {
@@ -727,7 +722,6 @@ pub fn render_virtual_editor(
                         }
                     }
                 }
-            }
 
             // Line number
             let num_str = format!("{:>width$}", line_idx + 1, width = gutter_digits);
@@ -844,8 +838,8 @@ pub fn render_virtual_editor(
     state.last_max_scroll_y = (scroll_out.content_size.y - scroll_out.inner_rect.height()).max(0.0);
 
     let mut bottom_reserve = 4.0_f32;
-    if let Some((max_content_w, text_area_w)) = horiz_metrics {
-        if max_content_w > text_area_w + 8.0 && full_rect.width() > gutter_w + 48.0 {
+    if let Some((max_content_w, text_area_w)) = horiz_metrics
+        && max_content_w > text_area_w + 8.0 && full_rect.width() > gutter_w + 48.0 {
             bottom_reserve = 14.0;
             let track_rect = egui::Rect::from_min_max(
                 egui::pos2(full_rect.left() + gutter_w + 6.0, full_rect.bottom() - 10.0),
@@ -872,13 +866,12 @@ pub fn render_virtual_editor(
                     let dx = sb_resp.drag_delta().x;
                     state.horiz_offset =
                         (state.horiz_offset + (dx / travel) * max_off).clamp(0.0, max_off);
-                } else if sb_resp.clicked() {
-                    if let Some(pos) = sb_resp.interact_pointer_pos() {
+                } else if sb_resp.clicked()
+                    && let Some(pos) = sb_resp.interact_pointer_pos() {
                         let target_ratio = ((pos.x - track_rect.left() - thumb_w * 0.5) / travel)
                             .clamp(0.0, 1.0);
                         state.horiz_offset = target_ratio * max_off;
                     }
-                }
 
                 let p = ui.painter_at(full_rect);
                 p.rect_filled(track_rect, 3.0, theme.pill_bg);
@@ -890,7 +883,6 @@ pub fn render_virtual_editor(
                 p.rect_filled(thumb_rect, 3.0, thumb_col);
             }
         }
-    }
 
     // Clicking empty canvas below the last line on short documents focuses and moves cursor to end.
     let content_bottom = full_rect.top() + total_lines as f32 * row_height;
@@ -1090,18 +1082,15 @@ fn handle_editor_input(
 
                 match key {
                     Key::V if cmd && shift => {
-                        if !pasted_this_frame {
-                            if let Some(plain) =
+                        if !pasted_this_frame
+                            && let Some(plain) =
                                 crate::document::clipboard::read_os_clipboard_plain_text()
-                            {
-                                if !plain.is_empty() {
+                                && !plain.is_empty() {
                                     buf.insert_at_cursor(&plain);
                                     state.desired_col = None;
                                     state.scroll_to_cursor = true;
                                     pasted_this_frame = true;
                                 }
-                            }
-                        }
                     }
                     Key::A if cmd => {
                         buf.selection_anchor = Some(0);
@@ -1547,8 +1536,8 @@ fn append_inline_syntax_highlights(
                 continue;
             }
         } else if bytes[i] == b'*' {
-            if let Some(rel_end) = slice[i + 1..].find('*') {
-                if rel_end > 0 {
+            if let Some(rel_end) = slice[i + 1..].find('*')
+                && rel_end > 0 {
                     if i > plain_start {
                         job.append(&slice[plain_start..i], 0.0, base_fmt.clone());
                     }
@@ -1567,7 +1556,6 @@ fn append_inline_syntax_highlights(
                     plain_start = end;
                     continue;
                 }
-            }
         } else if i + 1 < bytes.len() && bytes[i] == b'~' && bytes[i + 1] == b'~' {
             if let Some(rel_end) = slice[i + 2..].find("~~") {
                 if i > plain_start {
@@ -1588,8 +1576,8 @@ fn append_inline_syntax_highlights(
                 plain_start = end;
                 continue;
             }
-        } else if bytes[i] == b'[' {
-            if let Some(close_br) = slice[i + 1..].find("](") {
+        } else if bytes[i] == b'['
+            && let Some(close_br) = slice[i + 1..].find("](") {
                 let url_start = i + 1 + close_br + 2;
                 if let Some(close_par) = slice[url_start..].find(')') {
                     if i > plain_start {
@@ -1611,7 +1599,6 @@ fn append_inline_syntax_highlights(
                     continue;
                 }
             }
-        }
         let ch_len = slice[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
         i += ch_len;
     }

@@ -1795,12 +1795,11 @@ fn render_table_grid_inserter_button(
                         egui::pos2(x, y),
                         Vec2::splat(cell_sz),
                     );
-                    if let Some(pos) = pointer_pos {
-                        if cell_rect.contains(pos) {
+                    if let Some(pos) = pointer_pos
+                        && cell_rect.contains(pos) {
                             state.hover_rows = r + 1;
                             state.hover_cols = c + 1;
                         }
-                    }
                 }
             }
 

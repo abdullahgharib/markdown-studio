@@ -67,7 +67,7 @@ fn open_with_os(target: &str) -> Result<(), String> {
     use std::ptr::{null, null_mut};
 
     #[link(name = "shell32")]
-    extern "system" {
+    unsafe extern "system" {
         fn ShellExecuteW(
             hwnd: *mut core::ffi::c_void,
             lp_operation: *const u16,
@@ -366,8 +366,8 @@ impl MarkdownApp {
         reader_state.line_spacing = settings.line_spacing;
         reader_state.auto_calc_math = settings.auto_calc_math;
         reader_state.auto_calc_tables = settings.auto_calc_tables;
-        if view_mode == ViewMode::Wysiwyg {
-            if let Some(line_idx) = env_opt("MD_STUDIO_EDIT_LINE", "MD_WORD_EDIT_LINE")
+        if view_mode == ViewMode::Wysiwyg
+            && let Some(line_idx) = env_opt("MD_STUDIO_EDIT_LINE", "MD_WORD_EDIT_LINE")
                 .and_then(|s| s.trim().parse::<usize>().ok())
             {
                 activate_wysiwyg_at_line(
@@ -378,23 +378,19 @@ impl MarkdownApp {
                     &mut reader_state,
                 );
             }
-        }
 
         let initial_untitled_num = if buffer.file_path.is_some() { 0 } else { 1 };
         let next_untitled_num = if initial_untitled_num == 1 { 2 } else { 1 };
         let mut explorer_state = FileExplorerState::default();
-        if let Some(ref saved_root) = settings.explorer_root {
-            if saved_root.is_dir() {
+        if let Some(ref saved_root) = settings.explorer_root
+            && saved_root.is_dir() {
                 explorer_state.set_root(saved_root.clone());
             }
-        }
-        if explorer_state.root_dir.is_none() {
-            if let Some(parent) = buffer.file_path.as_deref().and_then(Path::parent) {
-                if !parent.as_os_str().is_empty() {
+        if explorer_state.root_dir.is_none()
+            && let Some(parent) = buffer.file_path.as_deref().and_then(Path::parent)
+                && !parent.as_os_str().is_empty() {
                     explorer_state.set_root(parent.to_path_buf());
                 }
-            }
-        }
 
         Self {
             doc_id,
@@ -494,11 +490,10 @@ impl MarkdownApp {
     }
 
     fn format_image_insert_path(&self, path: &Path) -> String {
-        if let Some(doc_dir) = self.buffer.file_path.as_deref().and_then(Path::parent) {
-            if let Ok(rel) = path.strip_prefix(doc_dir) {
+        if let Some(doc_dir) = self.buffer.file_path.as_deref().and_then(Path::parent)
+            && let Ok(rel) = path.strip_prefix(doc_dir) {
                 return rel.to_string_lossy().replace('\\', "/");
             }
-        }
         path.to_string_lossy().to_string()
     }
 
@@ -538,12 +533,11 @@ impl MarkdownApp {
                 }
             }
         }
-        if let Some(new_index) = self.ast_parser.poll_latest() {
-            if new_index.doc_id == self.doc_id {
+        if let Some(new_index) = self.ast_parser.poll_latest()
+            && new_index.doc_id == self.doc_id {
                 self.block_index = new_index;
                 self.outline_cache_key = (0, 0);
             }
-        }
         let outline_key = (self.doc_id, self.block_index.version);
         if self.outline_cache_key != outline_key {
             self.outline_items = build_outline_items(&self.block_index);
@@ -607,11 +601,10 @@ impl MarkdownApp {
                 .and_then(|t| t.state.as_ref())
                 .and_then(|s| s.buffer.file_path.as_ref())
         };
-        if let Some(path) = file_path {
-            if let Some(name) = path.file_name() {
+        if let Some(path) = file_path
+            && let Some(name) = path.file_name() {
                 return name.to_string_lossy().to_string();
             }
-        }
         let num = self.tabs.get(idx).map(|t| t.untitled_num).unwrap_or(1);
         Self::untitled_display_name(num)
     }
@@ -881,9 +874,9 @@ impl MarkdownApp {
         };
 
         let drop_screen_pos = self.pointer_screen_pos(ctx, self.tab_bar_state.last_drop_pos);
-        if let (Some(pos), Some(peers)) = (drop_screen_pos, self.cached_peer_windows.as_ref()) {
-            if let Some(peer) = peers.iter().find(|p| p.outer_rect.contains(pos)) {
-                let (sent, temp_handoff) = if let (Some(ref path), false) = (&file_path, dirty) {
+        if let (Some(pos), Some(peers)) = (drop_screen_pos, self.cached_peer_windows.as_ref())
+            && let Some(peer) = peers.iter().find(|p| p.outer_rect.contains(pos)) {
+                let (sent, temp_handoff) = if let (Some(path), false) = (&file_path, dirty) {
                     (
                         matches!(instance::try_send_open_to_peer(peer, path), Ok(true)),
                         None,
@@ -919,7 +912,6 @@ impl MarkdownApp {
                     return true;
                 }
             }
-        }
 
         if self.tabs.len() <= 1 {
             return false;
@@ -935,7 +927,7 @@ impl MarkdownApp {
         }
 
         let mut created_handoff: Option<PathBuf> = None;
-        if let (Some(ref path), false) = (&file_path, dirty) {
+        if let (Some(path), false) = (&file_path, dirty) {
             args.push(path.to_string_lossy().to_string());
         } else {
             let empty = ropey::Rope::new();
@@ -1167,11 +1159,10 @@ impl MarkdownApp {
                     .as_ref()
                     .and_then(|s| s.buffer.file_path.as_deref())
             };
-            if let Some(existing) = tab_path {
-                if paths_match(existing, path) {
+            if let Some(existing) = tab_path
+                && paths_match(existing, path) {
                     return Some(idx);
                 }
-            }
         }
         None
     }
@@ -1473,11 +1464,10 @@ impl MarkdownApp {
         if let Some(active_state) = active_state_opt {
             self.apply_incoming_tab_state(active_state);
         }
-        if self.explorer_state.root_dir.is_none() {
-            if let Some(dir) = self.current_base_dir() {
+        if self.explorer_state.root_dir.is_none()
+            && let Some(dir) = self.current_base_dir() {
                 self.explorer_state.set_root(dir);
             }
-        }
         self.sync_ast_if_needed();
         self.last_recovery_snapshot_key = self.current_session_snapshot_key();
         self.last_recovery_save = Instant::now();
@@ -1523,14 +1513,12 @@ impl MarkdownApp {
                 } else {
                     self.open_buffer_in_new_tab(new_buf, 0);
                 }
-                if self.explorer_state.root_dir.is_none() {
-                    if let Some(parent) = path.parent() {
-                        if !parent.as_os_str().is_empty() {
+                if self.explorer_state.root_dir.is_none()
+                    && let Some(parent) = path.parent()
+                        && !parent.as_os_str().is_empty() {
                             self.explorer_state.set_root(parent.to_path_buf());
                             self.settings.explorer_root = Some(parent.to_path_buf());
                         }
-                    }
-                }
                 self.settings.record_recent_file(path);
                 self.persist_settings();
                 self.sync_ast_if_needed();
@@ -2180,11 +2168,10 @@ impl MarkdownApp {
                 } else {
                     self.sidebar_tab = SidebarTab::Explorer;
                     self.outline_open = true;
-                    if self.explorer_state.root_dir.is_none() {
-                        if let Some(parent) = self.current_base_dir() {
+                    if self.explorer_state.root_dir.is_none()
+                        && let Some(parent) = self.current_base_dir() {
                             self.explorer_state.set_root(parent);
                         }
-                    }
                 }
                 self.settings.outline_open = self.outline_open;
                 let _ = self.settings.save_to(&self.settings_path);
@@ -2350,11 +2337,9 @@ impl MarkdownApp {
                             self.sidebar_tab = tab;
                             if tab == SidebarTab::Explorer
                                 && self.explorer_state.root_dir.is_none()
-                            {
-                                if let Some(parent) = self.current_base_dir() {
+                                && let Some(parent) = self.current_base_dir() {
                                     self.explorer_state.set_root(parent);
                                 }
-                            }
                         }
                     }
 
@@ -2390,11 +2375,10 @@ impl MarkdownApp {
                 }
             });
 
-        if pick_folder {
-            if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+        if pick_folder
+            && let Some(dir) = rfd::FileDialog::new().pick_folder() {
                 pending_root = Some(dir);
             }
-        }
         if let Some(root) = pending_root {
             self.explorer_state.set_root(root.clone());
             self.settings.explorer_root = Some(root);
@@ -2556,11 +2540,10 @@ impl MarkdownApp {
             });
         }
 
-        if let Some(line) = toggled_collapse_line {
-            if !self.collapsed_outline_lines.remove(&line) {
+        if let Some(line) = toggled_collapse_line
+            && !self.collapsed_outline_lines.remove(&line) {
                 self.collapsed_outline_lines.insert(line);
             }
-        }
         if let Some((source_line, fallback_y)) = clicked_target {
             self.reader_state.active_block_lines = None;
             let c = self.buffer.line_to_char(source_line);
@@ -2597,11 +2580,10 @@ impl eframe::App for MarkdownApp {
                     _ => None,
                 })
             }) {
-                if let Some(parent) = out_path.parent() {
-                    if !parent.as_os_str().is_empty() {
+                if let Some(parent) = out_path.parent()
+                    && !parent.as_os_str().is_empty() {
                         let _ = std::fs::create_dir_all(parent);
                     }
-                }
                 let _ = image::save_buffer_with_format(
                     out_path,
                     img.as_raw(),
@@ -2670,12 +2652,11 @@ impl MarkdownApp {
         {
             self.reader_state.active_block_lines = None;
         }
-        if let Some(blk_idx) = self.block_index.block_for_source_line(target_line) {
-            if blk_idx < self.block_index.blocks.len() {
+        if let Some(blk_idx) = self.block_index.block_for_source_line(target_line)
+            && blk_idx < self.block_index.blocks.len() {
                 self.reader_state.scroll_to_y =
                     Some((self.block_index.block_y_start(blk_idx) - 36.0).max(0.0));
             }
-        }
     }
 
     /// Attaches a custom `InstanceMessage` receiver (primarily for headless UI tests).
@@ -2709,7 +2690,7 @@ impl MarkdownApp {
         let Ok(handoff) = instance::read_and_remove_handoff_file(handoff_path) else {
             return;
         };
-        if let (Some(ref path), false) = (&handoff.file_path, handoff.dirty) {
+        if let (Some(path), false) = (&handoff.file_path, handoff.dirty) {
             self.open_specific_file(path);
             return;
         }
@@ -2745,13 +2726,11 @@ impl MarkdownApp {
             self.open_buffer_in_new_tab(new_buf, untitled_num);
             self.refocus_active_editor();
         }
-        if self.explorer_state.root_dir.is_none() {
-            if let Some(parent) = self.buffer.file_path.as_deref().and_then(Path::parent) {
-                if !parent.as_os_str().is_empty() {
+        if self.explorer_state.root_dir.is_none()
+            && let Some(parent) = self.buffer.file_path.as_deref().and_then(Path::parent)
+                && !parent.as_os_str().is_empty() {
                     self.explorer_state.set_root(parent.to_path_buf());
                 }
-            }
-        }
         self.exporter.status_text = format!("Moved {display_name} into this window");
     }
 
@@ -3076,9 +3055,8 @@ impl MarkdownApp {
             });
         if paste_image_hotkey
             && crate::document::clipboard::read_os_clipboard_plain_text().is_none()
-        {
-            if let Some(png_bytes) = crate::document::clipboard::read_os_clipboard_image_png() {
-                if self.paste_image_png_bytes(&png_bytes) {
+            && let Some(png_bytes) = crate::document::clipboard::read_os_clipboard_image_png()
+                && self.paste_image_png_bytes(&png_bytes) {
                     ctx.input_mut(|i| {
                         i.events.retain(|ev| {
                             !matches!(
@@ -3094,8 +3072,6 @@ impl MarkdownApp {
                         });
                     });
                 }
-            }
-        }
 
         let shortcut_action = self.handle_shortcuts(ctx);
         if shortcut_action != ToolbarAction::None {
@@ -3209,11 +3185,10 @@ impl MarkdownApp {
                 })
                 .collect();
             let over_peer_window = if self.tab_bar_state.dragging_tab_idx.is_some() {
-                if self.cached_peer_windows.is_none() {
-                    if let Some(server) = &self.instance_server {
+                if self.cached_peer_windows.is_none()
+                    && let Some(server) = &self.instance_server {
                         self.cached_peer_windows = Some(server.list_peer_windows());
                     }
-                }
                 let local_pos = ctx
                     .input(|i| i.pointer.interact_pos().or(i.pointer.latest_pos()))
                     .unwrap_or(self.tab_bar_state.last_pointer_pos);
@@ -3522,11 +3497,10 @@ impl MarkdownApp {
                         }
                     });
                 });
-            if open_diff {
-                if let Some(path) = self.buffer.file_path.as_deref() {
+            if open_diff
+                && let Some(path) = self.buffer.file_path.as_deref() {
                     self.external_diff_modal.open_for(&self.buffer, path);
                 }
-            }
             if reload_now {
                 self.external_diff_modal.open = false;
                 if self.reload_active_file_from_disk() {
@@ -3674,14 +3648,12 @@ impl MarkdownApp {
                                         self.last_split_top_row = top_row;
                                         if let Some(b_idx) =
                                             self.block_index.block_for_source_line(top_row)
-                                        {
-                                            if b_idx < self.block_index.blocks.len() {
+                                            && b_idx < self.block_index.blocks.len() {
                                                 self.reader_state.scroll_to_y = Some(
                                                     (self.block_index.block_y_start(b_idx) - 16.0)
                                                         .max(0.0),
                                                 );
                                             }
-                                        }
                                     }
                                 },
                             );
@@ -4016,20 +3988,18 @@ impl MarkdownApp {
         match action {
             ReaderAction::None => {}
             ReaderAction::EditTable(lines) => {
-                if self.view_mode != ViewMode::Reader {
-                    if let Some(table) = table_at_line(&self.buffer, lines.start) {
+                if self.view_mode != ViewMode::Reader
+                    && let Some(table) = table_at_line(&self.buffer, lines.start) {
                         self.table_modal.open_with(table);
                     }
-                }
             }
             ReaderAction::RecalculateTable(lines) => {
-                if self.view_mode != ViewMode::Reader {
-                    if let Some(mut table) = table_at_line(&self.buffer, lines.start) {
+                if self.view_mode != ViewMode::Reader
+                    && let Some(mut table) = table_at_line(&self.buffer, lines.start) {
                         let count = calc::recalculate_table(&mut table);
                         apply_table_edit(&mut self.buffer, &table);
                         self.exporter.status_text = format!("Recalculated {count} table formula(s)");
                     }
-                }
             }
             ReaderAction::JumpToSourceLine(line) => {
                 if self.view_mode != ViewMode::Reader {
@@ -4049,8 +4019,7 @@ impl MarkdownApp {
                         source_lines,
                         ..
                     } = &entry.block
-                    {
-                        if def_name.eq_ignore_ascii_case(&name) {
+                        && def_name.eq_ignore_ascii_case(&name) {
                             self.reader_state.active_block_lines = None;
                             self.reader_state.smooth_scroll_to(
                                 (self.block_index.block_y_start(idx) - 20.0).max(0.0),
@@ -4062,7 +4031,6 @@ impl MarkdownApp {
                             found = true;
                             break;
                         }
-                    }
                 }
                 if !found {
                     self.exporter.status_text = format!("Footnote not found: [^{name}]");
@@ -4176,8 +4144,8 @@ impl MarkdownApp {
 
     fn calculate_math_at_cursor(&mut self) {
         self.buffer.restore_cached_selection();
-        if let Some((open_line, close_line)) = self.find_fenced_math_block_at_cursor() {
-            if open_line + 1 < close_line {
+        if let Some((open_line, close_line)) = self.find_fenced_math_block_at_cursor()
+            && open_line + 1 < close_line {
                 let range = self.buffer.line_range_chars(open_line + 1, close_line - 1);
                 let raw_body = self.buffer.rope().slice(range.clone()).to_string();
                 let norm_body = raw_body.replace("\r\n", "\n");
@@ -4200,10 +4168,9 @@ impl MarkdownApp {
                     return;
                 }
             }
-        }
 
-        if let Some((inner_start, inner_end)) = self.inline_math_span_at_cursor() {
-            if inner_start < inner_end {
+        if let Some((inner_start, inner_end)) = self.inline_math_span_at_cursor()
+            && inner_start < inner_end {
                 let expr = self.buffer.rope().slice(inner_start..inner_end).to_string();
                 let (updated, summary) = calc::evaluate_math_block_text(&expr);
                 if let Some(res) = summary {
@@ -4217,7 +4184,6 @@ impl MarkdownApp {
                     return;
                 }
             }
-        }
 
         if let Some(sel) = self.buffer.selection_range() {
             let selected = self.buffer.rope().slice(sel.clone()).to_string();
@@ -4279,11 +4245,10 @@ impl MarkdownApp {
         {
             let mut tbls = Vec::new();
             for indexed in &self.block_index.blocks {
-                if let crate::export::ir::DocBlock::Table { source_lines, .. } = &indexed.block {
-                    if let Some(t) = table_at_line(&self.buffer, source_lines.start) {
+                if let crate::export::ir::DocBlock::Table { source_lines, .. } = &indexed.block
+                    && let Some(t) = table_at_line(&self.buffer, source_lines.start) {
                         tbls.push(t);
                     }
-                }
             }
             tbls
         } else if self.buffer.len_bytes() >= 512_000 {
@@ -4313,14 +4278,13 @@ impl MarkdownApp {
                     let cur_has_pipe = line_slice.bytes().any(|b| b == b'|');
                     let next_has_pipe = next_slice.bytes().any(|b| b == b'|');
                     let next_has_dash = next_slice.bytes().any(|b| b == b'-');
-                    if (cur_has_pipe || next_has_pipe) && next_has_dash {
-                        if let Some(t) = table_at_line(&self.buffer, line_idx) {
+                    if (cur_has_pipe || next_has_pipe) && next_has_dash
+                        && let Some(t) = table_at_line(&self.buffer, line_idx) {
                             let next_line = t.source_lines.end.max(line_idx + 1);
                             tbls.push(t);
                             line_idx = next_line;
                             continue;
                         }
-                    }
                 }
                 line_idx += 1;
             }
@@ -4366,8 +4330,7 @@ fn build_outline_items(index: &ViewportBlockIndex) -> Vec<OutlineItem> {
             source_lines,
             ..
         } = &b.block
-        {
-            if *level <= 6 {
+            && *level <= 6 {
                 let raw_title = runs_to_plain_text(runs);
                 if !raw_title.is_empty() {
                     let dir = detect_paragraph_direction(&raw_title);
@@ -4384,7 +4347,6 @@ fn build_outline_items(index: &ViewportBlockIndex) -> Vec<OutlineItem> {
                     });
                 }
             }
-        }
         if items.len() >= 2500 {
             break;
         }
@@ -4749,14 +4711,13 @@ fn build_fonts_with_loaded_groups(loaded_mask: u8) -> FontDefinitions {
             FONT_GROUP_EXTRA_SCRIPTS,
             FONT_GROUP_CJK,
         ] {
-            if (loaded_mask & bit) != 0 {
-                if let Some(entries) = guard.get(&bit) {
+            if (loaded_mask & bit) != 0
+                && let Some(entries) = guard.get(&bit) {
                     for (name, data) in entries {
                         fonts.font_data.insert(name.clone(), Arc::clone(data));
                         lazy_names.push(name.clone());
                     }
                 }
-            }
         }
     }
 

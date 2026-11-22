@@ -3,11 +3,11 @@
 **An ultra-fast, native desktop Markdown reader, WYSIWYG studio editor, and document exporter written in Rust.**
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPLv3-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/Rust-2021-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/Rust-2024-orange.svg)](https://www.rust-lang.org/)
 [![Platforms](https://img.shields.io/badge/Platforms-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#installation)
 [![CI](https://github.com/abdullahgharib/markdown-studio/actions/workflows/ci.yml/badge.svg)](https://github.com/abdullahgharib/markdown-studio/actions/workflows/ci.yml)
 
-**Current Version:** `0.7.14` (`markdown_studio`)
+**Current Version:** `0.7.15` (`markdown_studio`)
 
 ---
 
@@ -85,7 +85,7 @@ Download the latest release for **Windows**, **Linux**, or **macOS** from [GitHu
 
 ### Build from Source
 
-Prerequisites: [Rust toolchain](https://rustup.rs/) (stable, edition 2021).
+Prerequisites: [Rust toolchain](https://rustup.rs/) (stable, edition 2024).
 
 #### Windows
 ```powershell
@@ -121,7 +121,7 @@ cargo build --release
 ## Documentation & Internals
 
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** — System architecture diagram, core performance invariants, module map, settings schema, environment variables, and Criterion benchmark results.
-- **[changelog.md](changelog.md)** — Full version history (`v0.1.0` through `v0.7.14`).
+- **[changelog.md](changelog.md)** — Full version history (`v0.1.0` through `v0.7.15`).
 - **[CONTRIBUTING.md](CONTRIBUTING.md)** — Development setup, testing commands, and pull request guidelines.
 
 ---

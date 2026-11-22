@@ -5,6 +5,11 @@ For architecture, features, shortcuts, and build instructions, see [README.md](R
 
 ---
 
+### `v0.7.15` (2026-11-22) — Rust 2024 Edition Migration
+- **Migrated Crate to Rust Edition 2024 (`Cargo.toml`, `src/`, `tests/`, `README.md`, `CONTRIBUTING.md`)**:
+  - Updated `Cargo.toml` (`edition = "2024"`), marked Windows FFI `extern "system"` blocks `unsafe`, renamed the reserved `gen` identifier in `src/ui/explorer.rs` to `generation`, updated Edition 2024 pattern bindings (`src/`, `tests/export_tests.rs`), and adopted Edition 2024 `if let` chains across the codebase.
+  - Full test suite (**177 tests**) and strict `cargo clippy --all-targets -- -D warnings` pass with **0 warnings**.
+
 ### `v0.7.14` (2026-11-22) — Linux Font Metrics, macOS Checkmark Glyph & Unix Migration Fix
 - **Cross-Platform Legacy Exe Path Detection (`src/ui/settings.rs`)**:
   - Updated `AppSettings::migrate_legacy_settings_if_needed` to split `custom_exe_path` on both `/` and `\` so legacy Windows paths (`Markdown Word Studio.exe`) are detected and cleaned reliably on Linux and macOS.

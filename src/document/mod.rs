@@ -828,8 +828,8 @@ impl DocumentBuffer {
         if self.selection_range().is_some() {
             return true;
         }
-        if let Some((anchor, cursor)) = self.cached_selection {
-            if self.cached_selection_version == self.version {
+        if let Some((anchor, cursor)) = self.cached_selection
+            && self.cached_selection_version == self.version {
                 let len = self.len_chars();
                 let a = anchor.min(len);
                 let c = cursor.min(len);
@@ -839,7 +839,6 @@ impl DocumentBuffer {
                     return true;
                 }
             }
-        }
         false
     }
 

@@ -1001,11 +1001,10 @@ impl<'a> Parser<'a> {
                     frac
                 };
             }
-            if let Some(atom) = self.parse_scripted_atom() {
-                if !matches!(atom, MathNode::Empty) {
+            if let Some(atom) = self.parse_scripted_atom()
+                && !matches!(atom, MathNode::Empty) {
                     items.push(atom);
                 }
-            }
         }
         simplify_row(items)
     }
@@ -2302,7 +2301,7 @@ fn layout_node(
             let mut sup_y = -(base_l.ascent * 0.56).max(fs * 0.36);
             let mut sub_y = (base_l.descent * 0.65 + fs * 0.24).max(fs * 0.22);
 
-            if let (Some(ref sp), Some(ref sb)) = (&sup_l, &sub_l) {
+            if let (Some(sp), Some(sb)) = (&sup_l, &sub_l) {
                 let sup_bot = sup_y + sp.descent;
                 let sub_top = sub_y - sb.ascent;
                 let min_gap = fs * 0.12;

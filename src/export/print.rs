@@ -19,18 +19,14 @@ fn cleanup_old_spool_files() {
         let name_str = name.to_string_lossy();
         if (name_str.starts_with("markdown_studio_print_") || name_str.starts_with("md_word_print_"))
             && (name_str.ends_with(".pdf") || name_str.ends_with(".ps1"))
-        {
-            if let Ok(meta) = entry.metadata() {
-                if let Ok(modified) = meta.modified() {
-                    if now
+            && let Ok(meta) = entry.metadata()
+                && let Ok(modified) = meta.modified()
+                    && now
                         .duration_since(modified)
                         .is_ok_and(|age| age > Duration::from_secs(3600))
                     {
                         let _ = std::fs::remove_file(entry.path());
                     }
-                }
-            }
-        }
     }
 }
 
@@ -271,8 +267,7 @@ foreach ($name in [System.Drawing.Printing.PrinterSettings]::InstalledPrinters) 
             .creation_flags(CREATE_NO_WINDOW)
             .args(["-NoProfile", "-NonInteractive", "-Command", ps])
             .output()
-        {
-            if out.status.success() {
+            && out.status.success() {
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 let mut list = Vec::new();
                 for line in stdout.lines() {
@@ -293,7 +288,6 @@ foreach ($name in [System.Drawing.Printing.PrinterSettings]::InstalledPrinters) 
                 list.sort_by(|a, b| b.is_default.cmp(&a.is_default).then(a.name.cmp(&b.name)));
                 return list;
             }
-        }
         Vec::new()
     }
 

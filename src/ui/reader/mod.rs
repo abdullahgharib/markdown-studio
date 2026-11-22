@@ -311,12 +311,11 @@ impl VirtualReaderState {
         let key = h.finish();
         self.math_preview_tick = self.math_preview_tick.wrapping_add(1);
         let tick = self.math_preview_tick;
-        if let Some(entry) = self.math_preview_cache.get_mut(&key) {
-            if entry.text == expr {
+        if let Some(entry) = self.math_preview_cache.get_mut(&key)
+            && entry.text == expr {
                 entry.last_tick = tick;
                 return entry.result.clone();
             }
-        }
         let res = preview_math_result(expr);
         if !self.math_preview_cache.contains_key(&key) {
             evict_oldest_half(&mut self.math_preview_cache, MAX_PREVIEW_ENTRIES, |e| {
@@ -436,11 +435,10 @@ pub fn classify_link_url(url: &str) -> Option<LinkTarget> {
 
 fn clean_bracket_link_destination(raw_inner: &str) -> String {
     let trimmed = raw_inner.trim();
-    if let Some(after_lt) = trimmed.strip_prefix('<') {
-        if let Some(gt) = after_lt.find('>') {
+    if let Some(after_lt) = trimmed.strip_prefix('<')
+        && let Some(gt) = after_lt.find('>') {
             return after_lt[..gt].trim().to_string();
         }
-    }
     trimmed
         .split_ascii_whitespace()
         .next()
@@ -490,16 +488,15 @@ pub fn extract_markdown_link_at_char(text: &str, char_idx: usize) -> Option<Stri
         }
 
         // Skip images `![alt](src)` so they are not treated as clickable text hyperlinks.
-        if bytes[i] == b'!' && target_line[i..].starts_with("![") {
-            if let Some((_lbl_end, url_close)) = find_bracket_link_end(&target_line[i + 2..]) {
+        if bytes[i] == b'!' && target_line[i..].starts_with("![")
+            && let Some((_lbl_end, url_close)) = find_bracket_link_end(&target_line[i + 2..]) {
                 i = i + 2 + url_close + 1;
                 continue;
             }
-        }
 
         // Inline Markdown link `[label](url)`
-        if bytes[i] == b'[' {
-            if let Some((lbl_end_rel, url_close_rel)) = find_bracket_link_end(&target_line[i + 1..])
+        if bytes[i] == b'['
+            && let Some((lbl_end_rel, url_close_rel)) = find_bracket_link_end(&target_line[i + 1..])
             {
                 let span_end_b = i + 1 + url_close_rel + 1;
                 let char_s = target_line[..i].chars().count();
@@ -514,11 +511,10 @@ pub fn extract_markdown_link_at_char(text: &str, char_idx: usize) -> Option<Stri
                 i = span_end_b;
                 continue;
             }
-        }
 
         // Autolink `<https://...>`, `<http://...>`, `<mailto:...>`
-        if bytes[i] == b'<' {
-            if let Some(rel_gt) = target_line[i + 1..].find('>') {
+        if bytes[i] == b'<'
+            && let Some(rel_gt) = target_line[i + 1..].find('>') {
                 let inner = &target_line[i + 1..i + 1 + rel_gt];
                 let inner_low = inner.to_ascii_lowercase();
                 if !inner.chars().any(char::is_whitespace)
@@ -536,7 +532,6 @@ pub fn extract_markdown_link_at_char(text: &str, char_idx: usize) -> Option<Stri
                     continue;
                 }
             }
-        }
 
         // Bare URL (`https://...`, `http://...`, `www....`)
         let rest_low_match = target_line
@@ -871,13 +866,11 @@ fn next_list_continuation_marker(prefix: &str) -> Option<String> {
     let digits: String = body.chars().take_while(|c| c.is_ascii_digit()).collect();
     if !digits.is_empty() {
         let rest = &body[digits.len()..];
-        if let Some(delim) = rest.chars().next() {
-            if (delim == '.' || delim == ')') && rest.get(1..2) == Some(" ") {
-                if let Ok(n) = digits.parse::<usize>() {
+        if let Some(delim) = rest.chars().next()
+            && (delim == '.' || delim == ')') && rest.get(1..2) == Some(" ")
+                && let Ok(n) = digits.parse::<usize>() {
                     return Some(format!("{ws}{}{delim} ", n + 1));
                 }
-            }
-        }
     }
     None
 }
@@ -1328,10 +1321,8 @@ pub fn render_virtual_reader(
                                         && !rendered_active
                                         && !active_has_leaf
                                         && state.active_block_lines == initial_active_lines
-                                    {
-                                        if let Some(active_lines) = state.active_block_lines.clone()
-                                        {
-                                            if !active_lines.is_empty()
+                                        && let Some(active_lines) = state.active_block_lines.clone()
+                                            && !active_lines.is_empty()
                                                 && active_lines.end <= buf.len_lines()
                                                 && active_lines.start < src_lines.start
                                             {
@@ -1355,8 +1346,6 @@ pub fn render_virtual_reader(
                                                 rendered_active = true;
                                                 ui.add_space(block_gap);
                                             }
-                                        }
-                                    }
 
                                     let heading_top_pad = if idx > 0 {
                                         match block {
@@ -1395,8 +1384,7 @@ pub fn render_virtual_reader(
 
                                     let rect = block_resp.response.rect;
                                     if let Some((ref hl_range, until)) = state.highlight_block_lines
-                                    {
-                                        if now_frame_time < until && *hl_range == src_lines {
+                                        && now_frame_time < until && *hl_range == src_lines {
                                             let frac =
                                                 ((until - now_frame_time) / 1.4).clamp(0.0, 1.0)
                                                     as f32;
@@ -1411,7 +1399,6 @@ pub fn render_virtual_reader(
                                             ui.painter().rect_filled(halo_rect, 6.0, halo_col);
                                             ui.ctx().request_repaint();
                                         }
-                                    }
                                     if !state.search_matches.is_empty()
                                         && !src_lines.is_empty()
                                         && src_lines.end <= buf.len_lines()
@@ -1493,9 +1480,8 @@ pub fn render_virtual_reader(
                                     && !rendered_active
                                     && !active_has_leaf
                                     && state.active_block_lines == initial_active_lines
-                                {
-                                    if let Some(active_lines) = state.active_block_lines.clone() {
-                                        if !active_lines.is_empty()
+                                    && let Some(active_lines) = state.active_block_lines.clone()
+                                        && !active_lines.is_empty()
                                             && active_lines.end <= buf.len_lines()
                                         {
                                             let at_end = !use_virtual_window
@@ -1523,8 +1509,6 @@ pub fn render_virtual_reader(
                                                 }
                                             }
                                         }
-                                    }
-                                }
 
                                 if wysiwyg
                                     && !read_only
@@ -1609,11 +1593,10 @@ pub fn render_virtual_reader(
             scroll_max_y = (out.content_size.y - out.inner_rect.height()).max(0.0);
         });
 
-    if let Some(sy) = applied_smooth_y {
-        if (scroll_offset_y - sy).abs() > 2.0 {
+    if let Some(sy) = applied_smooth_y
+        && (scroll_offset_y - sy).abs() > 2.0 {
             state.smooth_scroll_target_y = None;
         }
-    }
 
     if scroll_max_y > 20.0 && scroll_inner_rect.is_positive() {
         let frac = (scroll_offset_y / scroll_max_y).clamp(0.0, 1.0);
@@ -1671,11 +1654,10 @@ pub fn render_virtual_reader(
     state.last_scroll_offset_y = scroll_offset_y;
     state.last_max_scroll_y = scroll_max_y;
 
-    if read_only && state.image_lightbox.is_some() {
-        if let Some(lb_action) = render_image_lightbox(ui.ctx(), theme, state) {
+    if read_only && state.image_lightbox.is_some()
+        && let Some(lb_action) = render_image_lightbox(ui.ctx(), theme, state) {
             action = lb_action;
         }
-    }
 
     action
 }
@@ -1791,9 +1773,9 @@ fn render_image_lightbox(
                             if ui.small_button("Fit").on_hover_text("Fit to Window (0)").clicked() {
                                 lb.zoom = 1.0;
                             }
-                            if let Some(ref raw_link) = lb.link_url {
-                                if let Some(classified) = classify_link_url(raw_link) {
-                                    if ui
+                            if let Some(ref raw_link) = lb.link_url
+                                && let Some(classified) = classify_link_url(raw_link)
+                                    && ui
                                         .small_button("Open Link ↗")
                                         .on_hover_text(raw_link)
                                         .clicked()
@@ -1802,8 +1784,6 @@ fn render_image_lightbox(
                                         action = Some(nav_target_action(&target));
                                         close_lightbox = true;
                                     }
-                                }
-                            }
                             if ui
                                 .small_button("✕ Close")
                                 .on_hover_text("Close Lightbox (Esc)")
@@ -1926,11 +1906,10 @@ fn wysiwyg_word_at_col(text: &str, col: usize, show_markup: bool) -> Option<Rang
             break;
         }
     }
-    if fwd != probe && fwd < len && (chars[fwd].is_alphanumeric() || chars[fwd] == '_') {
-        if let Some(r) = word_range_in_line(text, fwd) {
+    if fwd != probe && fwd < len && (chars[fwd].is_alphanumeric() || chars[fwd] == '_')
+        && let Some(r) = word_range_in_line(text, fwd) {
             return Some(r);
         }
-    }
     let mut bck = probe;
     for _ in 0..3 {
         if bck > 0 && is_inline_delim(chars[bck - 1]) {
@@ -2606,9 +2585,9 @@ fn append_inline_markdown_spans(
             } else {
                 None
             };
-            if let Some((open_len, close_tag, close_len)) = tag_match {
-                if let Some(rel_end) = find_ascii_case_insensitive(&s[i + open_len..], close_tag) {
-                    if !s[i + open_len..i + open_len + rel_end].contains("\n\n") {
+            if let Some((open_len, close_tag, close_len)) = tag_match
+                && let Some(rel_end) = find_ascii_case_insensitive(&s[i + open_len..], close_tag)
+                    && !s[i + open_len..i + open_len + rel_end].contains("\n\n") {
                         flush_plain(job, &s[plain_start..i], style);
                         job.append(&s[i..i + open_len], 0.0, delim_fmt.clone());
                         let mut next_st = style;
@@ -2634,8 +2613,6 @@ fn append_inline_markdown_spans(
                         plain_start = i;
                         continue;
                     }
-                }
-            }
         }
 
         // Inline code: `...`
@@ -2668,9 +2645,9 @@ fn append_inline_markdown_spans(
 
         // Bold+Italic / Bold / Italic (`***`, `**`, `*`)
         if depth < 4 && b == b'*' {
-            if s[i..].starts_with("***") {
-                if let Some(rel_end) = s[i + 3..].find("***") {
-                    if rel_end > 0 {
+            if s[i..].starts_with("***")
+                && let Some(rel_end) = s[i + 3..].find("***")
+                    && rel_end > 0 {
                         flush_plain(job, &s[plain_start..i], style);
                         job.append("***", 0.0, delim_fmt.clone());
                         let mut next_st = style;
@@ -2692,11 +2669,9 @@ fn append_inline_markdown_spans(
                         plain_start = i;
                         continue;
                     }
-                }
-            }
             if s[i..].starts_with("**") {
-                if let Some(rel_end) = find_closing_marker(&s[i + 2..], "**") {
-                    if rel_end > 0 {
+                if let Some(rel_end) = find_closing_marker(&s[i + 2..], "**")
+                    && rel_end > 0 {
                         flush_plain(job, &s[plain_start..i], style);
                         job.append("**", 0.0, delim_fmt.clone());
                         let mut next_st = style;
@@ -2717,10 +2692,9 @@ fn append_inline_markdown_spans(
                         plain_start = i;
                         continue;
                     }
-                }
-            } else if i + 1 < len && !bytes[i + 1].is_ascii_whitespace() {
-                if let Some(rel_end) = find_closing_single_star(&s[i + 1..]) {
-                    if rel_end > 0 {
+            } else if i + 1 < len && !bytes[i + 1].is_ascii_whitespace()
+                && let Some(rel_end) = find_closing_single_star(&s[i + 1..])
+                    && rel_end > 0 {
                         flush_plain(job, &s[plain_start..i], style);
                         job.append("*", 0.0, delim_fmt.clone());
                         let mut next_st = style;
@@ -2741,8 +2715,6 @@ fn append_inline_markdown_spans(
                         plain_start = i;
                         continue;
                     }
-                }
-            }
         }
 
         // Bold / Italic (`__`, `_`) respecting intra-word underscores (`snake_case`)
@@ -2785,8 +2757,7 @@ fn append_inline_markdown_spans(
                 && !s[i..].starts_with("__")
                 && i + 1 < len
                 && !bytes[i + 1].is_ascii_whitespace()
-            {
-                if let Some(rel_end) = find_closing_single_underscore(&s[i + 1..]) {
+                && let Some(rel_end) = find_closing_single_underscore(&s[i + 1..]) {
                     let close_end = i + 2 + rel_end;
                     let right_ok = s[close_end..]
                         .chars()
@@ -2814,13 +2785,12 @@ fn append_inline_markdown_spans(
                         continue;
                     }
                 }
-            }
         }
 
         // Strikethrough `~~...~~`
-        if depth < 4 && b == b'~' && s[i..].starts_with("~~") {
-            if let Some(rel_end) = s[i + 2..].find("~~") {
-                if rel_end > 0 {
+        if depth < 4 && b == b'~' && s[i..].starts_with("~~")
+            && let Some(rel_end) = s[i + 2..].find("~~")
+                && rel_end > 0 {
                     flush_plain(job, &s[plain_start..i], style);
                     job.append("~~", 0.0, delim_fmt.clone());
                     let mut next_st = style;
@@ -2841,8 +2811,6 @@ fn append_inline_markdown_spans(
                     plain_start = i;
                     continue;
                 }
-            }
-        }
 
         // Image `![alt](url)` or Link `[label](url)`
         let is_img = b == b'!' && s[i..].starts_with("![");
@@ -3690,7 +3658,7 @@ fn render_inline_wysiwyg_block(
                         let mut has_cmd_shift_v = false;
                         for ev in &mut i.events {
                             match ev {
-                                egui::Event::Paste(ref mut pasted) => {
+                                egui::Event::Paste(pasted) => {
                                     has_paste_event = true;
                                     if !shift_held && !pasted.is_empty() {
                                         let html =
@@ -3715,15 +3683,12 @@ fn render_inline_wysiwyg_block(
                                 _ => {}
                             }
                         }
-                        if has_cmd_shift_v && !has_paste_event {
-                            if let Some(plain) =
+                        if has_cmd_shift_v && !has_paste_event
+                            && let Some(plain) =
                                 crate::document::clipboard::read_os_clipboard_plain_text()
-                            {
-                                if !plain.is_empty() {
+                                && !plain.is_empty() {
                                     i.events.push(egui::Event::Paste(plain));
                                 }
-                            }
-                        }
                     });
                 }
 
@@ -3813,8 +3778,8 @@ fn render_inline_wysiwyg_block(
                         buf.set_cursor((block_start + prefix_chars).min(buf.len_chars()), false);
                     }
                     did_click_select = true;
-                } else if is_double {
-                    if let Some(pos) = pointer_pos_opt {
+                } else if is_double
+                    && let Some(pos) = pointer_pos_opt {
                         let rel = pos - output.galley_pos;
                         let vis_ccursor =
                             output.galley.cursor_from_pos(rel).ccursor.index.min(text_chars);
@@ -3877,14 +3842,13 @@ fn render_inline_wysiwyg_block(
                         }
                         did_click_select = true;
                     }
-                }
 
                 let text_mutated = state.active_block_text != prev_block_text;
                 if !did_click_select && !text_mutated && !bidi.is_identity {
                     let pointer_pressed = ui.input(|i| i.pointer.any_pressed());
                     let is_drag = output.response.dragged() || output.response.drag_started();
-                    if (output.response.hovered() && pointer_pressed) || is_drag {
-                        if let Some(pos) = pointer_pos_opt {
+                    if ((output.response.hovered() && pointer_pressed) || is_drag)
+                        && let Some(pos) = pointer_pos_opt {
                             let rel = pos - output.galley_pos;
                             let vis_idx = output
                                 .galley
@@ -3910,7 +3874,6 @@ fn render_inline_wysiwyg_block(
                             output.state.clone().store(ui.ctx(), inline_id);
                             state.last_cursor_range = Some(cr);
                         }
-                    }
                 }
 
                 if text_mutated && !src_lines.is_empty() && src_lines.end <= buf.len_lines() {
@@ -4147,9 +4110,9 @@ fn render_inline_wysiwyg_block(
                     }
                 }
 
-                if !did_mutate_sync && !did_click_select && !state.sync_cursor_from_buf {
-                    if let Some(cr) = output.state.cursor.char_range() {
-                        if output.response.has_focus() {
+                if !did_mutate_sync && !did_click_select && !state.sync_cursor_from_buf
+                    && let Some(cr) = output.state.cursor.char_range()
+                        && output.response.has_focus() {
                             state.last_cursor_range = Some(cr);
                             let block_start_char = buf.line_to_char(src_lines.start);
                             let prefix_chars = state.active_block_prefix.chars().count();
@@ -4177,8 +4140,6 @@ fn render_inline_wysiwyg_block(
                                 buf.cache_current_selection();
                             }
                         }
-                    }
-                }
 
                 let clip = ui.painter_at(output.text_clip_rect.expand(2.0));
                 if !state.search_matches.is_empty() && !src_lines.is_empty() && src_lines.end <= buf.len_lines()
@@ -4484,9 +4445,9 @@ fn render_inline_wysiwyg_block(
     if !res.did_click_select {
         let margin_triple = ui.input(|i| i.pointer.button_triple_clicked(egui::PointerButton::Primary));
         let margin_double = ui.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary));
-        if margin_triple || margin_double {
-            if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
-                if outer_resp.rect.contains(pos) && !res.text_resp.rect.contains(pos) {
+        if (margin_triple || margin_double)
+            && let Some(pos) = ui.input(|i| i.pointer.interact_pos())
+                && outer_resp.rect.contains(pos) && !res.text_resp.rect.contains(pos) {
                     let text_chars = state.active_block_text.chars().count();
                     let (s, e) = if margin_triple {
                         (0, text_chars)
@@ -4528,8 +4489,6 @@ fn render_inline_wysiwyg_block(
                         );
                     }
                 }
-            }
-        }
     }
 
     if !show_markup && !is_code {
@@ -4761,8 +4720,8 @@ fn render_doc_block(
                 if let RunsClickOutcome::Action(a) = runs_res.outcome {
                     action = a;
                 }
-                if wysiwyg && !read_only && !handled_nav && !state.autoscroll_active {
-                    if let Some(click_rect) =
+                if wysiwyg && !read_only && !handled_nav && !state.autoscroll_active
+                    && let Some(click_rect) =
                         clip_inactive_click_rect(resp.rect, &runs_res.interactive_rects)
                     {
                         let a = handle_inactive_wysiwyg_click(
@@ -4783,7 +4742,6 @@ fn render_doc_block(
                             action = a;
                         }
                     }
-                }
             }
             if *level <= 2 {
                 let (rect, _) = ui.allocate_exact_size(Vec2::new(content_w, 6.0), Sense::hover());
@@ -4872,8 +4830,8 @@ fn render_doc_block(
                 if let RunsClickOutcome::Action(a) = runs_res.outcome {
                     action = a;
                 }
-                if wysiwyg && !read_only && !handled_nav && !state.autoscroll_active {
-                    if let Some(click_rect) =
+                if wysiwyg && !read_only && !handled_nav && !state.autoscroll_active
+                    && let Some(click_rect) =
                         clip_inactive_click_rect(resp.rect, &runs_res.interactive_rects)
                     {
                         let a = handle_inactive_wysiwyg_click(
@@ -4894,7 +4852,6 @@ fn render_doc_block(
                             action = a;
                         }
                     }
-                }
             }
         }
         DocBlock::BlockQuote {
@@ -5206,8 +5163,8 @@ fn render_doc_block(
                                                 },
                                             );
                                         });
-                                    if state.auto_calc_math {
-                                        if let Some(res_str) =
+                                    if state.auto_calc_math
+                                        && let Some(res_str) =
                                             state.cached_math_preview(trimmed_code)
                                         {
                                             ui.add_space(4.0);
@@ -5215,7 +5172,6 @@ fn render_doc_block(
                                                 render_calc_preview_pill(ui, theme, &res_str);
                                             });
                                         }
-                                    }
                                 }
                             } else if is_empty_code {
                                 let hint = if wysiwyg && !read_only {
@@ -6067,11 +6023,9 @@ fn present_galley_text_chunk(
                 .or_else(|| ui.input(|i| i.pointer.interact_pos()));
             if let Some(target) = click_pos
                 .and_then(|pos| hit_test_galley_link(&galley, galley_pos, pos, &link_spans))
-            {
-                if read_only || cmd_down {
+                && (read_only || cmd_down) {
                     return RunsClickOutcome::Action(nav_target_action(target));
                 }
-            }
             if !read_only && !cmd_down && !src_lines.is_empty() {
                 return RunsClickOutcome::Action(ReaderAction::JumpToSourceLine(src_lines.start));
             }
@@ -6466,8 +6420,8 @@ fn render_runs_with_images(
                         let row_resp = ui.horizontal_wrapped(|ui| {
                             ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
                             for (offset, badge_run) in runs[group_start..group_end].iter().enumerate() {
-                                if let Some(ref badge_url) = badge_run.image_url {
-                                    if let Some(act) = render_remote_badge_pill(
+                                if let Some(ref badge_url) = badge_run.image_url
+                                    && let Some(act) = render_remote_badge_pill(
                                         ui,
                                         badge_run,
                                         badge_url,
@@ -6480,7 +6434,6 @@ fn render_runs_with_images(
                                     ) {
                                         img_action = Some(act);
                                     }
-                                }
                             }
                         });
                         interactive_rects.push(row_resp.response.rect);
@@ -7206,11 +7159,10 @@ fn build_runs_layout_job(
         ..Default::default()
     };
 
-    if direction == TextDirection::Ltr {
-        if let Some(prefix) = prefix_markup {
+    if direction == TextDirection::Ltr
+        && let Some(prefix) = prefix_markup {
             push_str(&mut job, &mut running_chars, prefix, markup_fmt.clone());
         }
-    }
 
     let ordered_runs: Vec<&InlineRun> = if direction == TextDirection::Rtl {
         runs.iter().rev().collect()
@@ -7317,14 +7269,13 @@ fn build_runs_layout_job(
                         target: NavTarget::Footnote(name),
                     });
                 }
-            } else if let Some(ref url) = run.link_url {
-                if let Some(target) = classify_link_url(url) {
+            } else if let Some(ref url) = run.link_url
+                && let Some(target) = classify_link_url(url) {
                     link_spans.push(GalleyLinkSpan {
                         char_range: text_start..text_end,
                         target: NavTarget::Link(url.clone(), target),
                     });
                 }
-            }
         }
 
         if show_inline_markup && !run.is_footnote_ref {
@@ -7354,11 +7305,10 @@ fn build_runs_layout_job(
         }
     }
 
-    if direction == TextDirection::Rtl {
-        if let Some(prefix) = prefix_markup {
+    if direction == TextDirection::Rtl
+        && let Some(prefix) = prefix_markup {
             push_str(&mut job, &mut running_chars, prefix, markup_fmt);
         }
-    }
     (job, link_spans)
 }
 

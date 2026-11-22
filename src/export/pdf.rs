@@ -754,12 +754,11 @@ fn inject_pdf_outlines_and_links(
             doc.objects
                 .insert(outlines_id, LoObject::Dictionary(outlines_dict));
 
-            if let Ok(catalog_obj) = doc.get_object_mut(catalog_id) {
-                if let Ok(catalog_dict) = catalog_obj.as_dict_mut() {
+            if let Ok(catalog_obj) = doc.get_object_mut(catalog_id)
+                && let Ok(catalog_dict) = catalog_obj.as_dict_mut() {
                     catalog_dict.set("Outlines", LoObject::Reference(outlines_id));
                     catalog_dict.set("PageMode", LoObject::Name(b"UseOutlines".to_vec()));
                 }
-            }
         }
     }
 
@@ -1090,8 +1089,8 @@ fn render_runs_with_images(
     };
 
     for run in runs {
-        if let Some(ref img_url) = run.image_url {
-            if let Some((xobj, w_px, h_px)) =
+        if let Some(ref img_url) = run.image_url
+            && let Some((xobj, w_px, h_px)) =
                 load_pdf_image_xobject(img_url, pdf.base_dir.as_deref())
             {
                 flush_text(pdf, &mut pending_text);
@@ -1110,7 +1109,6 @@ fn render_runs_with_images(
                 );
                 continue;
             }
-        }
         pending_text.push(run.clone());
     }
     flush_text(pdf, &mut pending_text);
@@ -1240,11 +1238,10 @@ fn render_block(pdf: &mut PdfCursor, block: &DocBlock, indent_mm: f32, in_quote:
             pdf.y_mm -= 2.0;
         }
         DocBlock::CodeBlock { info, code, .. } => {
-            if crate::document::ast::is_mermaid_code_info(info) && !code.trim().is_empty() {
-                if let Some((png_bytes, _, _)) =
+            if crate::document::ast::is_mermaid_code_info(info) && !code.trim().is_empty()
+                && let Some((png_bytes, _, _)) =
                     crate::document::mermaid::render_mermaid_to_png_bytes(code, 2.0)
-                {
-                    if let Some((xobj, w_px, h_px)) = png_bytes_to_pdf_image_xobject(&png_bytes) {
+                    && let Some((xobj, w_px, h_px)) = png_bytes_to_pdf_image_xobject(&png_bytes) {
                         let max_h_mm =
                             (pdf.top_y_mm - pdf.bottom_y_mm - 12.0).clamp(40.0, 162.0);
                         embed_pdf_image_xobject(
@@ -1262,8 +1259,6 @@ fn render_block(pdf: &mut PdfCursor, block: &DocBlock, indent_mm: f32, in_quote:
                         pdf.y_mm -= 2.0;
                         return;
                     }
-                }
-            }
             if crate::document::ast::is_math_code_info(info) {
                 let trimmed = code.trim();
                 if trimmed.is_empty() {
@@ -1276,8 +1271,8 @@ fn render_block(pdf: &mut PdfCursor, block: &DocBlock, indent_mm: f32, in_quote:
                     true,
                     [20, 24, 32, 255],
                     [255, 255, 255, 255],
-                ) {
-                    if let Some((xobj, w_px, h_px)) = png_bytes_to_pdf_image_xobject(&png_bytes) {
+                )
+                    && let Some((xobj, w_px, h_px)) = png_bytes_to_pdf_image_xobject(&png_bytes) {
                         let max_h_mm =
                             (pdf.top_y_mm - pdf.bottom_y_mm - 12.0).clamp(40.0, 115.0);
                         embed_pdf_image_xobject(
@@ -1295,7 +1290,6 @@ fn render_block(pdf: &mut PdfCursor, block: &DocBlock, indent_mm: f32, in_quote:
                         pdf.y_mm -= 2.0;
                         return;
                     }
-                }
             }
 
             let font_pt = 9.0;
@@ -1811,8 +1805,8 @@ fn draw_styled_line(
             });
         }
 
-        if seg.width_mm > 0.0 {
-            if let Some(target) = classify_pdf_link_target(&seg.run) {
+        if seg.width_mm > 0.0
+            && let Some(target) = classify_pdf_link_target(&seg.run) {
                 let x1_pt = x / PT_TO_MM;
                 let y1_pt = ((y_baseline - 1.2) / PT_TO_MM).max(0.0);
                 let x2_pt = (x + seg.width_mm) / PT_TO_MM;
@@ -1823,7 +1817,6 @@ fn draw_styled_line(
                     target,
                 });
             }
-        }
 
         x += seg.width_mm;
     }
@@ -2014,8 +2007,8 @@ fn append_seg(lines: &mut [StyledLine], template: &InlineRun, text: String, widt
         text
     };
     if let Some(last_line) = lines.last_mut() {
-        if let Some(prev) = last_line.last_mut() {
-            if prev.run.image_url == template.image_url
+        if let Some(prev) = last_line.last_mut()
+            && prev.run.image_url == template.image_url
                 && prev.run.is_footnote_ref == template.is_footnote_ref
                 && prev.run.is_math == template.is_math
                 && prev.run.bold == template.bold
@@ -2029,7 +2022,6 @@ fn append_seg(lines: &mut [StyledLine], template: &InlineRun, text: String, widt
                 prev.width_mm += width_mm;
                 return;
             }
-        }
         let mut run = template.clone();
         run.text = display_text;
         last_line.push(StyledSegment { run, width_mm });

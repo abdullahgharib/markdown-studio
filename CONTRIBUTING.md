@@ -19,7 +19,7 @@ Before starting work on a major change, consider opening an issue first so we ca
 
 ### Prerequisites
 
-- **Rust** (stable toolchain via [rustup](https://rustup.rs/), edition 2021)
+- **Rust** (stable toolchain via [rustup](https://rustup.rs/), edition 2024)
 
 #### Windows
 - MSVC build tools (Visual Studio Build Tools with C++ desktop workload).

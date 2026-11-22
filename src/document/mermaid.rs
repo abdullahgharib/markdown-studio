@@ -2154,15 +2154,14 @@ fn parse_node_token(raw: &str, graph: &mut GraphModel, active_sg: Option<usize>)
     let mut shape_opt: Option<FlowShape> = None;
 
     for &(open, close, shp) in shape_patterns {
-        if let Some(open_pos) = s.find(open) {
-            if open_pos > 0 && s.ends_with(close) && open_pos + open.len() <= s.len() - close.len()
+        if let Some(open_pos) = s.find(open)
+            && open_pos > 0 && s.ends_with(close) && open_pos + open.len() <= s.len() - close.len()
             {
                 id_part = s[..open_pos].trim();
                 label_opt = Some(clean_mermaid_label(&s[open_pos + open.len()..s.len() - close.len()]));
                 shape_opt = Some(shp);
                 break;
             }
-        }
     }
 
     let id = id_part.trim();
@@ -2170,21 +2169,19 @@ fn parse_node_token(raw: &str, graph: &mut GraphModel, active_sg: Option<usize>)
         return None;
     }
     let idx = graph.ensure_node(id, active_sg);
-    if let Some(lbl) = label_opt {
-        if !lbl.is_empty() {
+    if let Some(lbl) = label_opt
+        && !lbl.is_empty() {
             graph.nodes[idx].label = lbl;
         }
-    }
     if let Some(shp) = shape_opt {
         graph.nodes[idx].shape = shp;
     }
-    if let Some(cls) = class_name {
-        if let Some(&(f, st, tc)) = graph.class_defs.get(&cls) {
+    if let Some(cls) = class_name
+        && let Some(&(f, st, tc)) = graph.class_defs.get(&cls) {
             graph.nodes[idx].fill_override = f;
             graph.nodes[idx].stroke_override = st;
             graph.nodes[idx].text_override = tc;
         }
-    }
     Some(idx)
 }
 
@@ -2224,12 +2221,11 @@ fn try_parse_flow_edge_at(s: &str) -> Option<ParsedFlowEdge> {
             let mut label = String::new();
             let after_ws = after.trim_start();
             let ws_skip = after.len() - after_ws.len();
-            if let Some(after_bar) = after_ws.strip_prefix('|') {
-                if let Some(end_bar) = after_bar.find('|') {
+            if let Some(after_bar) = after_ws.strip_prefix('|')
+                && let Some(end_bar) = after_bar.find('|') {
                     label = clean_mermaid_label(&after_bar[..end_bar]);
                     consumed += ws_skip + 1 + end_bar + 1;
                 }
-            }
             return Some(ParsedFlowEdge {
                 style,
                 start_marker: sm,
@@ -2263,8 +2259,8 @@ fn try_parse_flow_edge_at(s: &str) -> Option<ParsedFlowEdge> {
             });
         }
     }
-    if let Some(after_dot) = rest.strip_prefix("-. ") {
-        if let Some(end_pos) = after_dot.find(" .->") {
+    if let Some(after_dot) = rest.strip_prefix("-. ")
+        && let Some(end_pos) = after_dot.find(" .->") {
             let lbl = clean_mermaid_label(&after_dot[..end_pos]);
             return Some(ParsedFlowEdge {
                 style: EdgeLineStyle::Dotted,
@@ -2274,9 +2270,8 @@ fn try_parse_flow_edge_at(s: &str) -> Option<ParsedFlowEdge> {
                 byte_len: trim_start_len + 3 + end_pos + 4,
             });
         }
-    }
-    if let Some(after_eq) = rest.strip_prefix("== ") {
-        if let Some(end_pos) = after_eq.find(" ==>") {
+    if let Some(after_eq) = rest.strip_prefix("== ")
+        && let Some(end_pos) = after_eq.find(" ==>") {
             let lbl = clean_mermaid_label(&after_eq[..end_pos]);
             return Some(ParsedFlowEdge {
                 style: EdgeLineStyle::Thick,
@@ -2286,7 +2281,6 @@ fn try_parse_flow_edge_at(s: &str) -> Option<ParsedFlowEdge> {
                 byte_len: trim_start_len + 3 + end_pos + 4,
             });
         }
-    }
 
     None
 }
@@ -2316,15 +2310,14 @@ fn split_flow_statement(line: &str) -> Vec<(String, Option<ParsedFlowEdge>)> {
             _ => {}
         }
 
-        if !in_dq && !in_sq && paren_depth == 0 && brack_depth == 0 && brace_depth == 0 {
-            if let Some(edge) = try_parse_flow_edge_at(&line[i..]) {
+        if !in_dq && !in_sq && paren_depth == 0 && brack_depth == 0 && brace_depth == 0
+            && let Some(edge) = try_parse_flow_edge_at(&line[i..]) {
                 let node_str = line[seg_start..i].trim().to_string();
                 parts.push((node_str, Some(edge.clone())));
                 i += edge.byte_len;
                 seg_start = i;
                 continue;
             }
-        }
         i += line[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
     }
 
@@ -2450,8 +2443,8 @@ fn build_flowchart_scene(
         }
         if let Some(after_cls) = trimmed.strip_prefix("class ") {
             let mut parts = after_cls.split_whitespace();
-            if let (Some(ids), Some(cls)) = (parts.next(), parts.next()) {
-                if let Some(&(f, st, tc)) = graph.class_defs.get(cls) {
+            if let (Some(ids), Some(cls)) = (parts.next(), parts.next())
+                && let Some(&(f, st, tc)) = graph.class_defs.get(cls) {
                     for id in ids.split(',') {
                         let idx = graph.ensure_node(id.trim(), sg_stack.last().copied());
                         graph.nodes[idx].fill_override = f.or(graph.nodes[idx].fill_override);
@@ -2459,7 +2452,6 @@ fn build_flowchart_scene(
                         graph.nodes[idx].text_override = tc.or(graph.nodes[idx].text_override);
                     }
                 }
-            }
             continue;
         }
         if lower.starts_with("linkstyle ") || lower.starts_with("click ") {
@@ -2755,8 +2747,8 @@ fn build_sequence_scene(
 
     let mut min_col_gap = vec![128.0_f32; participants.len().saturating_sub(1)];
     for ev in &events {
-        if let SeqEvent::Message(m) = ev {
-            if m.from != m.to {
+        if let SeqEvent::Message(m) = ev
+            && m.from != m.to {
                 let lo = m.from.min(m.to);
                 let hi = m.from.max(m.to);
                 let span = hi - lo;
@@ -2766,7 +2758,6 @@ fn build_sequence_scene(
                     *gap = gap.max(needed_per_step);
                 }
             }
-        }
     }
 
     let mut col_x = Vec::with_capacity(participants.len());
@@ -3033,8 +3024,8 @@ fn build_sequence_scene(
                     if m.activate_to {
                         active_stacks[m.to].push(y_line);
                     }
-                    if m.deactivate_from {
-                        if let Some(sy) = active_stacks[m.from].pop() {
+                    if m.deactivate_from
+                        && let Some(sy) = active_stacks[m.from].pop() {
                             activation_items.push(SceneItem::RoundedRect {
                                 x0: x_from - 5.0,
                                 y0: sy,
@@ -3046,7 +3037,6 @@ fn build_sequence_scene(
                                 dashed: false,
                             });
                         }
-                    }
                     cur_y += 42.0;
                 }
             }
@@ -3468,8 +3458,8 @@ fn build_class_scene(
 
 fn split_quoted_multiplicity(raw: &str, mult_first: bool) -> (&str, String) {
     let t = raw.trim();
-    if let Some(q1) = t.find('"') {
-        if let Some(q2) = t[q1 + 1..].find('"') {
+    if let Some(q1) = t.find('"')
+        && let Some(q2) = t[q1 + 1..].find('"') {
             let mult = t[q1 + 1..q1 + 1 + q2].to_string();
             let name = if mult_first {
                 t[q1 + 1 + q2 + 1..].trim()
@@ -3478,7 +3468,6 @@ fn split_quoted_multiplicity(raw: &str, mult_first: bool) -> (&str, String) {
             };
             return (name, mult);
         }
-    }
     (t, String::new())
 }
 
@@ -3552,14 +3541,13 @@ fn build_er_scene(
             continue;
         }
 
-        if let Some(open_b) = trimmed.find('{') {
-            if trimmed.ends_with('{') && !trimmed.contains("--") && !trimmed.contains("..") {
+        if let Some(open_b) = trimmed.find('{')
+            && trimmed.ends_with('{') && !trimmed.contains("--") && !trimmed.contains("..") {
                 let name = trimmed[..open_b].trim();
                 let idx = ensure_entity_node(&mut graph, name);
                 cur_entity = Some(idx);
                 continue;
             }
-        }
 
         // Look for ER connector (-- or ..) surrounded by cardinality tokens
         let conn = trimmed
@@ -3626,13 +3614,11 @@ fn build_pie_scene(
             title = Some(clean_mermaid_label(t));
             continue;
         }
-        if let Some((lbl_part, val_part)) = trimmed.rsplit_once(':') {
-            if let Ok(val) = val_part.trim().parse::<f64>() {
-                if val > 0.0 {
+        if let Some((lbl_part, val_part)) = trimmed.rsplit_once(':')
+            && let Ok(val) = val_part.trim().parse::<f64>()
+                && val > 0.0 {
                     slices.push((clean_mermaid_label(lbl_part), val));
                 }
-            }
-        }
     }
 
     if slices.is_empty() {

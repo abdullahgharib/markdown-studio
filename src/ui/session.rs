@@ -282,11 +282,10 @@ fn split_top_level_json_objects(array_body: &str) -> Vec<&str> {
             '}' => {
                 if depth > 0 {
                     depth -= 1;
-                    if depth == 0 {
-                        if let Some(start) = obj_start.take() {
+                    if depth == 0
+                        && let Some(start) = obj_start.take() {
                             objs.push(&array_body[start..=idx]);
                         }
-                    }
                 }
             }
             ']' if depth == 0 => break,
@@ -383,11 +382,10 @@ pub struct BackgroundSessionSaver {
 impl BackgroundSessionSaver {
     /// Queues `job` for asynchronous writing, lazily spawning `"md-session-saver"` on first use.
     pub fn enqueue(&mut self, job: SessionSaveJob) {
-        if let Some(ref tx) = self.tx {
-            if tx.send(job.clone()).is_ok() {
+        if let Some(ref tx) = self.tx
+            && tx.send(job.clone()).is_ok() {
                 return;
             }
-        }
         let (tx, rx) = mpsc::channel::<SessionSaveJob>();
         if tx.send(job).is_err() {
             return;

@@ -750,7 +750,7 @@ Second copy.
     );
     let page2_or_later_ids: Vec<lopdf::ObjectId> = pages
         .iter()
-        .filter(|(&num, _)| num >= 2)
+        .filter(|&(&num, _)| num >= 2)
         .map(|(_, &id)| id)
         .collect();
     assert!(

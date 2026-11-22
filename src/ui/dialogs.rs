@@ -44,11 +44,10 @@ impl TableEditorModal {
     pub fn open_with(&mut self, mut table: TableData) {
         for row in &mut table.rows {
             for cell in row.iter_mut() {
-                if cell.trim_start().starts_with("\\=") {
-                    if let (Some(f), _) = calc::extract_table_cell_formula(cell) {
+                if cell.trim_start().starts_with("\\=")
+                    && let (Some(f), _) = calc::extract_table_cell_formula(cell) {
                         *cell = f;
                     }
-                }
             }
         }
         self.selected_cell = if !table.rows.is_empty() && table.col_count() > 0 {
@@ -610,8 +609,8 @@ impl PrintDialogModal {
         if !self.open {
             return None;
         }
-        if let Some(ref rx) = self.printer_rx {
-            if let Ok(list) = rx.try_recv() {
+        if let Some(ref rx) = self.printer_rx
+            && let Ok(list) = rx.try_recv() {
                 self.printers = list;
                 self.loading_printers = false;
                 self.printer_rx = None;
@@ -624,7 +623,6 @@ impl PrintDialogModal {
                         .map(|p| p.name.clone());
                 }
             }
-        }
 
         let mut keep_open = true;
         let mut submit_job: Option<PrintJobOptions> = None;
@@ -914,11 +912,10 @@ pub struct BidiInputState {
 impl BidiInputState {
     fn clamp_cursor(&mut self, char_len: usize) {
         self.cursor_char = self.cursor_char.min(char_len);
-        if let Some(a) = self.selection_anchor {
-            if a > char_len {
+        if let Some(a) = self.selection_anchor
+            && a > char_len {
                 self.selection_anchor = Some(char_len);
             }
-        }
     }
 
     fn selection_range(&self, char_len: usize) -> Option<Range<usize>> {
@@ -1412,8 +1409,8 @@ fn render_bidi_singleline_input(
     };
 
     if let Some(ref g) = galley {
-        if focused {
-            if let Some(sel) = state.selection_range(char_len) {
+        if focused
+            && let Some(sel) = state.selection_range(char_len) {
                 for vr in bidi_map.visual_ranges_for_logical_span(sel.start, sel.end) {
                     let x1 = g.pos_from_ccursor(egui::text::CCursor::new(vr.start)).min.x;
                     let x2 = g.pos_from_ccursor(egui::text::CCursor::new(vr.end)).min.x;
@@ -1431,7 +1428,6 @@ fn render_bidi_singleline_input(
                     }
                 }
             }
-        }
         clip.galley(egui::pos2(text_origin_x, text_y), g.clone(), theme.text_primary);
     } else {
         let hint_galley = ui.fonts(|f| {
@@ -1493,8 +1489,8 @@ impl BackgroundSearcher {
         if self.in_flight.as_ref() == Some(&key) {
             return;
         }
-        if let Some(ref tx) = self.tx {
-            if tx
+        if let Some(ref tx) = self.tx
+            && tx
                 .send(SearchJob {
                     key: key.clone(),
                     rope: rope.clone(),
@@ -1505,7 +1501,6 @@ impl BackgroundSearcher {
                 self.in_flight = Some(key);
                 return;
             }
-        }
         let (job_tx, job_rx) = mpsc::channel::<SearchJob>();
         let (res_tx, res_rx) = mpsc::channel::<SearchJobResult>();
         if job_tx
@@ -1746,11 +1741,10 @@ impl FindReplaceBar {
         } else {
             self.bg_searcher
                 .request(key.clone(), buf.rope().clone(), ctx.cloned());
-            if self.bg_searcher.is_pending(&key) {
-                if let Some(c) = ctx {
+            if self.bg_searcher.is_pending(&key)
+                && let Some(c) = ctx {
                     c.request_repaint_after(Duration::from_millis(30));
                 }
-            }
         }
     }
 

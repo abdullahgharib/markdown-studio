@@ -78,11 +78,10 @@ impl LaunchArgs {
                 continue;
             }
             if s == "--window-pos" {
-                if let Some(next) = iter.next() {
-                    if let Some(pos) = parse_window_pos(next.as_ref()) {
+                if let Some(next) = iter.next()
+                    && let Some(pos) = parse_window_pos(next.as_ref()) {
                         out.window_pos = Some(pos);
                     }
-                }
                 continue;
             }
             if !s.is_empty() {
@@ -312,11 +311,10 @@ fn generate_nonce() -> String {
 }
 
 fn write_file_atomic(target: &Path, body: &[u8]) -> io::Result<()> {
-    if let Some(parent) = target.parent() {
-        if !parent.as_os_str().is_empty() {
+    if let Some(parent) = target.parent()
+        && !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
         }
-    }
     let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp_name = format!(
         "{}.tmp.{}.{}",
@@ -563,11 +561,10 @@ impl Drop for SingleInstanceServer {
         if let Some(handle) = self.join.take() {
             let _ = handle.join();
         }
-        if let Ok((_, file_nonce)) = read_lock_file(&self.lock_path) {
-            if file_nonce == self.nonce {
+        if let Ok((_, file_nonce)) = read_lock_file(&self.lock_path)
+            && file_nonce == self.nonce {
                 let _ = std::fs::remove_file(&self.lock_path);
             }
-        }
         let _ = std::fs::remove_file(&self.win_info_path);
     }
 }

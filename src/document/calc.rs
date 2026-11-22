@@ -1198,15 +1198,13 @@ fn unescape_markdown_formula(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
-        if c == '\\' {
-            if let Some(&next) = chars.peek() {
-                if matches!(next, '=' | '*' | '_' | '<' | '>' | '\\' | '[' | ']' | '|') {
+        if c == '\\'
+            && let Some(&next) = chars.peek()
+                && matches!(next, '=' | '*' | '_' | '<' | '>' | '\\' | '[' | ']' | '|') {
                     out.push(next);
                     chars.next();
                     continue;
                 }
-            }
-        }
         out.push(c);
     }
     out
@@ -1217,15 +1215,14 @@ pub fn extract_table_cell_formula(raw: &str) -> (Option<String>, String) {
     if trimmed.starts_with('=') || trimmed.starts_with("\\=") {
         return (Some(unescape_markdown_formula(trimmed)), String::new());
     }
-    if let Some(cmt_start) = trimmed.rfind("<!--") {
-        if let Some(cmt_rel_end) = trimmed[cmt_start + 4..].find("-->") {
+    if let Some(cmt_start) = trimmed.rfind("<!--")
+        && let Some(cmt_rel_end) = trimmed[cmt_start + 4..].find("-->") {
             let inner = trimmed[cmt_start + 4..cmt_start + 4 + cmt_rel_end].trim();
             if inner.starts_with('=') && cmt_start + 4 + cmt_rel_end + 3 == trimmed.len() {
                 let val = trimmed[..cmt_start].trim_end().to_string();
                 return (Some(inner.to_string()), val);
             }
         }
-    }
     (None, raw.to_string())
 }
 
@@ -1699,8 +1696,8 @@ impl<'a, 'b> XlParser<'a, 'b> {
             self.tokens.get(self.pos),
             self.tokens.get(self.pos + 1),
             self.tokens.get(self.pos + 2),
-        ) {
-            if matches!(
+        )
+            && matches!(
                 self.tokens.get(self.pos + 3),
                 Some(XlTok::Comma | XlTok::RParen)
             ) {
@@ -1715,7 +1712,6 @@ impl<'a, 'b> XlParser<'a, 'b> {
                 }
                 return Ok(vals);
             }
-        }
         if let Some(XlTok::Ident(dir)) = self.peek() {
             let up = dir.to_ascii_uppercase();
             if matches!(up.as_str(), "ABOVE" | "BELOW" | "LEFT" | "RIGHT")

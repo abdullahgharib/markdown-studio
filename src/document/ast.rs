@@ -367,17 +367,15 @@ fn normalize_atx_heading_space<'a>(line: &'a str) -> Cow<'a, str> {
         return Cow::Borrowed(line);
     }
     let hashes = trimmed.bytes().take_while(|&b| b == b'#').count();
-    if (1..=6).contains(&hashes) {
-        if let Some(next_ch) = trimmed[hashes..].chars().next() {
-            if next_ch != '#' && !next_ch.is_whitespace() {
+    if (1..=6).contains(&hashes)
+        && let Some(next_ch) = trimmed[hashes..].chars().next()
+            && next_ch != '#' && !next_ch.is_whitespace() {
                 let mut out = String::with_capacity(line.len() + 1);
                 out.push_str(&line[..lead_spaces + hashes]);
                 out.push(' ');
                 out.push_str(&trimmed[hashes..]);
                 return Cow::Owned(out);
             }
-        }
-    }
     Cow::Borrowed(line)
 }
 
@@ -593,11 +591,10 @@ fn classify_multiline_math_line(clean_line: &str, close_delim: &str) -> MathLook
     if parse_fence_open(trimmed).is_some() {
         return MathLookahead::AbortFence;
     }
-    if let Some(prefix) = trimmed.strip_suffix(close_delim) {
-        if close_delim == "\\]" || !is_escaped_at(prefix.as_bytes(), prefix.len()) {
+    if let Some(prefix) = trimmed.strip_suffix(close_delim)
+        && (close_delim == "\\]" || !is_escaped_at(prefix.as_bytes(), prefix.len())) {
             return MathLookahead::Close;
         }
-    }
     MathLookahead::Continue
 }
 
@@ -1574,8 +1571,8 @@ fn push_run(out: &mut Vec<InlineRun>, text: String, style: &InlineStyle, code: b
     if text.is_empty() {
         return;
     }
-    if let Some(last) = out.last_mut() {
-        if last.image_url.is_none()
+    if let Some(last) = out.last_mut()
+        && last.image_url.is_none()
             && !last.is_footnote_ref
             && !last.is_math
             && last.bold == style.bold
@@ -1588,7 +1585,6 @@ fn push_run(out: &mut Vec<InlineRun>, text: String, style: &InlineStyle, code: b
             last.text.push_str(&text);
             return;
         }
-    }
     out.push(InlineRun {
         text,
         bold: style.bold,

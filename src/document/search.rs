@@ -587,8 +587,8 @@ fn find_all_matches_internal_rope(
         && scope_slice.len_bytes() >= STREAMING_REGEX_BYTES_THRESHOLD
         && ((!opts.use_regex && !query.contains('\n') && !query.contains('\r'))
             || (opts.use_regex && can_stream_regex_by_line(query)));
-    if can_stream_lines {
-        if let Some(matches) = find_all_regex_streaming_lines(
+    if can_stream_lines
+        && let Some(matches) = find_all_regex_streaming_lines(
             rope,
             scope_start,
             scope_end,
@@ -603,7 +603,6 @@ fn find_all_matches_internal_rope(
                 error: None,
             };
         }
-    }
 
     let scope_is_ascii = scope_slice.len_bytes() == scope_slice.len_chars();
     let scope_str = scope_slice.to_string();

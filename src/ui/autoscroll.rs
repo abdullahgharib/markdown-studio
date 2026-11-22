@@ -127,8 +127,8 @@ impl AutoScrollState {
             return Some((self.target, scroll_delta_y));
         }
 
-        if middle_pressed {
-            if let Some(pos) = pointer_pos {
+        if middle_pressed
+            && let Some(pos) = pointer_pos {
                 let target = if editor_rect.is_some_and(|r| r.contains(pos)) {
                     Some(AutoScrollTarget::Editor)
                 } else if reader_rect.is_some_and(|r| r.contains(pos)) {
@@ -148,7 +148,6 @@ impl AutoScrollState {
                     return Some((target, 0.0));
                 }
             }
-        }
 
         None
     }

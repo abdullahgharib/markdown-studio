@@ -496,14 +496,13 @@ fn append_block(
             }
         }
         DocBlock::CodeBlock { info, code, .. } => {
-            if crate::document::ast::is_mermaid_code_info(info) && !code.trim().is_empty() {
-                if let Some((png_bytes, pw, ph)) =
+            if crate::document::ast::is_mermaid_code_info(info) && !code.trim().is_empty()
+                && let Some((png_bytes, pw, ph)) =
                     crate::document::mermaid::render_mermaid_to_png_bytes(code, 2.0)
                 {
                     let p = centered_scaled_pic_paragraph(png_bytes, pw, ph, 560.0, 420.0, 24.0);
                     return docx.add_paragraph(p);
                 }
-            }
             if crate::document::ast::is_math_code_info(info) {
                 let trimmed = code.trim();
                 if trimmed.is_empty() {
@@ -1050,8 +1049,8 @@ fn add_inline_run_to_paragraph(
         return p.add_run(run);
     }
 
-    if inline.is_math && inline.link_url.is_none() && has_2d_math_command(&inline.text) {
-        if let Some((png_bytes, w, h)) = crate::document::math::render_math_to_png_bytes(
+    if inline.is_math && inline.link_url.is_none() && has_2d_math_command(&inline.text)
+        && let Some((png_bytes, w, h)) = crate::document::math::render_math_to_png_bytes(
             &inline.text,
             14.0,
             false,
@@ -1064,7 +1063,6 @@ fn add_inline_run_to_paragraph(
             let pic = Pic::new_with_dimensions(png_bytes, disp_w, disp_h);
             return p.add_run(Run::new().add_image(pic));
         }
-    }
 
     let resolved_text: std::borrow::Cow<'_, str> = if inline.is_math {
         std::borrow::Cow::Owned(crate::document::math::math_to_plain_text(&inline.text))

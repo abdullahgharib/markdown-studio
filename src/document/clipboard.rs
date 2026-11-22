@@ -37,11 +37,10 @@ pub fn extract_cf_html_fragment(raw: &str) -> String {
         }
     }
 
-    if let (Some(s), Some(e)) = (start_frag, end_frag) {
-        if s < e && e <= raw.len() && raw.is_char_boundary(s) && raw.is_char_boundary(e) {
+    if let (Some(s), Some(e)) = (start_frag, end_frag)
+        && s < e && e <= raw.len() && raw.is_char_boundary(s) && raw.is_char_boundary(e) {
             return raw[s..e].to_string();
         }
-    }
 
     if let Some(start_marker) = raw.find("<!--StartFragment-->") {
         let body_start = start_marker + "<!--StartFragment-->".len();
@@ -50,11 +49,10 @@ pub fn extract_cf_html_fragment(raw: &str) -> String {
         }
     }
 
-    if let (Some(s), Some(e)) = (start_html, end_html) {
-        if s < e && e <= raw.len() && raw.is_char_boundary(s) && raw.is_char_boundary(e) {
+    if let (Some(s), Some(e)) = (start_html, end_html)
+        && s < e && e <= raw.len() && raw.is_char_boundary(s) && raw.is_char_boundary(e) {
             return raw[s..e].to_string();
         }
-    }
 
     raw.to_string()
 }
@@ -166,7 +164,7 @@ mod win_clip {
     const CF_UNICODETEXT: u32 = 13;
 
     #[link(name = "user32")]
-    extern "system" {
+    unsafe extern "system" {
         fn OpenClipboard(h_wnd_new_owner: *mut c_void) -> i32;
         fn CloseClipboard() -> i32;
         fn RegisterClipboardFormatW(lpsz_format: *const u16) -> u32;
@@ -174,7 +172,7 @@ mod win_clip {
     }
 
     #[link(name = "kernel32")]
-    extern "system" {
+    unsafe extern "system" {
         fn GlobalLock(h_mem: *mut c_void) -> *const u8;
         fn GlobalUnlock(h_mem: *mut c_void) -> i32;
         fn GlobalSize(h_mem: *mut c_void) -> usize;
@@ -314,13 +312,11 @@ mod win_clip {
         let png_name: Vec<u16> = OsStr::new("PNG").encode_wide().chain(once(0)).collect();
         // SAFETY: `png_name` is a NUL-terminated UTF-16 string.
         let cf_png = unsafe { RegisterClipboardFormatW(png_name.as_ptr()) };
-        if cf_png != 0 {
-            if let Some(bytes) = read_global_clipboard_bytes(cf_png) {
-                if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        if cf_png != 0
+            && let Some(bytes) = read_global_clipboard_bytes(cf_png)
+                && bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
                     return Some(bytes);
                 }
-            }
-        }
         let dib = read_global_clipboard_bytes(CF_DIB)?;
         dib_to_png_bytes(&dib)
     }
@@ -614,11 +610,10 @@ pub fn read_os_clipboard_plain_text() -> Option<String> {
 /// Converts rich clipboard input (`html` or spreadsheet TSV `plain_text`) to clean GFM Markdown,
 /// falling back to `plain_text` verbatim when no rich structure is detected.
 pub fn smart_paste_markdown(plain_text: &str, html: Option<&str>) -> String {
-    if let Some(h) = html {
-        if let Some(md) = html_to_markdown(h) {
+    if let Some(h) = html
+        && let Some(md) = html_to_markdown(h) {
             return md;
         }
-    }
     if let Some(table_md) = tsv_to_markdown_table(plain_text) {
         return table_md;
     }
@@ -1076,11 +1071,10 @@ fn extract_code_lang_from_attrs(attrs: &[HtmlAttr]) -> Option<String> {
         for cls in class_val.split_whitespace() {
             let lower = cls.to_ascii_lowercase();
             for prefix in ["language-", "lang-", "highlight-source-"] {
-                if let Some(rest) = lower.strip_prefix(prefix) {
-                    if !rest.is_empty() {
+                if let Some(rest) = lower.strip_prefix(prefix)
+                    && !rest.is_empty() {
                         return Some(rest.to_string());
                     }
-                }
             }
         }
     }
@@ -1273,11 +1267,10 @@ impl HtmlMdConverter {
     }
 
     fn current_buffer_mut(&mut self) -> &mut String {
-        if let Some(tbl) = self.table.as_mut() {
-            if let Some((ref mut cell, _, _)) = tbl.active_cell {
+        if let Some(tbl) = self.table.as_mut()
+            && let Some((ref mut cell, _, _)) = tbl.active_cell {
                 return cell;
             }
-        }
         if self.inline_code_depth > 0 {
             return &mut self.inline_code_buf;
         }
@@ -1332,13 +1325,11 @@ impl HtmlMdConverter {
 
     fn request_breaks(&mut self, n: usize) {
         if self.table.is_some() {
-            if let Some(tbl) = self.table.as_mut() {
-                if let Some((ref mut cell, _, _)) = tbl.active_cell {
-                    if !cell.ends_with(' ') && !cell.is_empty() {
+            if let Some(tbl) = self.table.as_mut()
+                && let Some((ref mut cell, _, _)) = tbl.active_cell
+                    && !cell.ends_with(' ') && !cell.is_empty() {
                         cell.push(' ');
                     }
-                }
-            }
             return;
         }
         let line_tail = self.out.rsplit('\n').next().unwrap_or(&self.out).trim();
@@ -1406,13 +1397,11 @@ impl HtmlMdConverter {
             }
             "p" | "div" | "section" | "article" | "header" | "footer" | "main" | "aside" => {
                 if self.table.is_some() {
-                    if let Some(tbl) = self.table.as_mut() {
-                        if let Some((ref mut cell, _, _)) = tbl.active_cell {
-                            if !cell.is_empty() && !cell.ends_with(' ') {
+                    if let Some(tbl) = self.table.as_mut()
+                        && let Some((ref mut cell, _, _)) = tbl.active_cell
+                            && !cell.is_empty() && !cell.ends_with(' ') {
                                 cell.push(' ');
                             }
-                        }
-                    }
                 } else {
                     let breaks = if tag == "p" && self.list_stack.is_empty() {
                         2
@@ -1425,13 +1414,11 @@ impl HtmlMdConverter {
             }
             "br" => {
                 if self.table.is_some() {
-                    if let Some(tbl) = self.table.as_mut() {
-                        if let Some((ref mut cell, _, _)) = tbl.active_cell {
-                            if !cell.is_empty() && !cell.ends_with(' ') {
+                    if let Some(tbl) = self.table.as_mut()
+                        && let Some((ref mut cell, _, _)) = tbl.active_cell
+                            && !cell.is_empty() && !cell.ends_with(' ') {
                                 cell.push(' ');
                             }
-                        }
-                    }
                 } else if !self.in_heading && self.inline_code_depth == 0 {
                     self.flush_breaks();
                     self.out.push('\n');
@@ -1763,8 +1750,8 @@ impl HtmlMdConverter {
                 } else {
                     Some(&mut self.out)
                 };
-                if let Some(buf) = target_buf {
-                    if start_len <= buf.len() {
+                if let Some(buf) = target_buf
+                    && start_len <= buf.len() {
                         let inner = buf[start_len..].trim().replace('\n', " ");
                         buf.truncate(start_len);
                         if !inner.is_empty() {
@@ -1778,13 +1765,12 @@ impl HtmlMdConverter {
                             buf.push_str(&format!("[{href}]({href})"));
                         }
                     }
-                }
             }
             TagEffect::TableSection => {}
             TagEffect::TableRow => {}
             TagEffect::TableCell => {
-                if let Some(tbl) = self.table.as_mut() {
-                    if let Some((raw, colspan, align)) = tbl.active_cell.take() {
+                if let Some(tbl) = self.table.as_mut()
+                    && let Some((raw, colspan, align)) = tbl.active_cell.take() {
                         let cleaned = normalize_ws_collapse(&raw).trim().to_string();
                         let row = match tbl.rows.last_mut() {
                             Some(r) => r,
@@ -1804,7 +1790,6 @@ impl HtmlMdConverter {
                             });
                         }
                     }
-                }
             }
             TagEffect::Table => {
                 if let Some(mut tbl) = self.table.take() {
@@ -1912,15 +1897,14 @@ impl HtmlMdConverter {
             return;
         }
         if self.table.is_some() {
-            if let Some(tbl) = self.table.as_mut() {
-                if let Some((ref mut cell, _, _)) = tbl.active_cell {
+            if let Some(tbl) = self.table.as_mut()
+                && let Some((ref mut cell, _, _)) = tbl.active_cell {
                     if cell.is_empty() || (cell.ends_with(' ') && s.starts_with(' ')) {
                         cell.push_str(s.trim_start_matches(' '));
                     } else {
                         cell.push_str(s);
                     }
                 }
-            }
             return;
         }
         self.push_inline_str(s);

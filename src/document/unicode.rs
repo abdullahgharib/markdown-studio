@@ -157,13 +157,12 @@ pub fn detect_paragraph_direction(text: &str) -> TextDirection {
         // Skip task checkbox markers like `[x]` or `[ ]` before first strong character.
         if c == '[' {
             let mut look = chars.clone();
-            if let (Some(inner), Some(']')) = (look.next(), look.next()) {
-                if matches!(inner, ' ' | 'x' | 'X') {
+            if let (Some(inner), Some(']')) = (look.next(), look.next())
+                && matches!(inner, ' ' | 'x' | 'X') {
                     chars.next();
                     chars.next();
                     continue;
                 }
-            }
         }
         if is_rtl_char(c) {
             return TextDirection::Rtl;
@@ -442,8 +441,8 @@ fn shape_arabic_with_ligatures(text: &str) -> String {
             continue;
         }
         // Lam + Alef ligature substitution (including transparent haraka between Lam and Alef)
-        if c == '\u{0644}' {
-            if let Some(j) = next_base_char_idx(&chars, i) {
+        if c == '\u{0644}'
+            && let Some(j) = next_base_char_idx(&chars, i) {
                 let alef = chars[j];
                 if matches!(alef, '\u{0622}' | '\u{0623}' | '\u{0625}' | '\u{0627}') {
                     let join_prev = prev_base_char(&chars, i).is_some_and(connects_after);
@@ -463,7 +462,6 @@ fn shape_arabic_with_ligatures(text: &str) -> String {
                     continue;
                 }
             }
-        }
         if let Some((iso, fin, init, med)) = arabic_forms(c) {
             let join_prev = connects_before(c) && prev_base_char(&chars, i).is_some_and(connects_after);
             let join_next = connects_after(c)
@@ -593,12 +591,11 @@ pub fn shape_bidi_for_display(text: &str, base_dir: TextDirection) -> String {
     for (i, r) in cluster_ranges.into_iter().enumerate() {
         let d = resolved[i];
         let c_str = &shaped[r];
-        if let Some(last) = runs.last_mut() {
-            if last.0 == d {
+        if let Some(last) = runs.last_mut()
+            && last.0 == d {
                 last.1.push(c_str);
                 continue;
             }
-        }
         runs.push((d, vec![c_str]));
     }
 
@@ -777,12 +774,11 @@ impl VisualBidiLineMap {
         ranges.sort_by_key(|r| r.start);
         let mut merged: Vec<std::ops::Range<usize>> = Vec::new();
         for r in ranges {
-            if let Some(last) = merged.last_mut() {
-                if r.start <= last.end {
+            if let Some(last) = merged.last_mut()
+                && r.start <= last.end {
                     last.end = last.end.max(r.end);
                     continue;
                 }
-            }
             merged.push(r);
         }
         merged
@@ -800,8 +796,7 @@ fn compute_ltr_markup_mask(logical_chars: &[char]) -> Vec<bool> {
                 && logical_chars[i + 1] == '!'
                 && logical_chars[i + 2] == '-'
                 && logical_chars[i + 3] == '-'
-            {
-                if let Some(rel_end) = logical_chars[i + 4..]
+                && let Some(rel_end) = logical_chars[i + 4..]
                     .windows(3)
                     .position(|w| w == ['-', '-', '>'])
                 {
@@ -812,12 +807,10 @@ fn compute_ltr_markup_mask(logical_chars: &[char]) -> Vec<bool> {
                     i = end;
                     continue;
                 }
-            }
             // Inline HTML tag: <tag...> or </tag>
             if i + 1 < n
                 && (logical_chars[i + 1].is_ascii_alphabetic() || logical_chars[i + 1] == '/')
-            {
-                if let Some(rel_gt) = logical_chars[i + 1..].iter().position(|&c| c == '>') {
+                && let Some(rel_gt) = logical_chars[i + 1..].iter().position(|&c| c == '>') {
                     let end = i + 1 + rel_gt + 1;
                     if end - i <= 64
                         && !logical_chars[i + 1..end - 1].iter().any(|&c| is_rtl_char(c))
@@ -829,7 +822,6 @@ fn compute_ltr_markup_mask(logical_chars: &[char]) -> Vec<bool> {
                         continue;
                     }
                 }
-            }
         }
         i += 1;
     }
@@ -893,12 +885,11 @@ pub fn build_visual_bidi_line_map(line: &str) -> VisualBidiLineMap {
     let mut runs: Vec<(TextDirection, Vec<std::ops::Range<usize>>)> = Vec::new();
     for (i, log_r) in raw_ranges.into_iter().enumerate() {
         let d = resolved[i];
-        if let Some(last) = runs.last_mut() {
-            if last.0 == d {
+        if let Some(last) = runs.last_mut()
+            && last.0 == d {
                 last.1.push(log_r);
                 continue;
             }
-        }
         runs.push((d, vec![log_r]));
     }
 
