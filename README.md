@@ -15,7 +15,7 @@
 
 Most modern Markdown editors bundle a full Chromium browser via Electron, consume hundreds of megabytes of RAM, and lag on multi-megabyte documents—or rely on external toolchains (Pandoc, LaTeX, Node.js) for diagrams, math, and exports.
 
-**Markdown Studio** compiles to a single native Rust binary (~15 MB on Windows) powered by `eframe`/`egui`, `ropey`, and `comrak`:
+**Markdown Studio** compiles to a single native Rust binary (~21 MB on Windows) powered by `eframe`/`egui`, `ropey`, and `comrak`:
 
 - **No Electron, No Browser Runtime** — instant cold startup, low memory footprint, and smooth 60–120 FPS rendering.
 - **Built for Massive Files** — $O(\log n)$ `ropey::Rope` edits, $O(\log B)$ Fenwick-tree viewport virtualization, off-thread AST parsing ($\ge 32\text{ KB}$), and SIMD literal search via `memchr` let you open and edit 10 MB+ Markdown files smoothly.
