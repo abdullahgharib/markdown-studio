@@ -21,7 +21,9 @@ jobs:
         include:
           - os: windows-latest
             target: windows-x86_64
-            asset: Markdown-Studio-windows-x86_64.zip
+            asset: |
+              Markdown-Studio-windows-x86_64.zip
+              Markdown-Studio-windows-x86_64.exe
           - os: ubuntu-latest
             target: linux-x86_64
             asset: Markdown-Studio-linux-x86_64.tar.gz
@@ -64,6 +66,7 @@ jobs:
           cargo build --release
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item target\release\markdown_studio.exe "dist\Markdown Studio.exe"
+          Copy-Item target\release\markdown_studio.exe "Markdown-Studio-${{ matrix.target }}.exe"
           Copy-Item LICENSE "dist\LICENSE"
           Compress-Archive -Path "dist\*" -DestinationPath "Markdown-Studio-${{ matrix.target }}.zip"
 
