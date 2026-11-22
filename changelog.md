@@ -5,6 +5,16 @@ For architecture, features, shortcuts, and build instructions, see [README.md](R
 
 ---
 
+### `v0.7.11` (2026-11-22) — Local & Online Images, Animated GIFs, SVG Rendering & WYSIWYG Image Label Editing
+- **Remote Images, Animated GIFs & SVG/SVGZ Support (`Cargo.toml`, `src/ui/reader/images.rs`)**:
+  - Added `resvg` (`0.50`) for 2× HiDPI SVG/SVGZ rasterization (with `OnceLock` system `fontdb`), `ureq` (`3.5`) for non-blocking off-thread `http://`/`https://` image fetching (10s timeout, 5 redirects, 16 MB body cap, 60s retry TTL, `MD_STUDIO_DISABLE_REMOTE_IMAGES=1` offline toggle), and `webp` decoding via `image`.
+  - Upgraded `ImageDecodePool` to 4 workers supporting multi-frame animated GIF playback (`MAX_GIF_FRAMES = 120`, `MAX_GIF_TOTAL_BYTES = 48 MB`, `MAX_GIF_TEXTURE_DIM = 1280`, frame-delay scheduling via `ctx.request_repaint_after` outside `ctx.data_mut`).
+- **In-Place WYSIWYG Image Label Editing & Remote Badge Rendering (`src/document/editing.rs`, `src/ui/reader/mod.rs`)**:
+  - Added surgical `update_image_alt_text` supporting standalone, linked (`[![alt](url)](href)`), `<...>` spaced-path, and table-cell images in one undoable `Ctrl+Z` step.
+  - Added `ImageLabelEditorState` in `VirtualReaderState` so clicking an image's `"<label>  ✎"` / `"✎ Add image label..."` button in WYSIWYG mode opens an inline editor (`Enter`/`✓` commits, `Esc`/`✕` cancels) while keeping Reader mode strictly read-only.
+  - Consecutive remote shields.io/workflow badge groups now display live fetched SVG/PNG textures (falling back to compact clickable pills while loading or offline), while standalone remote images render full-size with editable WYSIWYG captions.
+- **Verification**: Full test suite passes (**176 tests**: `86` unit, `14` export, `11` roundtrip, `65` UI integration) with **0 Clippy warnings** (`cargo clippy --all-targets -- -D warnings`).
+
 ### `v0.7.10` (2026-11-22) — Fix Async Image Deadlock, Table Cell Images & Remote Badge Pills
 - **Async Image Loading Deadlock Fix (`src/ui/reader/images.rs`)**:
   - Fixed a UI freeze/deadlock when opening documents containing images `> 256 KB` (such as animated GIFs or high-res PNGs): moved `ctx.load_texture(...)` outside `ctx.data_mut(|d| ...)` using `ImageLoadState::{Loaded, Loading, Unavailable}` (`load_cached_image_state`) so worker-decoded textures upload without re-entering `egui::Context`'s `RwLock`.

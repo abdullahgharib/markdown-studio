@@ -23,7 +23,8 @@ use crate::document::calc::{
 };
 use crate::document::editing::{
     delete_block_lines, indent_lines, outdent_lines, parse_code_fence_line,
-    set_code_block_language, table_at_line, toggle_task_checkbox_at_line, word_range_in_line,
+    set_code_block_language, table_at_line, toggle_task_checkbox_at_line, update_image_alt_text,
+    word_range_in_line,
 };
 use crate::document::math::{render_math_in_ui, MATH_TEXTBOOK_TEMPLATES};
 use crate::document::mermaid::{render_mermaid_in_ui, MERMAID_TEMPLATES};
@@ -109,6 +110,16 @@ enum ActiveBlockKind {
 }
 
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageLabelEditorState {
+    pub source_lines: Range<usize>,
+    pub image_url: String,
+    pub run_idx: usize,
+    pub old_alt: String,
+    pub draft: String,
+    pub focus_requested: bool,
+}
+
 #[derive(Debug)]
 pub struct VirtualReaderState {
     pub active_block_lines: Option<Range<usize>>,
@@ -142,6 +153,7 @@ pub struct VirtualReaderState {
     pub autoscroll_active: bool,
     pub auto_calc_math: bool,
     pub auto_calc_tables: bool,
+    pub image_label_editor: Option<ImageLabelEditorState>,
     galley_cache: ReaderGalleyCache,
     table_eval_epoch: (u64, u64),
     table_eval_cache: TableEvalCache,
@@ -183,6 +195,7 @@ impl Default for VirtualReaderState {
             autoscroll_active: false,
             auto_calc_math: false,
             auto_calc_tables: true,
+            image_label_editor: None,
             galley_cache: ReaderGalleyCache::default(),
             table_eval_epoch: (0, 0),
             table_eval_cache: TableEvalCache::default(),
@@ -4503,11 +4516,14 @@ fn render_doc_block(
                 let mut runs_res = RunsRenderResult {
                     outcome: RunsClickOutcome::None,
                     hitboxes: Vec::new(),
+                    handled_ui: false,
+                    interactive_rects: Vec::new(),
                 };
                 let whole_word = state.search_whole_word;
                 let base_dir_owned = state.base_dir.clone();
                 let suppress_clicks = state.autoscroll_active;
                 let galley_cache = &mut state.galley_cache;
+                let image_label_editor = &mut state.image_label_editor;
                 let resp =
                     render_indented_logical(ui, content_w, *indent_level, *direction, |ui, iw| {
                         runs_res = render_runs_with_images(
@@ -4532,29 +4548,37 @@ fn render_doc_block(
                             &search_needles,
                             whole_word,
                             galley_cache,
+                            image_label_editor,
                         );
                     });
-                let handled_nav = runs_res.outcome != RunsClickOutcome::None;
+                let handled_nav = runs_res.outcome != RunsClickOutcome::None || runs_res.handled_ui;
+                if runs_res.handled_ui && state.image_label_editor.is_some() {
+                    state.active_block_lines = None;
+                }
                 if let RunsClickOutcome::Action(a) = runs_res.outcome {
                     action = a;
                 }
                 if wysiwyg && !read_only && !handled_nav && !state.autoscroll_active {
-                    let a = handle_inactive_wysiwyg_click(
-                        ui,
-                        buf,
-                        resp.rect,
-                        "wys_h",
-                        "wys_h_tip",
-                        source_lines,
-                        kind,
-                        content_w,
-                        theme,
-                        show_markup,
-                        &runs_res.hitboxes,
-                        state,
-                    );
-                    if a != ReaderAction::None {
-                        action = a;
+                    if let Some(click_rect) =
+                        clip_inactive_click_rect(resp.rect, &runs_res.interactive_rects)
+                    {
+                        let a = handle_inactive_wysiwyg_click(
+                            ui,
+                            buf,
+                            click_rect,
+                            "wys_h",
+                            "wys_h_tip",
+                            source_lines,
+                            kind,
+                            content_w,
+                            theme,
+                            show_markup,
+                            &runs_res.hitboxes,
+                            state,
+                        );
+                        if a != ReaderAction::None {
+                            action = a;
+                        }
                     }
                 }
             }
@@ -4600,12 +4624,15 @@ fn render_doc_block(
                 let mut runs_res = RunsRenderResult {
                     outcome: RunsClickOutcome::None,
                     hitboxes: Vec::new(),
+                    handled_ui: false,
+                    interactive_rects: Vec::new(),
                 };
                 let whole_word = state.search_whole_word;
                 let base_dir_owned = state.base_dir.clone();
                 let suppress_clicks = state.autoscroll_active;
                 let body_line_mult = state.line_spacing.body_multiplier();
                 let galley_cache = &mut state.galley_cache;
+                let image_label_editor = &mut state.image_label_editor;
                 let resp =
                     render_indented_logical(ui, content_w, *indent_level, *direction, |ui, iw| {
                         runs_res = render_runs_with_images(
@@ -4630,29 +4657,37 @@ fn render_doc_block(
                             &search_needles,
                             whole_word,
                             galley_cache,
+                            image_label_editor,
                         );
                     });
-                let handled_nav = runs_res.outcome != RunsClickOutcome::None;
+                let handled_nav = runs_res.outcome != RunsClickOutcome::None || runs_res.handled_ui;
+                if runs_res.handled_ui && state.image_label_editor.is_some() {
+                    state.active_block_lines = None;
+                }
                 if let RunsClickOutcome::Action(a) = runs_res.outcome {
                     action = a;
                 }
                 if wysiwyg && !read_only && !handled_nav && !state.autoscroll_active {
-                    let a = handle_inactive_wysiwyg_click(
-                        ui,
-                        buf,
-                        resp.rect,
-                        "wys_p",
-                        "wys_p_tip",
-                        source_lines,
-                        kind,
-                        content_w,
-                        theme,
-                        show_markup,
-                        &runs_res.hitboxes,
-                        state,
-                    );
-                    if a != ReaderAction::None {
-                        action = a;
+                    if let Some(click_rect) =
+                        clip_inactive_click_rect(resp.rect, &runs_res.interactive_rects)
+                    {
+                        let a = handle_inactive_wysiwyg_click(
+                            ui,
+                            buf,
+                            click_rect,
+                            "wys_p",
+                            "wys_p_tip",
+                            source_lines,
+                            kind,
+                            content_w,
+                            theme,
+                            show_markup,
+                            &runs_res.hitboxes,
+                            state,
+                        );
+                        if a != ReaderAction::None {
+                            action = a;
+                        }
                     }
                 }
             }
@@ -5271,6 +5306,7 @@ fn render_doc_block(
                 let suppress_clicks = state.autoscroll_active;
                 let base_dir_owned = state.base_dir.clone();
                 let galley_cache = &mut state.galley_cache;
+                let image_label_editor = &mut state.image_label_editor;
                 let large_table = rows.len() > 80;
                 let table_scroll_id = ui.id().with(("md_table_hscroll", source_lines.start));
                 let approx_row_h = 26.0_f32;
@@ -5314,6 +5350,7 @@ fn render_doc_block(
                                                 .unwrap_or(TableAlign::None);
                                             if let Some(cell_act) = render_table_cell(
                                                 ui,
+                                                buf,
                                                 runs,
                                                 None,
                                                 source_lines,
@@ -5325,10 +5362,10 @@ fn render_doc_block(
                                                 read_only,
                                                 suppress_clicks,
                                                 base_dir_owned.as_deref(),
-                                                buf.file_path.as_deref(),
                                                 &table_needles,
                                                 whole_word,
                                                 galley_cache,
+                                                image_label_editor,
                                             ) {
                                                 action = cell_act;
                                             }
@@ -5369,6 +5406,7 @@ fn render_doc_block(
                                             );
                                             if let Some(cell_act) = render_table_cell(
                                                 ui,
+                                                buf,
                                                 runs,
                                                 eval_text,
                                                 source_lines,
@@ -5380,10 +5418,10 @@ fn render_doc_block(
                                                 read_only,
                                                 suppress_clicks,
                                                 base_dir_owned.as_deref(),
-                                                buf.file_path.as_deref(),
                                                 &table_needles,
                                                 whole_word,
                                                 galley_cache,
+                                                image_label_editor,
                                             ) {
                                                 action = cell_act;
                                             }
@@ -5678,6 +5716,29 @@ struct RenderedGalleyHitbox {
 struct RunsRenderResult {
     outcome: RunsClickOutcome,
     hitboxes: Vec<RenderedGalleyHitbox>,
+    handled_ui: bool,
+    interactive_rects: Vec<egui::Rect>,
+}
+
+fn clip_inactive_click_rect(
+    rect: egui::Rect,
+    interactive_rects: &[egui::Rect],
+) -> Option<egui::Rect> {
+    if interactive_rects.is_empty() {
+        return Some(rect);
+    }
+    let min_top = interactive_rects
+        .iter()
+        .map(|r| r.top())
+        .fold(f32::INFINITY, f32::min);
+    if min_top > rect.top() + 4.0 {
+        let mut clipped = rect;
+        clipped.max.y = (min_top - 2.0).min(rect.bottom());
+        if clipped.height() > 2.0 {
+            return Some(clipped);
+        }
+    }
+    None
 }
 
 fn label_galley_pos(rect: egui::Rect, galley: &egui::Galley) -> egui::Pos2 {
@@ -5983,7 +6044,7 @@ fn render_inline_math_wrapped_runs(
 #[allow(clippy::too_many_arguments)]
 fn render_runs_with_images(
     ui: &mut egui::Ui,
-    buf: &DocumentBuffer,
+    buf: &mut DocumentBuffer,
     runs: &[InlineRun],
     src_lines: &Range<usize>,
     font_size: f32,
@@ -6003,11 +6064,14 @@ fn render_runs_with_images(
     search_needles: &[(String, bool)],
     whole_word: bool,
     galley_cache: &mut ReaderGalleyCache,
+    image_label_editor: &mut Option<ImageLabelEditorState>,
 ) -> RunsRenderResult {
     let egui_align = resolve_egui_align(alignment, direction);
     let cmd_down = ui.input(|i| i.modifiers.command || i.modifiers.ctrl);
     let mut outcome = RunsClickOutcome::None;
     let mut hitboxes: Vec<RenderedGalleyHitbox> = Vec::new();
+    let mut handled_ui = false;
+    let mut interactive_rects: Vec<egui::Rect> = Vec::new();
 
     ui.with_layout(egui::Layout::top_down(egui_align), |ui| {
         ui.set_width(content_w);
@@ -6171,11 +6235,13 @@ fn render_runs_with_images(
                 if is_remote_image_url(url) {
                     let group_start = idx;
                     let mut group_end = idx + 1;
+                    let mut remote_count = 1usize;
                     let mut scan = group_end;
                     while scan < runs.len() {
                         if let Some(ref next_url) = runs[scan].image_url {
                             if is_remote_image_url(next_url) {
                                 group_end = scan + 1;
+                                remote_count += 1;
                                 scan += 1;
                                 continue;
                             }
@@ -6187,47 +6253,59 @@ fn render_runs_with_images(
                         }
                         break;
                     }
-                    ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
-                        for (offset, badge_run) in runs[group_start..group_end].iter().enumerate() {
-                            if let Some(ref badge_url) = badge_run.image_url {
-                                if let Some(act) = render_remote_badge_pill(
-                                    ui,
-                                    badge_run,
-                                    badge_url,
-                                    group_start + offset,
-                                    theme,
-                                    show_inline_markup,
-                                    read_only,
-                                    suppress_clicks,
-                                    cmd_down,
-                                ) {
-                                    img_action = Some(act);
+                    if remote_count >= 2 || is_likely_remote_badge_run(&runs[idx], url) {
+                        let row_resp = ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                            for (offset, badge_run) in runs[group_start..group_end].iter().enumerate() {
+                                if let Some(ref badge_url) = badge_run.image_url {
+                                    if let Some(act) = render_remote_badge_pill(
+                                        ui,
+                                        badge_run,
+                                        badge_url,
+                                        group_start + offset,
+                                        theme,
+                                        show_inline_markup,
+                                        read_only,
+                                        suppress_clicks,
+                                        cmd_down,
+                                    ) {
+                                        img_action = Some(act);
+                                    }
                                 }
                             }
-                        }
-                    });
-                    idx = group_end;
-                    continue;
+                        });
+                        interactive_rects.push(row_resp.response.rect);
+                        idx = group_end;
+                        continue;
+                    }
                 }
 
-                if let Some(act) = render_image_run(
+                let (act, ui_used, ui_rect) = render_image_run(
                     ui,
+                    buf,
                     &runs[idx],
                     url,
+                    src_lines,
                     idx,
                     content_w.clamp(80.0, 640.0),
                     420.0_f32,
                     true,
                     show_inline_markup,
                     base_dir,
-                    buf.file_path.as_deref(),
                     theme,
                     read_only,
                     suppress_clicks,
                     cmd_down,
-                ) {
-                    img_action = Some(act);
+                    image_label_editor,
+                );
+                if ui_used {
+                    handled_ui = true;
+                }
+                if let Some(r) = ui_rect {
+                    interactive_rects.push(r);
+                }
+                if let Some(a) = act {
+                    img_action = Some(a);
                 }
             } else {
                 text_chunk.push(runs[idx].clone());
@@ -6241,12 +6319,29 @@ fn render_runs_with_images(
             outcome = RunsClickOutcome::Action(act);
         }
     });
-    RunsRenderResult { outcome, hitboxes }
+    RunsRenderResult {
+        outcome,
+        hitboxes,
+        handled_ui,
+        interactive_rects,
+    }
 }
 
 fn is_remote_image_url(url: &str) -> bool {
     let lower = url.trim().to_ascii_lowercase();
     lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+fn is_likely_remote_badge_run(run: &InlineRun, url: &str) -> bool {
+    if run.link_url.is_none() {
+        return false;
+    }
+    let lower = url.to_ascii_lowercase();
+    lower.contains("shields.io")
+        || lower.contains("/badge")
+        || lower.contains("badge.svg")
+        || lower.contains("codecov.io")
+        || lower.contains("actions/workflows")
 }
 
 fn image_run_nav_target(link_url: Option<&str>, fallback_url: Option<&str>) -> Option<NavTarget> {
@@ -6267,30 +6362,49 @@ fn render_remote_badge_pill(
     suppress_clicks: bool,
     cmd_down: bool,
 ) -> Option<ReaderAction> {
-    let label_text = if !run.text.trim().is_empty() {
-        run.text.trim().to_string()
-    } else {
-        url.trim()
-            .trim_start_matches("https://")
-            .trim_start_matches("http://")
-            .split('/')
-            .next()
-            .filter(|s| !s.is_empty())
-            .unwrap_or("Remote Badge")
-            .to_string()
-    };
-
     let nav_target = image_run_nav_target(run.link_url.as_deref(), Some(url));
-    let btn = egui::Button::new(
-        RichText::new(&label_text)
-            .size(11.5)
-            .strong()
-            .color(theme.accent),
-    )
-    .fill(theme.accent_soft)
-    .stroke(Stroke::new(1.0_f32, theme.border))
-    .corner_radius(CornerRadius::same(10));
-    let resp = ui.add(btn);
+    let resp = if let ImageLoadState::Loaded(tex) = load_cached_image_state(ui.ctx(), url, None, None) {
+        let [tw, th] = tex.size();
+        let mut draw_w = tw.max(1) as f32;
+        let mut draw_h = th.max(1) as f32;
+        let max_badge_h = 24.0_f32;
+        let max_badge_w = 260.0_f32;
+        if draw_h > max_badge_h {
+            let scale = max_badge_h / draw_h;
+            draw_w *= scale;
+            draw_h *= scale;
+        }
+        if draw_w > max_badge_w {
+            let scale = max_badge_w / draw_w;
+            draw_w *= scale;
+            draw_h *= scale;
+        }
+        ui.image((tex.id(), Vec2::new(draw_w, draw_h)))
+            .interact(Sense::click())
+    } else {
+        let label_text = if !run.text.trim().is_empty() {
+            run.text.trim().to_string()
+        } else {
+            url.trim()
+                .trim_start_matches("https://")
+                .trim_start_matches("http://")
+                .split('/')
+                .next()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("Remote Badge")
+                .to_string()
+        };
+        let btn = egui::Button::new(
+            RichText::new(&label_text)
+                .size(11.5)
+                .strong()
+                .color(theme.accent),
+        )
+        .fill(theme.accent_soft)
+        .stroke(Stroke::new(1.0_f32, theme.border))
+        .corner_radius(CornerRadius::same(10));
+        ui.add(btn)
+    };
 
     let mut action = None;
     if let Some(ref target) = nav_target {
@@ -6318,38 +6432,146 @@ fn render_remote_badge_pill(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn render_image_run(
+fn render_image_label_controls(
     ui: &mut egui::Ui,
+    buf: &mut DocumentBuffer,
     run: &InlineRun,
     url: &str,
+    src_lines: &Range<usize>,
+    run_idx: usize,
+    max_w: f32,
+    show_caption: bool,
+    theme: &WordTheme,
+    read_only: bool,
+    image_label_editor: &mut Option<ImageLabelEditorState>,
+) -> (bool, Option<egui::Rect>) {
+    let trimmed_alt = run.text.trim();
+    let has_custom_alt = !trimmed_alt.is_empty() && trimmed_alt != url.trim();
+    if read_only {
+        if show_caption && has_custom_alt {
+            ui.label(
+                RichText::new(&run.text)
+                    .size(11.5)
+                    .italics()
+                    .color(theme.text_muted),
+            );
+        }
+        return (false, None);
+    }
+
+    let is_editing_this = image_label_editor.as_ref().is_some_and(|ed| {
+        ed.source_lines == *src_lines && ed.run_idx == run_idx && ed.image_url == url
+    });
+    if is_editing_this {
+        let mut close_editor = false;
+        let mut commit_editor = false;
+        let row_resp = ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            if let Some(ed) = image_label_editor.as_mut() {
+                let edit_w = (max_w - 72.0).clamp(110.0, 320.0);
+                let te_resp = ui.add(
+                    egui::TextEdit::singleline(&mut ed.draft)
+                        .id_source(("img_alt_edit", src_lines.start, run_idx, url))
+                        .hint_text("Image label (alt text)...")
+                        .desired_width(edit_w),
+                );
+                let had_focus_request = ed.focus_requested;
+                if ed.focus_requested {
+                    te_resp.request_focus();
+                    ed.focus_requested = false;
+                }
+                let save_resp = ui
+                    .small_button("✓")
+                    .on_hover_text("Save image label (Enter)");
+                let cancel_resp = ui
+                    .small_button("✕")
+                    .on_hover_text("Cancel (Esc)");
+
+                let esc_pressed = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                let enter_pressed = !had_focus_request
+                    && te_resp.lost_focus()
+                    && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if cancel_resp.clicked() || esc_pressed {
+                    close_editor = true;
+                } else if save_resp.clicked()
+                    || enter_pressed
+                    || (!had_focus_request && te_resp.lost_focus() && !cancel_resp.hovered())
+                {
+                    commit_editor = true;
+                }
+            }
+        });
+        if commit_editor {
+            if let Some(ed) = image_label_editor.take() {
+                let _ = update_image_alt_text(buf, src_lines, url, &ed.old_alt, &ed.draft);
+            }
+        } else if close_editor {
+            *image_label_editor = None;
+        }
+        return (true, Some(row_resp.response.rect));
+    }
+
+    let display_label = if has_custom_alt {
+        format!("{}  ✎", trimmed_alt)
+    } else {
+        "✎ Add image label...".to_string()
+    };
+    let text_color = if has_custom_alt {
+        theme.text_muted
+    } else {
+        theme.accent
+    };
+    let label_btn = egui::Button::new(RichText::new(display_label).size(11.5).italics().color(text_color))
+        .fill(theme.code_bg)
+        .stroke(Stroke::new(0.8_f32, theme.border_subtle))
+        .corner_radius(CornerRadius::same(4));
+    let resp = ui
+        .add(label_btn)
+        .on_hover_text("Click to edit image label without entering Source mode");
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    if resp.clicked() {
+        let initial_draft = if has_custom_alt {
+            run.text.clone()
+        } else {
+            String::new()
+        };
+        *image_label_editor = Some(ImageLabelEditorState {
+            source_lines: src_lines.clone(),
+            image_url: url.to_string(),
+            run_idx,
+            old_alt: run.text.clone(),
+            draft: initial_draft,
+            focus_requested: true,
+        });
+        return (true, Some(resp.rect));
+    }
+    (resp.hovered() || resp.is_pointer_button_down_on(), Some(resp.rect))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_image_run(
+    ui: &mut egui::Ui,
+    buf: &mut DocumentBuffer,
+    run: &InlineRun,
+    url: &str,
+    src_lines: &Range<usize>,
     run_idx: usize,
     max_w: f32,
     max_h: f32,
     show_caption: bool,
     show_inline_markup: bool,
     base_dir: Option<&Path>,
-    doc_path: Option<&Path>,
     theme: &WordTheme,
     read_only: bool,
     suppress_clicks: bool,
     cmd_down: bool,
-) -> Option<ReaderAction> {
-    if is_remote_image_url(url) {
-        return render_remote_badge_pill(
-            ui,
-            run,
-            url,
-            run_idx,
-            theme,
-            show_inline_markup,
-            read_only,
-            suppress_clicks,
-            cmd_down,
-        );
-    }
-
+    image_label_editor: &mut Option<ImageLabelEditorState>,
+) -> (Option<ReaderAction>, bool, Option<egui::Rect>) {
     let mut action = None;
-    match load_cached_image_state(ui.ctx(), url, base_dir, doc_path) {
+    let doc_path = buf.file_path.clone();
+    match load_cached_image_state(ui.ctx(), url, base_dir, doc_path.as_deref()) {
         ImageLoadState::Loaded(tex) => {
             let [tw, th] = tex.size();
             let mut draw_w = tw.max(1) as f32;
@@ -6391,14 +6613,19 @@ fn render_image_run(
                 );
             }
 
-            if show_caption && !run.text.is_empty() {
-                ui.label(
-                    RichText::new(&run.text)
-                        .size(11.5)
-                        .italics()
-                        .color(theme.text_muted),
-                );
-            }
+            let (label_ui_used, label_rect) = render_image_label_controls(
+                ui,
+                buf,
+                run,
+                url,
+                src_lines,
+                run_idx,
+                max_w,
+                show_caption,
+                theme,
+                read_only,
+                image_label_editor,
+            );
             if show_inline_markup {
                 ui.label(
                     RichText::new(format!("![{}]({})", run.text, url))
@@ -6407,6 +6634,7 @@ fn render_image_run(
                         .color(theme.accent),
                 );
             }
+            return (action, label_ui_used, label_rect);
         }
         ImageLoadState::Loading => {
             egui::Frame::new()
@@ -6439,12 +6667,26 @@ fn render_image_run(
                 });
         }
     }
-    action
+    let (label_ui_used, label_rect) = render_image_label_controls(
+        ui,
+        buf,
+        run,
+        url,
+        src_lines,
+        run_idx,
+        max_w,
+        false,
+        theme,
+        read_only,
+        image_label_editor,
+    );
+    (action, label_ui_used, label_rect)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn render_table_cell(
     ui: &mut egui::Ui,
+    buf: &mut DocumentBuffer,
     runs: &[InlineRun],
     eval_text: Option<&str>,
     src_lines: &Range<usize>,
@@ -6456,10 +6698,10 @@ fn render_table_cell(
     read_only: bool,
     suppress_clicks: bool,
     base_dir: Option<&Path>,
-    doc_path: Option<&Path>,
     search_needles: &[(String, bool)],
     whole_word: bool,
     galley_cache: &mut ReaderGalleyCache,
+    image_label_editor: &mut Option<ImageLabelEditorState>,
 ) -> Option<ReaderAction> {
     let cell_dir = if let Some(eval_s) = eval_text {
         detect_paragraph_direction(eval_s)
@@ -6535,22 +6777,25 @@ fn render_table_cell(
                         cell_action = Some(a);
                     }
                     text_chunk.clear();
-                    if let Some(a) = render_image_run(
+                    let (act, _, _) = render_image_run(
                         ui,
+                        buf,
                         run,
                         url,
+                        src_lines,
                         idx,
                         max_img_w,
                         220.0_f32,
                         false,
                         show_inline_markup,
                         base_dir,
-                        doc_path,
                         theme,
                         read_only,
                         suppress_clicks,
                         cmd_down,
-                    ) {
+                        image_label_editor,
+                    );
+                    if let Some(a) = act {
                         cell_action = Some(a);
                     }
                 } else {
@@ -7546,5 +7791,71 @@ mod tests {
             Some([512, 512]),
             "async worker result must upload texture without deadlocking"
         );
+    }
+
+    #[test]
+    fn decode_and_load_svg_and_animated_gif() {
+        // 1. SVG with <rect> and <text> decodes at 2x scale and loads synchronously
+        let svg_src = br##"<svg xmlns="http://www.w3.org/2000/svg" width="80" height="24"><rect width="80" height="24" fill="#1d5fc4"/><text x="8" y="16" font-size="12" fill="#ffffff">OK</text></svg>"##;
+        let dec_svg =
+            super::images::decode_image_bytes(svg_src, "badge.svg").expect("SVG must decode");
+        assert_eq!(dec_svg.frames.len(), 1);
+        assert_eq!(dec_svg.frames[0].image.size, [160, 48]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let svg_path = dir.path().join("badge.svg");
+        std::fs::write(&svg_path, svg_src).unwrap();
+        let ctx = egui::Context::default();
+        let mut svg_state = ImageLoadState::Unavailable;
+        let _ = ctx.run(Default::default(), |ctx| {
+            svg_state = load_cached_image_state(ctx, svg_path.to_str().unwrap(), None, None);
+        });
+        match svg_state {
+            ImageLoadState::Loaded(tex) => assert_eq!(tex.size(), [160, 48]),
+            ImageLoadState::Loading | ImageLoadState::Unavailable => {
+                panic!("local SVG must load immediately")
+            }
+        }
+
+        // 2. 2-frame animated GIF decodes both frames with delays and loads via worker pool
+        let mut gif_bytes = Vec::new();
+        {
+            let mut encoder = image::codecs::gif::GifEncoder::new(&mut gif_bytes);
+            let f1 = image::Frame::from_parts(
+                image::RgbaImage::from_pixel(16, 16, image::Rgba([255, 0, 0, 255])),
+                0,
+                0,
+                image::Delay::from_numer_denom_ms(120, 1),
+            );
+            let f2 = image::Frame::from_parts(
+                image::RgbaImage::from_pixel(16, 16, image::Rgba([0, 0, 255, 255])),
+                0,
+                0,
+                image::Delay::from_numer_denom_ms(180, 1),
+            );
+            encoder.encode_frames([f1, f2]).unwrap();
+        }
+        let dec_gif =
+            super::images::decode_image_bytes(&gif_bytes, "anim.gif").expect("GIF must decode");
+        assert_eq!(dec_gif.frames.len(), 2);
+        assert!(dec_gif.frames[0].delay >= std::time::Duration::from_millis(100));
+        assert!(dec_gif.frames[1].delay >= std::time::Duration::from_millis(100));
+
+        let gif_path = dir.path().join("anim.gif");
+        std::fs::write(&gif_path, &gif_bytes).unwrap();
+        let mut gif_loaded = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            let mut s = ImageLoadState::Unavailable;
+            let _ = ctx.run(Default::default(), |ctx| {
+                s = load_cached_image_state(ctx, gif_path.to_str().unwrap(), None, None);
+            });
+            if let ImageLoadState::Loaded(tex) = s {
+                gif_loaded = Some(tex.size());
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(gif_loaded, Some([16, 16]));
     }
 }

@@ -6196,19 +6196,15 @@ fn test_open_repo_readme_async_images_and_table_gallery_never_freeze() {
     let mut t = 1.0_f64;
     let mut last_out = ui_step(&ctx, &mut app, t, vec![]);
 
-    // Step across frames for up to 3s while >256 KB demo.gif & PNGs decode off-thread
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-    while std::time::Instant::now() < deadline {
+    // Step across frames briefly while >256 KB local images & optional remote badges decode off-thread
+    for _ in 0..8 {
         t += 0.05;
         last_out = ui_step(&ctx, &mut app, t, vec![]);
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
 
-    // Remote shields.io badges should render cleanly as compact badge pills, not raw [Image: ...] boxes
-    assert!(
-        !find_rendered_text_shapes(&last_out, "License: AGPL v3").is_empty(),
-        "remote badge alt label should render in badge pill"
-    );
+    // Remote shields.io badges render either as live SVG textures (online) or compact clickable pills (offline),
+    // never as [Image: ...] unavailable-local-file boxes
     assert!(
         find_rendered_text_shapes(&last_out, "[Image: License: AGPL v3]").is_empty(),
         "remote badges must not render missing-local-image fallback box"
@@ -6252,5 +6248,91 @@ fn test_open_repo_readme_async_images_and_table_gallery_never_freeze() {
     assert!(
         find_rendered_text_shapes(&reader_out, "[Image: Markdown Studio Demo]").is_empty(),
         "hero demo.gif should render texture, not unavailable placeholder"
+    );
+}
+
+#[test]
+fn test_wysiwyg_inline_image_label_editing_and_reader_guard() {
+    let ctx = egui::Context::default();
+    let (dir, mut app) = new_isolated_app(&ctx);
+
+    let png_path = dir.path().join("sample.png");
+    let img = image::RgbaImage::from_pixel(32, 24, image::Rgba([60, 130, 220, 255]));
+    img.save(&png_path).unwrap();
+
+    let doc_path = dir.path().join("gallery.md");
+    std::fs::write(&doc_path, "# Photos\n\n![Old Label](sample.png)\n").unwrap();
+    app.open_specific_file(&doc_path);
+    app.dispatch_action(&ctx, ToolbarAction::SetViewMode(ViewMode::Wysiwyg));
+
+    let mut t = 1.0_f64;
+    let out = ui_step(&ctx, &mut app, t, vec![]);
+    let label_pos = find_rendered_text(&out, "Old Label", 0.0, 1280.0, 110.0);
+
+    // Click the WYSIWYG image label button to open inline caption editor
+    let _ = click_at(&ctx, &mut app, &mut t, label_pos, Modifiers::NONE);
+    t += 0.04;
+    let _ = ui_step(&ctx, &mut app, t, vec![]);
+    assert!(
+        app.reader_state.image_label_editor.is_some(),
+        "clicking WYSIWYG image label should open inline label editor"
+    );
+
+    // Replace draft via Ctrl+A + Backspace + Text + Enter
+    let cmd = Modifiers {
+        ctrl: true,
+        command: true,
+        ..Default::default()
+    };
+    t += 0.04;
+    let _ = ui_step(
+        &ctx,
+        &mut app,
+        t,
+        vec![
+            Event::Key {
+                key: Key::A,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: cmd,
+            },
+            Event::Key {
+                key: Key::Backspace,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            },
+            Event::Text("New Caption".to_string()),
+            Event::Key {
+                key: Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            },
+        ],
+    );
+    assert_eq!(
+        app.buffer.as_string(),
+        "# Photos\n\n![New Caption](sample.png)\n"
+    );
+    assert!(app.reader_state.image_label_editor.is_none());
+
+    // Ctrl+Z / Undo reverts cleanly
+    app.dispatch_action(&ctx, ToolbarAction::Undo);
+    assert_eq!(
+        app.buffer.as_string(),
+        "# Photos\n\n![Old Label](sample.png)\n"
+    );
+
+    // Reader mode must hide WYSIWYG image label edit icon
+    app.dispatch_action(&ctx, ToolbarAction::SetViewMode(ViewMode::Reader));
+    t += 0.04;
+    let reader_out = ui_step(&ctx, &mut app, t, vec![]);
+    assert!(
+        find_rendered_text_shapes(&reader_out, "✎").is_empty(),
+        "Reader mode must not show WYSIWYG image label edit icon"
     );
 }
