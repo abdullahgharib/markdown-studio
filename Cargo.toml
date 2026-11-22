@@ -1,0 +1,48 @@
+[package]
+name = "markdown_studio"
+version = "0.7.9"
+edition = "2021"
+description = "Ultra-fast native desktop Markdown reader and studio editor in Rust"
+license = "AGPL-3.0-or-later"
+readme = "README.md"
+repository = "https://github.com/abdullahgharib/markdown-studio"
+keywords = ["markdown", "editor", "wysiwyg", "egui", "rust"]
+categories = ["text-editors", "gui"]
+
+[lib]
+name = "markdown_studio"
+path = "src/lib.rs"
+
+[[bin]]
+name = "markdown_studio"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.31"
+egui = "0.31"
+rfd = "0.15"
+ropey = "1.6"
+comrak = { version = "0.35", default-features = false }
+printpdf = "0.7"
+docx-rs = "0.4"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "tiff"] }
+lopdf = { version = "0.35", default-features = false, features = ["nom_parser"] }
+memchr = "2.8"
+regex = "1.13"
+rustc-hash = "2.1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[dev-dependencies]
+zip = "2.2"
+quick-xml = "0.37"
+criterion = "0.5"
+tempfile = "3"
+
+[[bench]]
+name = "editor_bench"
+harness = false
