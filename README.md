@@ -7,7 +7,7 @@
 [![Platforms](https://img.shields.io/badge/Platforms-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#installation)
 [![CI](https://github.com/abdullahgharib/markdown-studio/actions/workflows/ci.yml/badge.svg)](https://github.com/abdullahgharib/markdown-studio/actions/workflows/ci.yml)
 
-**Current Version:** `0.7.11` (`markdown_studio`)
+**Current Version:** `0.7.12` (`markdown_studio`)
 
 ---
 
@@ -24,7 +24,7 @@ Most modern Markdown editors bundle a full Chromium browser via Electron, consum
 - **Native 6-Type Mermaid Engine** — vector rendering for Flowchart, Sequence, State, Class, ER, and Pie diagrams with zero Node.js/browser dependencies.
 - **Excel-Like Table Formulas** — interactive 8×8 table picker, Formula Bar (`SUM`, `AVERAGE`, `MIN`, `MAX`, `COUNT`, `IF`, `A1:B3`, `ABOVE`/`LEFT`/`BELOW`/`RIGHT`), and lossless cached Markdown persistence (`<!-- =FORMULA -->`).
 - **First-Class BiDi & Arabic / Persian / Urdu Support** — UAX #9 paragraph direction detection, contextual Arabic/Persian/Urdu shaping, RTL bracket mirroring, and bijective logical-to-visual cursor editing.
-- **Rich Media & In-Place WYSIWYG Captions**: Native rendering for local and online (`http://`/`https://`) raster images (PNG, JPEG, WebP, TIFF), **animated GIFs**, and **crisp 2× SVG/SVGZ** graphics — with click-to-edit image labels right inside WYSIWYG mode (`Ctrl+Z` undoable) without switching to Source mode.
+- **Rich Media, Lightbox & In-Place WYSIWYG Captions**: Native rendering for local and online (`http://`/`https://`) raster images (PNG, JPEG, WebP, TIFF), **animated GIFs**, and **crisp 2× SVG/SVGZ** graphics — click any image in **Reader Mode** (inline, inside tables, lists, or blockquotes) to open an enlarged **zoomable lightbox** (`50%–400%` / `Esc`), or click any image label in **WYSIWYG Mode** to edit captions in place (`Ctrl+Z` undoable) without switching to Source mode.
 - **Zero-Dependency Exports** — export directly to **Vector PDF** (with clickable outline bookmarks, internal `#anchor`/footnote links, and configurable headers/footers), **Word (`.docx`)**, **Standalone HTML5**, **Structured JSON**, or print via OS spoolers.
 
 ---
@@ -121,7 +121,7 @@ cargo build --release
 ## Documentation & Internals
 
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** — System architecture diagram, core performance invariants, module map, settings schema, environment variables, and Criterion benchmark results.
-- **[changelog.md](changelog.md)** — Full version history (`v0.1.0` through `v0.7.11`).
+- **[changelog.md](changelog.md)** — Full version history (`v0.1.0` through `v0.7.12`).
 - **[CONTRIBUTING.md](CONTRIBUTING.md)** — Development setup, testing commands, and pull request guidelines.
 
 ---

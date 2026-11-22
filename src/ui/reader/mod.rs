@@ -120,6 +120,16 @@ pub struct ImageLabelEditorState {
     pub focus_requested: bool,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImageLightboxState {
+    pub url: String,
+    pub alt: String,
+    pub link_url: Option<String>,
+    pub base_dir: Option<PathBuf>,
+    pub doc_path: Option<PathBuf>,
+    pub zoom: f32,
+}
+
 #[derive(Debug)]
 pub struct VirtualReaderState {
     pub active_block_lines: Option<Range<usize>>,
@@ -154,6 +164,7 @@ pub struct VirtualReaderState {
     pub auto_calc_math: bool,
     pub auto_calc_tables: bool,
     pub image_label_editor: Option<ImageLabelEditorState>,
+    pub image_lightbox: Option<ImageLightboxState>,
     galley_cache: ReaderGalleyCache,
     table_eval_epoch: (u64, u64),
     table_eval_cache: TableEvalCache,
@@ -196,6 +207,7 @@ impl Default for VirtualReaderState {
             auto_calc_math: false,
             auto_calc_tables: true,
             image_label_editor: None,
+            image_lightbox: None,
             galley_cache: ReaderGalleyCache::default(),
             table_eval_epoch: (0, 0),
             table_eval_cache: TableEvalCache::default(),
@@ -1065,6 +1077,9 @@ pub fn render_virtual_reader(
     if read_only || !wysiwyg {
         state.active_block_lines = None;
     }
+    if !read_only {
+        state.image_lightbox = None;
+    }
 
     let initial_active_lines = state.active_block_lines.clone();
 
@@ -1108,9 +1123,10 @@ pub fn render_virtual_reader(
         state.smooth_scroll_target_y = None;
     }
 
-    // Keyboard page/line smooth navigation in Reader mode (disabled while modals or text inputs hold focus).
+    // Keyboard page/line smooth navigation in Reader mode (disabled while modals, lightbox, or text inputs hold focus).
     if read_only
         && !state.modal_open
+        && state.image_lightbox.is_none()
         && !state.autoscroll_active
         && !ui.ctx().wants_keyboard_input()
     {
@@ -1655,6 +1671,191 @@ pub fn render_virtual_reader(
     state.last_scroll_offset_y = scroll_offset_y;
     state.last_max_scroll_y = scroll_max_y;
 
+    if read_only && state.image_lightbox.is_some() {
+        if let Some(lb_action) = render_image_lightbox(ui.ctx(), theme, state) {
+            action = lb_action;
+        }
+    }
+
+    action
+}
+
+fn render_image_lightbox(
+    ctx: &egui::Context,
+    theme: &WordTheme,
+    state: &mut VirtualReaderState,
+) -> Option<ReaderAction> {
+    let mut close_lightbox = false;
+    let mut action = None;
+
+    let screen = ctx.screen_rect();
+    let backdrop_resp = egui::Area::new(egui::Id::new("md_image_lightbox_backdrop"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(screen.min)
+        .show(ctx, |ui| {
+            let (rect, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
+            ui.painter()
+                .rect_filled(rect, 0.0, Color32::from_black_alpha(205));
+            resp
+        })
+        .inner;
+    if backdrop_resp.clicked() {
+        close_lightbox = true;
+    }
+
+    if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+        close_lightbox = true;
+    }
+
+    if let Some(lb) = state.image_lightbox.as_mut() {
+        ctx.input_mut(|i| {
+            let no_mod = egui::Modifiers::NONE;
+            if i.consume_key(no_mod, egui::Key::Plus) || i.consume_key(no_mod, egui::Key::Equals) {
+                lb.zoom = (lb.zoom + 0.25).clamp(0.5, 4.0);
+            } else if i.consume_key(no_mod, egui::Key::Minus) {
+                lb.zoom = (lb.zoom - 0.25).clamp(0.5, 4.0);
+            } else if i.consume_key(no_mod, egui::Key::Num0) {
+                lb.zoom = 1.0;
+            }
+        });
+
+        let load_state = load_cached_image_state(
+            ctx,
+            &lb.url,
+            lb.base_dir.as_deref(),
+            lb.doc_path.as_deref(),
+        );
+
+        let max_card_w = (screen.width() - 64.0).max(300.0);
+        let max_card_h = (screen.height() - 72.0).max(240.0);
+        let max_view_w = (max_card_w - 32.0).max(240.0);
+        let max_view_h = (max_card_h - 84.0).max(160.0);
+
+        let title_text = {
+            let trimmed_alt = lb.alt.trim();
+            if !trimmed_alt.is_empty() && trimmed_alt != lb.url.trim() {
+                trimmed_alt.to_string()
+            } else {
+                lb.url
+                    .trim()
+                    .trim_start_matches('<')
+                    .trim_end_matches('>')
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .unwrap_or(&lb.url)
+                    .to_string()
+            }
+        };
+
+        egui::Area::new(egui::Id::new("md_image_lightbox_card"))
+            .order(egui::Order::Tooltip)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(theme.paper_bg)
+                    .stroke(Stroke::new(1.5_f32, theme.border))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(egui::Margin::same(12))
+                    .show(ui, |ui| {
+                        ui.set_max_width(max_card_w);
+                        ui.set_max_height(max_card_h);
+
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            ui.label(
+                                RichText::new(&title_text)
+                                    .size(13.5)
+                                    .strong()
+                                    .color(theme.heading_color),
+                            );
+                            if let ImageLoadState::Loaded(ref tex) = load_state {
+                                let [tw, th] = tex.size();
+                                ui.label(
+                                    RichText::new(format!("{tw}×{th}"))
+                                        .size(11.5)
+                                        .color(theme.text_muted),
+                                );
+                            }
+                            ui.separator();
+                            if ui.small_button("−").on_hover_text("Zoom Out (-)").clicked() {
+                                lb.zoom = (lb.zoom - 0.25).clamp(0.5, 4.0);
+                            }
+                            ui.label(
+                                RichText::new(format!("{}%", (lb.zoom * 100.0).round() as i32))
+                                    .size(12.0)
+                                    .color(theme.text_primary),
+                            );
+                            if ui.small_button("+").on_hover_text("Zoom In (+)").clicked() {
+                                lb.zoom = (lb.zoom + 0.25).clamp(0.5, 4.0);
+                            }
+                            if ui.small_button("Fit").on_hover_text("Fit to Window (0)").clicked() {
+                                lb.zoom = 1.0;
+                            }
+                            if let Some(ref raw_link) = lb.link_url {
+                                if let Some(classified) = classify_link_url(raw_link) {
+                                    if ui
+                                        .small_button("Open Link ↗")
+                                        .on_hover_text(raw_link)
+                                        .clicked()
+                                    {
+                                        let target = NavTarget::Link(raw_link.clone(), classified);
+                                        action = Some(nav_target_action(&target));
+                                        close_lightbox = true;
+                                    }
+                                }
+                            }
+                            if ui
+                                .small_button("✕ Close")
+                                .on_hover_text("Close Lightbox (Esc)")
+                                .clicked()
+                            {
+                                close_lightbox = true;
+                            }
+                        });
+
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.add_space(8.0);
+
+                        egui::ScrollArea::both()
+                            .id_salt("md_image_lightbox_scroll")
+                            .max_width(max_view_w)
+                            .max_height(max_view_h)
+                            .show(ui, |ui| match &load_state {
+                                ImageLoadState::Loaded(tex) => {
+                                    let [tw, th] = tex.size();
+                                    let fw = tw.max(1) as f32;
+                                    let fh = th.max(1) as f32;
+                                    let fit_scale =
+                                        (max_view_w / fw).min(max_view_h / fh).clamp(0.1, 3.0);
+                                    let draw_w = (fw * fit_scale * lb.zoom).max(24.0);
+                                    let draw_h = (fh * fit_scale * lb.zoom).max(24.0);
+                                    ui.vertical_centered(|ui| {
+                                        ui.image((tex.id(), Vec2::new(draw_w, draw_h)));
+                                    });
+                                }
+                                ImageLoadState::Loading => {
+                                    ui.label(
+                                        RichText::new("Loading image...")
+                                            .size(13.0)
+                                            .color(theme.text_muted),
+                                    );
+                                }
+                                ImageLoadState::Unavailable => {
+                                    ui.label(
+                                        RichText::new(format!("Unable to load image: {}", lb.url))
+                                            .size(13.0)
+                                            .color(theme.text_muted),
+                                    );
+                                }
+                            });
+                    });
+            });
+    }
+
+    if close_lightbox {
+        state.image_lightbox = None;
+    }
     action
 }
 
@@ -4524,6 +4725,7 @@ fn render_doc_block(
                 let suppress_clicks = state.autoscroll_active;
                 let galley_cache = &mut state.galley_cache;
                 let image_label_editor = &mut state.image_label_editor;
+                let image_lightbox = &mut state.image_lightbox;
                 let resp =
                     render_indented_logical(ui, content_w, *indent_level, *direction, |ui, iw| {
                         runs_res = render_runs_with_images(
@@ -4549,6 +4751,7 @@ fn render_doc_block(
                             whole_word,
                             galley_cache,
                             image_label_editor,
+                            image_lightbox,
                         );
                     });
                 let handled_nav = runs_res.outcome != RunsClickOutcome::None || runs_res.handled_ui;
@@ -4633,6 +4836,7 @@ fn render_doc_block(
                 let body_line_mult = state.line_spacing.body_multiplier();
                 let galley_cache = &mut state.galley_cache;
                 let image_label_editor = &mut state.image_label_editor;
+                let image_lightbox = &mut state.image_lightbox;
                 let resp =
                     render_indented_logical(ui, content_w, *indent_level, *direction, |ui, iw| {
                         runs_res = render_runs_with_images(
@@ -4658,6 +4862,7 @@ fn render_doc_block(
                             whole_word,
                             galley_cache,
                             image_label_editor,
+                            image_lightbox,
                         );
                     });
                 let handled_nav = runs_res.outcome != RunsClickOutcome::None || runs_res.handled_ui;
@@ -5307,6 +5512,7 @@ fn render_doc_block(
                 let base_dir_owned = state.base_dir.clone();
                 let galley_cache = &mut state.galley_cache;
                 let image_label_editor = &mut state.image_label_editor;
+                let image_lightbox = &mut state.image_lightbox;
                 let large_table = rows.len() > 80;
                 let table_scroll_id = ui.id().with(("md_table_hscroll", source_lines.start));
                 let approx_row_h = 26.0_f32;
@@ -5366,6 +5572,7 @@ fn render_doc_block(
                                                 whole_word,
                                                 galley_cache,
                                                 image_label_editor,
+                                                image_lightbox,
                                             ) {
                                                 action = cell_act;
                                             }
@@ -5422,6 +5629,7 @@ fn render_doc_block(
                                                 whole_word,
                                                 galley_cache,
                                                 image_label_editor,
+                                                image_lightbox,
                                             ) {
                                                 action = cell_act;
                                             }
@@ -6065,6 +6273,7 @@ fn render_runs_with_images(
     whole_word: bool,
     galley_cache: &mut ReaderGalleyCache,
     image_label_editor: &mut Option<ImageLabelEditorState>,
+    image_lightbox: &mut Option<ImageLightboxState>,
 ) -> RunsRenderResult {
     let egui_align = resolve_egui_align(alignment, direction);
     let cmd_down = ui.input(|i| i.modifiers.command || i.modifiers.ctrl);
@@ -6297,6 +6506,7 @@ fn render_runs_with_images(
                     suppress_clicks,
                     cmd_down,
                     image_label_editor,
+                    image_lightbox,
                 );
                 if ui_used {
                     handled_ui = true;
@@ -6568,6 +6778,7 @@ fn render_image_run(
     suppress_clicks: bool,
     cmd_down: bool,
     image_label_editor: &mut Option<ImageLabelEditorState>,
+    image_lightbox: &mut Option<ImageLightboxState>,
 ) -> (Option<ReaderAction>, bool, Option<egui::Rect>) {
     let mut action = None;
     let doc_path = buf.file_path.clone();
@@ -6593,7 +6804,54 @@ fn render_image_run(
                 .inner_margin(egui::Margin::same(4))
                 .show(ui, |ui| ui.image((tex.id(), Vec2::new(draw_w, draw_h))));
 
-            if let Some(target) = image_run_nav_target(run.link_url.as_deref(), None) {
+            if read_only && !suppress_clicks {
+                let click_resp = frame_resp.inner.interact(Sense::click());
+                let linked_target = image_run_nav_target(run.link_url.as_deref(), None);
+                if cmd_down {
+                    if let Some(ref target) = linked_target {
+                        if click_resp.hovered() {
+                            let tip = nav_target_tooltip(target, true);
+                            show_link_hover_tooltip(
+                                ui,
+                                click_resp.id.with(("img_link", run_idx)),
+                                &tip,
+                            );
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        if click_resp.clicked() {
+                            action = Some(nav_target_action(target));
+                        }
+                    }
+                } else {
+                    if click_resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::ZoomIn);
+                        let trimmed_alt = run.text.trim();
+                        let mut tip = if !trimmed_alt.is_empty() && trimmed_alt != url.trim() {
+                            format!("{trimmed_alt} — Click to enlarge")
+                        } else {
+                            "Click to enlarge".to_string()
+                        };
+                        if linked_target.is_some() {
+                            tip.push_str(" (Ctrl+Click to open link)");
+                        }
+                        show_link_hover_tooltip(
+                            ui,
+                            click_resp.id.with(("img_zoom_tip", run_idx)),
+                            &tip,
+                        );
+                    }
+                    if click_resp.clicked() {
+                        *image_lightbox = Some(ImageLightboxState {
+                            url: url.to_string(),
+                            alt: run.text.clone(),
+                            link_url: run.link_url.clone(),
+                            base_dir: base_dir.map(Path::to_path_buf),
+                            doc_path: doc_path.clone(),
+                            zoom: 1.0,
+                        });
+                    }
+                }
+            } else if let Some(target) = image_run_nav_target(run.link_url.as_deref(), None) {
                 let click_resp = frame_resp.inner.interact(Sense::click());
                 if click_resp.hovered() {
                     let tip = nav_target_tooltip(&target, read_only);
@@ -6702,6 +6960,7 @@ fn render_table_cell(
     whole_word: bool,
     galley_cache: &mut ReaderGalleyCache,
     image_label_editor: &mut Option<ImageLabelEditorState>,
+    image_lightbox: &mut Option<ImageLightboxState>,
 ) -> Option<ReaderAction> {
     let cell_dir = if let Some(eval_s) = eval_text {
         detect_paragraph_direction(eval_s)
@@ -6794,6 +7053,7 @@ fn render_table_cell(
                         suppress_clicks,
                         cmd_down,
                         image_label_editor,
+                        image_lightbox,
                     );
                     if let Some(a) = act {
                         cell_action = Some(a);

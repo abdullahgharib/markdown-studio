@@ -5,6 +5,11 @@ For architecture, features, shortcuts, and build instructions, see [README.md](R
 
 ---
 
+### `v0.7.12` (2026-11-22) — Reader Mode Image Lightbox
+- **Reader Mode Click-to-Enlarge Image Lightbox (`src/ui/reader/mod.rs`, `src/ui/mod.rs`)**:
+  - Added `ImageLightboxState` and `render_image_lightbox` so clicking any image in **Reader Mode**—whether inline, inside a GFM table cell, list, or blockquote—opens a dimmed centered inspection modal with native resolution badge, zoom controls (`−`, `%`, `+`, `Fit`, `50%–400%`, keyboard `+`/`-`/`0`), live animated GIF & crisp 2× SVG rendering, optional `"Open Link ↗"` button for linked images (`Ctrl+Click` still opens links directly), and `Esc` / backdrop click dismissal without exiting Focus Mode.
+- **Verification**: Full test suite passes (**177 tests**: `86` unit, `14` export, `11` roundtrip, `66` UI integration) with **0 Clippy warnings** (`cargo clippy --all-targets -- -D warnings`).
+
 ### `v0.7.11` (2026-11-22) — Local & Online Images, Animated GIFs, SVG Rendering & WYSIWYG Image Label Editing
 - **Remote Images, Animated GIFs & SVG/SVGZ Support (`Cargo.toml`, `src/ui/reader/images.rs`)**:
   - Added `resvg` (`0.50`) for 2× HiDPI SVG/SVGZ rasterization (with `OnceLock` system `fontdb`), `ureq` (`3.5`) for non-blocking off-thread `http://`/`https://` image fetching (10s timeout, 5 redirects, 16 MB body cap, 60s retry TTL, `MD_STUDIO_DISABLE_REMOTE_IMAGES=1` offline toggle), and `webp` decoding via `image`.

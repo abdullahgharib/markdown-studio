@@ -746,6 +746,7 @@ impl MarkdownApp {
             return;
         };
         self.toolbar_state.renaming_file = false;
+        self.reader_state.image_lightbox = None;
         let old_idx = self.active_tab;
         let outgoing = self.swap_active_with_state(*incoming);
         self.tabs[old_idx].state = Some(Box::new(outgoing));
@@ -1499,6 +1500,7 @@ impl MarkdownApp {
     }
 
     pub fn open_specific_file(&mut self, path: &Path) {
+        self.reader_state.image_lightbox = None;
         if let Some(existing_idx) = self.find_open_tab_by_path(path) {
             self.switch_to_tab(existing_idx);
             self.exporter.status_text = format!("Switched to {}", path.display());
@@ -3290,7 +3292,12 @@ impl MarkdownApp {
             || self.insert_link_modal.open
             || self.os_modal.open
             || self.external_diff_modal.open;
-        if !modal_open_now && !self.autoscroll.active && self.find_bar.open {
+        if self.reader_state.image_lightbox.is_some()
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape))
+        {
+            self.reader_state.image_lightbox = None;
+            ctx.request_repaint();
+        } else if !modal_open_now && !self.autoscroll.active && self.find_bar.open {
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
                 self.find_bar.open = false;
                 self.refocus_active_editor();

@@ -6336,3 +6336,142 @@ fn test_wysiwyg_inline_image_label_editing_and_reader_guard() {
         "Reader mode must not show WYSIWYG image label edit icon"
     );
 }
+
+#[test]
+fn test_reader_mode_image_lightbox_opens_from_inline_and_table_and_closes() {
+    fn collect_textured_image_rects(shape: &egui::Shape, out: &mut Vec<Rect>) {
+        match shape {
+            egui::Shape::Vec(v) => {
+                for s in v {
+                    collect_textured_image_rects(s, out);
+                }
+            }
+            egui::Shape::Rect(r)
+                if r.fill_texture_id() != egui::TextureId::default()
+                    && r.rect.min.y > 110.0
+                    && r.rect.width() >= 40.0
+                    && r.rect.height() >= 30.0 =>
+            {
+                out.push(r.rect);
+            }
+            _ => {}
+        }
+    }
+
+    let ctx = egui::Context::default();
+    let (dir, mut app) = new_isolated_app(&ctx);
+
+    let inline_img = image::RgbaImage::from_pixel(64, 48, image::Rgba([30, 120, 220, 255]));
+    inline_img.save(dir.path().join("inline.png")).unwrap();
+    let table_img = image::RgbaImage::from_pixel(64, 48, image::Rgba([220, 90, 40, 255]));
+    table_img.save(dir.path().join("table.png")).unwrap();
+
+    let doc_path = dir.path().join("lightbox.md");
+    std::fs::write(
+        &doc_path,
+        "# Lightbox\n\n![Inline Photo](inline.png)\n\n| Shot |\n| :--- |\n| ![Table Photo](table.png) |\n",
+    )
+    .unwrap();
+    app.open_specific_file(&doc_path);
+    app.dispatch_action(&ctx, ToolbarAction::SetViewMode(ViewMode::Reader));
+
+    let mut t = 1.0_f64;
+    let out = ui_step(&ctx, &mut app, t, vec![]);
+    let mut img_rects = Vec::new();
+    for s in &out.shapes {
+        collect_textured_image_rects(&s.shape, &mut img_rects);
+    }
+    img_rects.sort_by(|a, b| a.min.y.total_cmp(&b.min.y));
+    assert_eq!(
+        img_rects.len(),
+        2,
+        "expected inline and table images to render in Reader mode, got {img_rects:?}"
+    );
+
+    // 1. Click inline image -> opens lightbox
+    let _ = click_at(&ctx, &mut app, &mut t, img_rects[0].center(), Modifiers::NONE);
+    let lb_open = app
+        .reader_state
+        .image_lightbox
+        .as_ref()
+        .expect("clicking inline image in Reader mode must open lightbox");
+    assert_eq!(lb_open.url, "inline.png");
+
+    // Step 2 frames so the centered egui::Area finishes auto-sizing before clicking inside it
+    t += 0.03;
+    let _ = ui_step(&ctx, &mut app, t, vec![]);
+    t += 0.03;
+    let lb_out = ui_step(&ctx, &mut app, t, vec![]);
+    assert!(
+        !find_rendered_text_shapes(&lb_out, "Close").is_empty(),
+        "lightbox modal header should render Close button"
+    );
+    assert!(
+        !find_rendered_text_shapes(&lb_out, "100%").is_empty(),
+        "lightbox modal header should display zoom percentage"
+    );
+
+    // 2. Test zoom + button inside lightbox & Esc close
+    let card_plus_pos = find_rendered_text_shapes(&lb_out, "+")
+        .into_iter()
+        .find_map(|(_, ts)| {
+            (ts.pos.y > 110.0 && ts.galley.text().trim() == "+")
+                .then_some(ts.pos + egui::vec2(3.0, 6.0))
+        })
+        .expect("lightbox + button must be rendered below toolbar");
+    let _ = click_at(&ctx, &mut app, &mut t, card_plus_pos, Modifiers::NONE);
+    assert!(
+        app.reader_state
+            .image_lightbox
+            .as_ref()
+            .is_some_and(|lb| lb.zoom > 1.0),
+        "clicking + in lightbox should increase zoom"
+    );
+
+    t += 0.03;
+    let _ = ui_step(
+        &ctx,
+        &mut app,
+        t,
+        vec![Event::Key {
+            key: Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        }],
+    );
+    assert!(
+        app.reader_state.image_lightbox.is_none(),
+        "pressing Esc must close image lightbox"
+    );
+
+    // 3. Click table cell image -> opens lightbox for table.png
+    let _ = click_at(&ctx, &mut app, &mut t, img_rects[1].center(), Modifiers::NONE);
+    assert_eq!(
+        app.reader_state
+            .image_lightbox
+            .as_ref()
+            .map(|lb| lb.url.as_str()),
+        Some("table.png"),
+        "clicking table cell image in Reader mode must open lightbox"
+    );
+
+    // 4. Switching out of Reader mode clears lightbox and WYSIWYG image click does not open Reader lightbox
+    app.dispatch_action(&ctx, ToolbarAction::SetViewMode(ViewMode::Wysiwyg));
+    t += 0.03;
+    let wys_out = ui_step(&ctx, &mut app, t, vec![]);
+    assert!(app.reader_state.image_lightbox.is_none());
+
+    let mut wys_rects = Vec::new();
+    for s in &wys_out.shapes {
+        collect_textured_image_rects(&s.shape, &mut wys_rects);
+    }
+    if let Some(first_rect) = wys_rects.first() {
+        let _ = click_at(&ctx, &mut app, &mut t, first_rect.center(), Modifiers::NONE);
+        assert!(
+            app.reader_state.image_lightbox.is_none(),
+            "clicking image in WYSIWYG mode must not open Reader lightbox"
+        );
+    }
+}
