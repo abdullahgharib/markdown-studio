@@ -356,7 +356,7 @@ pub use crate::export::ir::heading_slug;
 /// or local/relative file path, rejecting dangerous URI schemes (`javascript:`, `data:`, etc.).
 pub fn classify_link_url(url: &str) -> Option<LinkTarget> {
     let trimmed = url.trim().trim_start_matches('<').trim_end_matches('>').trim();
-    if trimmed.is_empty() {
+    if trimmed.is_empty() || trimmed.chars().any(|c| c.is_control()) {
         return None;
     }
     if let Some(slug) = trimmed.strip_prefix('#') {
@@ -5456,7 +5456,7 @@ fn render_doc_block(
                 }
 
                 let evaluated_formulas: Option<Arc<EvaluatedTableGrid>> =
-                    if state.auto_calc_tables && !(wysiwyg && show_markup) && rows.len() <= 500 {
+                    if state.auto_calc_tables && !(wysiwyg && show_markup) {
                         state.cached_table_evaluation(buf, source_lines.start)
                     } else {
                         None
@@ -7801,10 +7801,11 @@ mod tests {
         let _ = ctx.run(Default::default(), |_| {});
         let galley = ctx.fonts(|f| f.layout_no_wrap("cell".to_string(), FontId::default(), Color32::BLACK));
         let mut cache = ReaderGalleyCache::default();
-        for i in 0..ReaderGalleyCache::MAX_ENTRIES {
+        let cap = ReaderGalleyCache::max_entries();
+        for i in 0..cap {
             cache.insert_bounded((i, i + 1, i as u64), Arc::clone(&galley), Arc::new(Vec::new()));
         }
-        assert_eq!(cache.entries.len(), ReaderGalleyCache::MAX_ENTRIES);
+        assert_eq!(cache.entries.len(), cap);
 
         // Touch entry 0 so it becomes newest
         assert!(cache.get(&(0, 1, 0)).is_some());
@@ -7812,8 +7813,8 @@ mod tests {
         // Inserting beyond capacity triggers bounded half-eviction
         let extra_key = (9999, 10000, 9999);
         cache.insert_bounded(extra_key, Arc::clone(&galley), Arc::new(Vec::new()));
-        assert!(cache.entries.len() < ReaderGalleyCache::MAX_ENTRIES);
-        assert!(cache.entries.len() >= ReaderGalleyCache::MAX_ENTRIES / 2);
+        assert!(cache.entries.len() < cap);
+        assert!(cache.entries.len() >= cap / 2);
         assert!(cache.get(&(0, 1, 0)).is_some());
         assert!(cache.get(&extra_key).is_some());
     }
@@ -7933,11 +7934,12 @@ mod tests {
     #[test]
     fn table_eval_cache_evicts_oldest_half_preserving_hot_entries() {
         let mut cache = TableEvalCache::default();
-        for i in 0..TableEvalCache::MAX_ENTRIES {
+        let cap = TableEvalCache::max_entries();
+        for i in 0..cap {
             let val = Some(Arc::new((vec![vec![i.to_string()]], vec![vec![true]])));
             cache.insert_bounded(i, val);
         }
-        assert_eq!(cache.len(), TableEvalCache::MAX_ENTRIES);
+        assert_eq!(cache.len(), cap);
 
         // Touch entry 0 so it becomes newest
         let hot = cache.get(0).flatten().expect("hot entry must be present");
@@ -7945,8 +7947,8 @@ mod tests {
 
         // Trigger bounded half-eviction
         cache.insert_bounded(9999, None);
-        assert!(cache.len() < TableEvalCache::MAX_ENTRIES);
-        assert!(cache.len() >= TableEvalCache::MAX_ENTRIES / 2);
+        assert!(cache.len() < cap);
+        assert!(cache.len() >= cap / 2);
         assert!(cache.get(0).is_some(), "hot entry must survive LRU eviction");
         assert!(cache.get(9999).is_some(), "newly inserted entry must be present");
     }

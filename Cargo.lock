@@ -2364,13 +2364,14 @@ dependencies = [
 
 [[package]]
 name = "markdown_studio"
-version = "0.7.15"
+version = "0.8.0"
 dependencies = [
  "comrak",
  "criterion",
  "docx-rs",
  "eframe",
  "egui",
+ "flate2",
  "image",
  "lopdf 0.35.0",
  "memchr",

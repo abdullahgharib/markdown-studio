@@ -7,9 +7,11 @@ use rustc_hash::FxHashMap;
 
 use crate::document::editing::{indent_lines, outdent_lines, word_range_in_line};
 use crate::document::search::is_unicode_word_char;
+use crate::document::system_total_memory_bytes;
 use crate::document::unicode::{
     build_visual_bidi_line_map, detect_paragraph_direction, shape_bidi_for_display,
-    snap_to_grapheme_end, snap_to_grapheme_start, TextDirection, VisualBidiLineMap,
+    snap_grapheme_end_in_rope_line, snap_grapheme_start_in_rope_line,
+    snap_to_grapheme_start, TextDirection, VisualBidiLineMap,
 };
 use crate::document::DocumentBuffer;
 use crate::ui::reader::{classify_link_url, extract_markdown_link_at_char};
@@ -29,6 +31,8 @@ struct CachedEditorLine {
     truncated: bool,
     bidi_map: Arc<VisualBidiLineMap>,
     galley: Option<Arc<egui::Galley>>,
+    last_tick: u64,
+    approx_bytes: usize,
 }
 
 #[derive(Debug, Default)]
@@ -37,7 +41,14 @@ struct LineLayoutCache {
     font_size_bits: u32,
     ppp_bits: u32,
     atlas: Weak<egui::epaint::mutex::Mutex<egui::epaint::TextureAtlas>>,
+    tick: u64,
+    total_bytes: usize,
     entries: FxHashMap<usize, CachedEditorLine>,
+}
+
+fn adaptive_line_cache_bytes() -> usize {
+    (system_total_memory_bytes() / 512)
+        .clamp(16 * 1024 * 1024, 128 * 1024 * 1024) as usize
 }
 
 #[inline]
@@ -148,6 +159,7 @@ impl VirtualEditorState {
         self.ime_composing = false;
         self.ime_preedit.clear();
         self.line_cache.entries.clear();
+        self.line_cache.total_bytes = 0;
     }
 
     fn prepare_line_cache(&mut self, ui: &egui::Ui, theme_mode: ThemeMode, font_size: f32) {
@@ -161,6 +173,7 @@ impl VirtualEditorState {
             || self.line_cache.ppp_bits != ppp_bits
         {
             self.line_cache.entries.clear();
+            self.line_cache.total_bytes = 0;
             self.line_cache.theme_mode = theme_mode;
             self.line_cache.font_size_bits = font_bits;
             self.line_cache.ppp_bits = ppp_bits;
@@ -201,15 +214,34 @@ impl VirtualEditorState {
             } else {
                 None
             };
-            self.line_cache.entries.insert(
+            let approx_bytes = line_str
+                .len()
+                .saturating_mul(8)
+                .saturating_add(512);
+            self.line_cache.tick = self.line_cache.tick.wrapping_add(1);
+            let tick = self.line_cache.tick;
+            if let Some(prev) = self.line_cache.entries.insert(
                 line_idx,
                 CachedEditorLine {
                     text: line_str,
                     truncated,
                     bidi_map,
                     galley,
+                    last_tick: tick,
+                    approx_bytes,
                 },
-            );
+            ) {
+                self.line_cache.total_bytes =
+                    self.line_cache.total_bytes.saturating_sub(prev.approx_bytes);
+            }
+            self.line_cache.total_bytes =
+                self.line_cache.total_bytes.saturating_add(approx_bytes);
+        } else {
+            self.line_cache.tick = self.line_cache.tick.wrapping_add(1);
+            let tick = self.line_cache.tick;
+            if let Some(entry) = self.line_cache.entries.get_mut(&line_idx) {
+                entry.last_tick = tick;
+            }
         }
 
         let entry = self.line_cache.entries.get(&line_idx).unwrap();
@@ -222,14 +254,24 @@ impl VirtualEditorState {
     }
 
     fn prune_line_cache(&mut self, visible: &Range<usize>) {
-        if self.line_cache.entries.len() <= 512 {
+        let max_bytes = adaptive_line_cache_bytes();
+        let max_entries = 4_096usize;
+        if self.line_cache.entries.len() <= max_entries
+            && self.line_cache.total_bytes <= max_bytes
+        {
             return;
         }
-        let keep_start = visible.start.saturating_sub(64);
-        let keep_end = visible.end.saturating_add(64);
+        let keep_start = visible.start.saturating_sub(128);
+        let keep_end = visible.end.saturating_add(128);
         self.line_cache
             .entries
             .retain(|&idx, _| idx >= keep_start && idx < keep_end);
+        self.line_cache.total_bytes = self
+            .line_cache
+            .entries
+            .values()
+            .map(|e| e.approx_bytes)
+            .sum();
     }
 }
 
@@ -914,22 +956,23 @@ fn prev_word_boundary_char(buf: &DocumentBuffer, pos: usize) -> usize {
         let prev_start = buf.line_to_char(line_idx - 1);
         return prev_start + buf.line_len_without_newline(line_idx - 1);
     }
-    let line_text = buf.line_text(line_idx);
-    let chars: Vec<char> = line_text.chars().collect();
-    let mut c = col.min(chars.len());
-    while c > 0 && chars[c - 1].is_whitespace() {
+    let line_slice = buf.rope().line(line_idx);
+    let line_len = buf.line_len_without_newline(line_idx);
+    let mut c = col.min(line_len);
+    while c > 0 && line_slice.char(c - 1).is_whitespace() {
         c -= 1;
     }
     if c > 0 {
-        let target_word = is_unicode_word_char(chars[c - 1]);
-        while c > 0
-            && !chars[c - 1].is_whitespace()
-            && is_unicode_word_char(chars[c - 1]) == target_word
-        {
+        let target_word = is_unicode_word_char(line_slice.char(c - 1));
+        while c > 0 {
+            let prev_ch = line_slice.char(c - 1);
+            if prev_ch.is_whitespace() || is_unicode_word_char(prev_ch) != target_word {
+                break;
+            }
             c -= 1;
         }
     }
-    buf.line_to_char(line_idx) + snap_to_grapheme_start(&line_text, c)
+    buf.line_to_char(line_idx) + snap_grapheme_start_in_rope_line(line_slice, c, line_len)
 }
 
 fn next_word_boundary_char(buf: &DocumentBuffer, pos: usize) -> usize {
@@ -938,32 +981,33 @@ fn next_word_boundary_char(buf: &DocumentBuffer, pos: usize) -> usize {
         return total;
     }
     let (line_idx, col) = buf.char_to_line_col(pos);
-    let line_text = buf.line_text(line_idx);
-    let chars: Vec<char> = line_text.chars().collect();
-    let mut c = col.min(chars.len());
-    if c >= chars.len() {
+    let line_slice = buf.rope().line(line_idx);
+    let line_len = buf.line_len_without_newline(line_idx);
+    let mut c = col.min(line_len);
+    if c >= line_len {
         if line_idx + 1 < buf.len_lines() {
             return buf.line_to_char(line_idx + 1);
         }
         return total;
     }
-    if chars[c].is_whitespace() {
-        while c < chars.len() && chars[c].is_whitespace() {
+    if line_slice.char(c).is_whitespace() {
+        while c < line_len && line_slice.char(c).is_whitespace() {
             c += 1;
         }
     } else {
-        let target_word = is_unicode_word_char(chars[c]);
-        while c < chars.len()
-            && !chars[c].is_whitespace()
-            && is_unicode_word_char(chars[c]) == target_word
-        {
+        let target_word = is_unicode_word_char(line_slice.char(c));
+        while c < line_len {
+            let cur_ch = line_slice.char(c);
+            if cur_ch.is_whitespace() || is_unicode_word_char(cur_ch) != target_word {
+                break;
+            }
             c += 1;
         }
-        while c < chars.len() && chars[c].is_whitespace() {
+        while c < line_len && line_slice.char(c).is_whitespace() {
             c += 1;
         }
     }
-    let snapped = snap_to_grapheme_end(&line_text, c);
+    let snapped = snap_grapheme_end_in_rope_line(line_slice, c, line_len);
     buf.line_to_char(line_idx) + snapped
 }
 
@@ -1486,8 +1530,14 @@ fn append_inline_syntax_highlights(
         ..Default::default()
     };
     let bytes = slice.as_bytes();
-    let mut i = 0;
-    let mut plain_start = 0;
+    let mut i = 0usize;
+    let mut plain_start = 0usize;
+    let mut no_more_tick = false;
+    let mut no_more_bold = false;
+    let mut no_more_italic = false;
+    let mut no_more_strike = false;
+    let mut no_more_link = false;
+
     while i < bytes.len() {
         if bytes[i] == b'\\' {
             i += 1;
@@ -1496,8 +1546,8 @@ fn append_inline_syntax_highlights(
             }
             continue;
         }
-        if bytes[i] == b'`' {
-            if let Some(rel_end) = slice[i + 1..].find('`') {
+        if bytes[i] == b'`' && !no_more_tick {
+            if let Some(rel_end) = memchr::memchr(b'`', &bytes[i + 1..]) {
                 if i > plain_start {
                     job.append(&slice[plain_start..i], 0.0, base_fmt.clone());
                 }
@@ -1516,7 +1566,12 @@ fn append_inline_syntax_highlights(
                 plain_start = end;
                 continue;
             }
-        } else if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'*' {
+            no_more_tick = true;
+        } else if i + 1 < bytes.len()
+            && bytes[i] == b'*'
+            && bytes[i + 1] == b'*'
+            && !no_more_bold
+        {
             if let Some(rel_end) = slice[i + 2..].find("**") {
                 if i > plain_start {
                     job.append(&slice[plain_start..i], 0.0, base_fmt.clone());
@@ -1535,9 +1590,10 @@ fn append_inline_syntax_highlights(
                 plain_start = end;
                 continue;
             }
-        } else if bytes[i] == b'*' {
-            if let Some(rel_end) = slice[i + 1..].find('*')
-                && rel_end > 0 {
+            no_more_bold = true;
+        } else if bytes[i] == b'*' && !no_more_italic {
+            if let Some(rel_end) = memchr::memchr(b'*', &bytes[i + 1..]) {
+                if rel_end > 0 {
                     if i > plain_start {
                         job.append(&slice[plain_start..i], 0.0, base_fmt.clone());
                     }
@@ -1556,7 +1612,14 @@ fn append_inline_syntax_highlights(
                     plain_start = end;
                     continue;
                 }
-        } else if i + 1 < bytes.len() && bytes[i] == b'~' && bytes[i + 1] == b'~' {
+            } else {
+                no_more_italic = true;
+            }
+        } else if i + 1 < bytes.len()
+            && bytes[i] == b'~'
+            && bytes[i + 1] == b'~'
+            && !no_more_strike
+        {
             if let Some(rel_end) = slice[i + 2..].find("~~") {
                 if i > plain_start {
                     job.append(&slice[plain_start..i], 0.0, base_fmt.clone());
@@ -1576,10 +1639,11 @@ fn append_inline_syntax_highlights(
                 plain_start = end;
                 continue;
             }
-        } else if bytes[i] == b'['
-            && let Some(close_br) = slice[i + 1..].find("](") {
+            no_more_strike = true;
+        } else if bytes[i] == b'[' && !no_more_link {
+            if let Some(close_br) = slice[i + 1..].find("](") {
                 let url_start = i + 1 + close_br + 2;
-                if let Some(close_par) = slice[url_start..].find(')') {
+                if let Some(close_par) = memchr::memchr(b')', &bytes[url_start..]) {
                     if i > plain_start {
                         job.append(&slice[plain_start..i], 0.0, base_fmt.clone());
                     }
@@ -1598,7 +1662,11 @@ fn append_inline_syntax_highlights(
                     plain_start = end;
                     continue;
                 }
+                no_more_link = true;
+            } else {
+                no_more_link = true;
             }
+        }
         let ch_len = slice[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
         i += ch_len;
     }

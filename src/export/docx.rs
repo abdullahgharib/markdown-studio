@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::Cursor;
+use std::io::{BufWriter, Cursor, Write};
 use std::path::{Path, PathBuf};
+
+use rustc_hash::FxHashMap;
 
 use docx_rs::{
     AbstractNumbering, AlignmentType, BorderType, BreakType, Docx, Hyperlink, HyperlinkType,
@@ -23,6 +25,7 @@ struct DocxCtx {
     slug_tracker: SlugTracker,
     bookmarks: HashMap<String, String>,
     base_dir: Option<PathBuf>,
+    image_cache: FxHashMap<String, (Vec<u8>, u32, u32)>,
 }
 
 #[derive(Debug, Clone)]
@@ -39,12 +42,11 @@ pub fn render_docx_bytes(
     render_docx_bytes_with_base_dir(blocks, None, on_progress)
 }
 
-/// Compiles `blocks` into a native OpenXML `.docx` ZIP archive in memory with optional relative image base directory.
-pub fn render_docx_bytes_with_base_dir(
+fn build_docx_document(
     blocks: &[DocBlock],
     base_dir: Option<&Path>,
     mut on_progress: impl FnMut(f32),
-) -> Result<Vec<u8>, String> {
+) -> Docx {
     let mut docx = Docx::new()
         .default_fonts(
             RunFonts::new()
@@ -81,10 +83,10 @@ pub fn render_docx_bytes_with_base_dir(
         docx = docx.add_style(style);
     }
 
-    // Register bullet abstract/numbering (ID 1) and ordered abstract numbering (abs ID 2).
+    // Register bullet abstract/numbering (ID 1) and ordered abstract numbering (abs ID 2) across all 9 OOXML list levels.
     let mut bullet_abs = AbstractNumbering::new(1);
     let mut ordered_abs = AbstractNumbering::new(2);
-    for lvl in 0..5usize {
+    for lvl in 0..9usize {
         let left_twips = ((lvl + 1) * 720) as i32;
         bullet_abs = bullet_abs.add_level(
             Level::new(
@@ -130,6 +132,7 @@ pub fn render_docx_bytes_with_base_dir(
         slug_tracker: SlugTracker::new(),
         bookmarks,
         base_dir: base_dir.map(Path::to_path_buf),
+        image_cache: FxHashMap::default(),
     };
 
     let total = blocks.len().max(1);
@@ -137,7 +140,16 @@ pub fn render_docx_bytes_with_base_dir(
         docx = append_block(docx, &mut ctx, block, 0, false);
         on_progress((idx + 1) as f32 / total as f32);
     }
+    docx
+}
 
+/// Compiles `blocks` into a native OpenXML `.docx` ZIP archive in memory with optional relative image base directory.
+pub fn render_docx_bytes_with_base_dir(
+    blocks: &[DocBlock],
+    base_dir: Option<&Path>,
+    on_progress: impl FnMut(f32),
+) -> Result<Vec<u8>, String> {
+    let docx = build_docx_document(blocks, base_dir, on_progress);
     let mut cursor = Cursor::new(Vec::new());
     docx.build().pack(&mut cursor).map_err(|e| e.to_string())?;
     Ok(cursor.into_inner())
@@ -248,11 +260,11 @@ pub fn export_docx_to_file_with_base_dir(
     base_dir: Option<&Path>,
     on_progress: impl FnMut(f32),
 ) -> Result<(), String> {
-    let bytes = render_docx_bytes_with_base_dir(blocks, base_dir, on_progress)?;
-    use std::io::Write;
-    let mut file = File::create(path.as_ref()).map_err(|e| e.to_string())?;
-    file.write_all(&bytes).map_err(|e| e.to_string())?;
-    file.flush().map_err(|e| e.to_string())?;
+    let docx = build_docx_document(blocks, base_dir, on_progress);
+    let file = File::create(path.as_ref()).map_err(|e| e.to_string())?;
+    let mut writer = BufWriter::with_capacity(64 * 1024, file);
+    docx.build().pack(&mut writer).map_err(|e| e.to_string())?;
+    writer.flush().map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -451,6 +463,7 @@ fn append_block(
                     Some("1F3A5F"),
                     base_dir.as_deref(),
                     &ctx.bookmarks,
+                    &mut ctx.image_cache,
                 );
             }
             if let Some(id) = bm_id {
@@ -486,6 +499,7 @@ fn append_block(
                     color,
                     base_dir.as_deref(),
                     &ctx.bookmarks,
+                    &mut ctx.image_cache,
                 );
             }
             docx = docx.add_paragraph(p);
@@ -579,7 +593,7 @@ fn append_block(
             let num_id = if *ordered {
                 let id = ctx.next_ordered_num_id;
                 ctx.next_ordered_num_id += 1;
-                let lvl = list_depth.min(4);
+                let lvl = list_depth.min(8);
                 let num = Numbering::new(id, 2).add_override(LevelOverride::new(lvl).start(*start));
                 docx = docx.add_numbering(num);
                 id
@@ -596,7 +610,14 @@ fn append_block(
             rows,
             ..
         } => {
-            let tbl = build_docx_table(alignments, header, rows, base_dir.as_deref(), &ctx.bookmarks);
+            let tbl = build_docx_table(
+                alignments,
+                header,
+                rows,
+                base_dir.as_deref(),
+                &ctx.bookmarks,
+                &mut ctx.image_cache,
+            );
             docx = docx
                 .add_table(tbl)
                 .add_paragraph(Paragraph::new().line_spacing(DocxLineSpacing::new().line(160).after(40)));
@@ -662,7 +683,7 @@ fn append_list_item(
     block_indent_level: u8,
 ) -> Docx {
     let base_dir = ctx.base_dir.clone();
-    let lvl = depth.min(4);
+    let lvl = depth.min(8);
     let extra_indent = block_indent_level as i32 * 720;
     for (idx, block) in item.blocks.iter().enumerate() {
         match block {
@@ -710,6 +731,7 @@ fn append_list_item(
                         None,
                         base_dir.as_deref(),
                         &ctx.bookmarks,
+                        &mut ctx.image_cache,
                     );
                 }
                 docx = docx.add_paragraph(p);
@@ -724,7 +746,7 @@ fn append_list_item(
                 let sub_num_id = if *sub_ord {
                     let id = ctx.next_ordered_num_id;
                     ctx.next_ordered_num_id += 1;
-                    let sub_lvl = (depth + 1).min(4);
+                    let sub_lvl = (depth + 1).min(8);
                     let num =
                         Numbering::new(id, 2).add_override(LevelOverride::new(sub_lvl).start(*sub_start));
                     docx = docx.add_numbering(num);
@@ -758,6 +780,7 @@ fn build_docx_table(
     rows: &[Vec<Vec<InlineRun>>],
     base_dir: Option<&Path>,
     bookmarks: &HashMap<String, String>,
+    image_cache: &mut FxHashMap<String, (Vec<u8>, u32, u32)>,
 ) -> Table {
     let cols = header
         .len()
@@ -784,6 +807,7 @@ fn build_docx_table(
                     Some("1E293B"),
                     base_dir,
                     bookmarks,
+                    image_cache,
                 );
             }
             cells.push(
@@ -805,7 +829,16 @@ fn build_docx_table(
                 .align(align)
                 .line_spacing(DocxLineSpacing::new().line(250).after(20));
             for r in runs {
-                p = add_inline_run_to_paragraph(p, r, 20, false, None, base_dir, bookmarks);
+                p = add_inline_run_to_paragraph(
+                    p,
+                    r,
+                    20,
+                    false,
+                    None,
+                    base_dir,
+                    bookmarks,
+                    image_cache,
+                );
             }
             let mut cell = TableCell::new()
                 .width(cell_w_dxa, WidthType::Dxa)
@@ -833,53 +866,31 @@ fn to_docx_align(a: TableAlign) -> AlignmentType {
     }
 }
 
-fn load_docx_pic(url: &str, base_dir: Option<&Path>) -> Option<Pic> {
+fn load_docx_pic(
+    url: &str,
+    base_dir: Option<&Path>,
+    cache: &mut FxHashMap<String, (Vec<u8>, u32, u32)>,
+) -> Option<Pic> {
     let trimmed = url.trim().trim_start_matches('<').trim_end_matches('>');
-    if trimmed.is_empty()
-        || trimmed.starts_with("http://")
-        || trimmed.starts_with("https://")
-        || trimmed.starts_with("data:")
-    {
-        return None;
+    if let Some((bytes, disp_w, disp_h)) = cache.get(trimmed) {
+        return Some(Pic::new_with_dimensions(bytes.clone(), *disp_w, *disp_h));
     }
-    let decoded = trimmed.replace("%20", " ");
-    let resolve_candidate = |candidate: &str| -> PathBuf {
-        let raw = Path::new(candidate);
-        if raw.is_absolute() || raw.exists() {
-            return raw.to_path_buf();
-        }
-        if let Some(base) = base_dir {
-            let joined = base.join(raw);
-            if joined.exists() {
-                return joined;
-            }
-        }
-        raw.to_path_buf()
-    };
-    let resolved = {
-        let primary = resolve_candidate(trimmed);
-        if primary.exists() || decoded == trimmed {
-            primary
-        } else {
-            resolve_candidate(&decoded)
-        }
-    };
-
-    let mut dyn_img = image::open(&resolved).ok()?;
-    let (w, h) = image::GenericImageView::dimensions(&dyn_img);
+    let rgba = crate::export::load_safe_export_rgba(trimmed, base_dir, 1200)?;
+    let (w, h) = rgba.dimensions();
     if w == 0 || h == 0 {
         return None;
     }
-    if w > 1200 {
-        dyn_img = dyn_img.resize(1200, 1200, image::imageops::FilterType::Triangle);
-    }
     let mut png_bytes = Cursor::new(Vec::new());
-    dyn_img.write_to(&mut png_bytes, image::ImageFormat::Png).ok()?;
+    image::DynamicImage::ImageRgba8(rgba)
+        .write_to(&mut png_bytes, image::ImageFormat::Png)
+        .ok()?;
+    let png_vec = png_bytes.into_inner();
     let disp_w = w.clamp(16, 540);
     let disp_h = ((h as f32) * (disp_w as f32 / w as f32))
         .round()
         .max(16.0) as u32;
-    Some(Pic::new_with_dimensions(png_bytes.into_inner(), disp_w, disp_h))
+    cache.insert(trimmed.to_string(), (png_vec.clone(), disp_w, disp_h));
+    Some(Pic::new_with_dimensions(png_vec, disp_w, disp_h))
 }
 
 fn classify_docx_link(
@@ -907,15 +918,7 @@ fn classify_docx_link(
         .trim_start_matches('<')
         .trim_end_matches('>')
         .trim();
-    if raw.is_empty() {
-        return None;
-    }
-
-    let lower = raw.to_ascii_lowercase();
-    if lower.starts_with("javascript:")
-        || lower.starts_with("vbscript:")
-        || lower.starts_with("data:text/html")
-    {
+    if raw.is_empty() || raw.chars().any(|c| c.is_control()) {
         return None;
     }
 
@@ -936,6 +939,7 @@ fn classify_docx_link(
         return None;
     }
 
+    let lower = raw.to_ascii_lowercase();
     if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("mailto:")
     {
         return Some(DocxLinkTarget::External(raw.to_string()));
@@ -944,15 +948,7 @@ fn classify_docx_link(
         return Some(DocxLinkTarget::External(format!("https://{raw}")));
     }
 
-    // Reject unknown explicit schemes while allowing safe relative file paths.
-    if let Some(colon) = raw.find(':') {
-        let before = &raw[..colon];
-        if !before.contains('/') && !before.contains('\\') && !before.contains('.') {
-            return None;
-        }
-    }
-
-    Some(DocxLinkTarget::External(raw.to_string()))
+    None
 }
 
 fn build_styled_text_run(
@@ -1021,6 +1017,7 @@ fn build_styled_text_run(
     run
 }
 
+#[allow(clippy::too_many_arguments)]
 fn add_inline_run_to_paragraph(
     mut p: Paragraph,
     inline: &InlineRun,
@@ -1029,12 +1026,13 @@ fn add_inline_run_to_paragraph(
     override_color: Option<&str>,
     base_dir: Option<&Path>,
     bookmarks: &HashMap<String, String>,
+    image_cache: &mut FxHashMap<String, (Vec<u8>, u32, u32)>,
 ) -> Paragraph {
     let link_target = classify_docx_link(inline, bookmarks);
     let styled_as_link = link_target.is_some();
 
     if let Some(ref img_url) = inline.image_url {
-        if let Some(pic) = load_docx_pic(img_url, base_dir) {
+        if let Some(pic) = load_docx_pic(img_url, base_dir, image_cache) {
             return p.add_run(Run::new().add_image(pic));
         }
         let fallback = format!("[Image: {}]", inline.text);
@@ -1109,4 +1107,34 @@ fn add_inline_run_to_paragraph(
         }
     }
     p
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_docx_link_allows_safe_schemes_and_blocks_unsafe_uris() {
+        let mut bookmarks = HashMap::new();
+        bookmarks.insert("sec".to_string(), "_Ref1".to_string());
+
+        let mut run = InlineRun::plain("click");
+        run.link_url = Some("javascript:alert(1)".to_string());
+        assert!(classify_docx_link(&run, &bookmarks).is_none());
+
+        run.link_url = Some("file:///C:/Windows/System32/cmd.exe".to_string());
+        assert!(classify_docx_link(&run, &bookmarks).is_none());
+
+        run.link_url = Some("https://example.org/docs".to_string());
+        assert!(matches!(
+            classify_docx_link(&run, &bookmarks),
+            Some(DocxLinkTarget::External(_))
+        ));
+
+        run.link_url = Some("#sec".to_string());
+        assert!(matches!(
+            classify_docx_link(&run, &bookmarks),
+            Some(DocxLinkTarget::Anchor(_))
+        ));
+    }
 }

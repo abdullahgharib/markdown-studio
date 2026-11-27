@@ -9,8 +9,8 @@ use egui::{Color32, CornerRadius, Margin, RichText, Sense, Stroke, Vec2};
 
 use crate::ui::theme::WordTheme;
 
-const MAX_SCAN_DEPTH: usize = 8;
-const MAX_SCAN_ENTRIES: usize = 2_500;
+const MAX_SCAN_DEPTH: usize = 64;
+const MAX_SCAN_ENTRIES: usize = 50_000;
 const FAST_SYNC_SCAN_ENTRIES: usize = 256;
 const FAST_SYNC_SCAN_BUDGET: Duration = Duration::from_millis(2);
 
@@ -110,6 +110,17 @@ pub struct ExplorerEntry {
 type ExplorerFilteredCache = (String, ExplorerFileFilter, bool, u64, Vec<usize>);
 type ExplorerScanResult = (PathBuf, bool, u64, Vec<ExplorerEntry>, bool);
 
+#[derive(Debug, Clone)]
+struct FlatTreeRow {
+    path: PathBuf,
+    name: String,
+    ext_lower: String,
+    is_dir: bool,
+    depth: usize,
+    expanded: bool,
+    empty_hint: bool,
+}
+
 /// Stateful, cached VS Code-style File Explorer with search & file type filters.
 #[derive(Debug, Default)]
 pub struct FileExplorerState {
@@ -119,6 +130,8 @@ pub struct FileExplorerState {
     pub show_hidden: bool,
     expanded_dirs: HashSet<PathBuf>,
     dir_cache: HashMap<PathBuf, Vec<ExplorerEntry>>,
+    flat_tree_cache: Option<(PathBuf, bool, u64, Vec<FlatTreeRow>)>,
+    tree_rev: u64,
     search_cache: Option<(PathBuf, bool, Vec<ExplorerEntry>, bool)>,
     filtered_cache: Option<ExplorerFilteredCache>,
     scan_rx: Option<Receiver<ExplorerScanResult>>,
@@ -138,7 +151,9 @@ impl FileExplorerState {
 
     pub fn refresh(&mut self) {
         self.scan_gen = self.scan_gen.wrapping_add(1);
+        self.tree_rev = self.tree_rev.wrapping_add(1);
         self.dir_cache.clear();
+        self.flat_tree_cache = None;
         self.search_cache = None;
         self.filtered_cache = None;
         self.scan_rx = None;
@@ -155,6 +170,7 @@ impl FileExplorerState {
         } else {
             self.expanded_dirs.insert(dir.to_path_buf());
         }
+        self.tree_rev = self.tree_rev.wrapping_add(1);
     }
 
     /// Returns sorted direct children of `dir`, reading from disk once and caching.
@@ -164,11 +180,84 @@ impl FileExplorerState {
         if !self.dir_cache.contains_key(dir) {
             let entries = read_dir_sorted(dir, root.as_deref(), show_hidden);
             self.dir_cache.insert(dir.to_path_buf(), entries);
+            self.tree_rev = self.tree_rev.wrapping_add(1);
         }
         self.dir_cache
             .get(dir)
             .map(Vec::as_slice)
             .unwrap_or(&[])
+    }
+
+    fn ensure_flat_tree(&mut self, root: &Path) {
+        if self.flat_tree_cache.as_ref().is_some_and(
+            |(cached_root, cached_hidden, cached_rev, _)| {
+                cached_root == root
+                    && *cached_hidden == self.show_hidden
+                    && *cached_rev == self.tree_rev
+            },
+        ) {
+            return;
+        }
+        let mut rows = Vec::new();
+        let mut seen_dirs = HashSet::new();
+        if let Ok(canon) = fs::canonicalize(root) {
+            seen_dirs.insert(canon);
+        }
+        self.append_flat_dir(root, 0, &mut seen_dirs, &mut rows);
+        self.flat_tree_cache = Some((root.to_path_buf(), self.show_hidden, self.tree_rev, rows));
+    }
+
+    fn append_flat_dir(
+        &mut self,
+        dir: &Path,
+        depth: usize,
+        seen_dirs: &mut HashSet<PathBuf>,
+        out: &mut Vec<FlatTreeRow>,
+    ) {
+        if depth > MAX_SCAN_DEPTH {
+            return;
+        }
+        let count = self.directory_children(dir).len();
+        if count == 0 {
+            if depth == 0 {
+                out.push(FlatTreeRow {
+                    path: dir.to_path_buf(),
+                    name: "(Empty folder)".to_string(),
+                    ext_lower: String::new(),
+                    is_dir: false,
+                    depth,
+                    expanded: false,
+                    empty_hint: true,
+                });
+            }
+            return;
+        }
+        for idx in 0..count {
+            let (path, name, ext_lower, is_dir) = {
+                let entry = &self.directory_children(dir)[idx];
+                (
+                    entry.path.clone(),
+                    entry.name.clone(),
+                    entry.ext_lower.clone(),
+                    entry.is_dir,
+                )
+            };
+            let expanded = is_dir && self.is_dir_expanded(&path);
+            out.push(FlatTreeRow {
+                path: path.clone(),
+                name,
+                ext_lower,
+                is_dir,
+                depth,
+                expanded,
+                empty_hint: false,
+            });
+            if expanded && let Ok(canon) = fs::canonicalize(&path)
+                && seen_dirs.insert(canon)
+            {
+                self.append_flat_dir(&path, depth + 1, seen_dirs, out);
+            }
+        }
     }
 
     fn search_cache_matches(&self, root: &Path) -> bool {
@@ -228,8 +317,19 @@ impl FileExplorerState {
                 self.filtered_cache = None;
                 true
             }
-            ScanProgress::Partial { entries, stack } => {
-                self.spawn_background_scan(root, self.show_hidden, entries, stack, Some(ctx.clone()));
+            ScanProgress::Partial {
+                entries,
+                stack,
+                visited_canon,
+            } => {
+                self.spawn_background_scan(
+                    root,
+                    self.show_hidden,
+                    entries,
+                    stack,
+                    visited_canon,
+                    Some(ctx.clone()),
+                );
                 false
             }
         }
@@ -241,6 +341,7 @@ impl FileExplorerState {
         show_hidden: bool,
         partial_entries: Vec<ExplorerEntry>,
         remaining_stack: Vec<(PathBuf, usize)>,
+        visited_canon: HashSet<PathBuf>,
         repaint_ctx: Option<egui::Context>,
     ) {
         let generation = self.scan_gen;
@@ -250,8 +351,13 @@ impl FileExplorerState {
         let _ = thread::Builder::new()
             .name("md-explorer-scan".to_string())
             .spawn(move || {
-                let (entries, truncated) =
-                    finish_scan_tree(&root, show_hidden, partial_entries, remaining_stack);
+                let (entries, truncated) = finish_scan_tree(
+                    &root,
+                    show_hidden,
+                    partial_entries,
+                    remaining_stack,
+                    visited_canon,
+                );
                 let _ = tx.send((root, show_hidden, generation, entries, truncated));
                 if let Some(c) = repaint_ctx {
                     c.request_repaint();
@@ -400,6 +506,7 @@ enum ScanProgress {
     Partial {
         entries: Vec<ExplorerEntry>,
         stack: Vec<(PathBuf, usize)>,
+        visited_canon: HashSet<PathBuf>,
     },
 }
 
@@ -412,10 +519,16 @@ fn scan_tree_with_budget(
     let start = Instant::now();
     let mut results = Vec::new();
     let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
+    let mut visited_canon: HashSet<PathBuf> = HashSet::new();
     let mut truncated = false;
 
     while let Some((dir, depth)) = stack.pop() {
         if depth > MAX_SCAN_DEPTH {
+            continue;
+        }
+        if let Ok(canon) = fs::canonicalize(&dir)
+            && !visited_canon.insert(canon)
+        {
             continue;
         }
         let children = read_dir_sorted(&dir, Some(root), show_hidden);
@@ -445,6 +558,7 @@ fn scan_tree_with_budget(
             return ScanProgress::Partial {
                 entries: results,
                 stack,
+                visited_canon,
             };
         }
     }
@@ -460,6 +574,7 @@ fn finish_scan_tree(
     show_hidden: bool,
     mut results: Vec<ExplorerEntry>,
     mut stack: Vec<(PathBuf, usize)>,
+    mut visited_canon: HashSet<PathBuf>,
 ) -> (Vec<ExplorerEntry>, bool) {
     let mut truncated = results.len() >= MAX_SCAN_ENTRIES;
 
@@ -468,6 +583,11 @@ fn finish_scan_tree(
             break;
         };
         if depth > MAX_SCAN_DEPTH {
+            continue;
+        }
+        if let Ok(canon) = fs::canonicalize(&dir)
+            && !visited_canon.insert(canon)
+        {
             continue;
         }
         let children = read_dir_sorted(&dir, Some(root), show_hidden);
@@ -496,7 +616,13 @@ fn finish_scan_tree(
 }
 
 fn scan_tree_bounded(root: &Path, show_hidden: bool) -> (Vec<ExplorerEntry>, bool) {
-    finish_scan_tree(root, show_hidden, Vec::new(), vec![(root.to_path_buf(), 0)])
+    finish_scan_tree(
+        root,
+        show_hidden,
+        Vec::new(),
+        vec![(root.to_path_buf(), 0)],
+        HashSet::new(),
+    )
 }
 
 fn file_badge_label(ext_lower: &str, theme: &WordTheme) -> (&'static str, Color32) {
@@ -721,180 +847,186 @@ pub fn render_explorer_panel(
     let filtering = !state.search_query.trim().is_empty()
         || state.file_filter != ExplorerFileFilter::All;
 
-    egui::ScrollArea::vertical()
-        .id_salt("file_explorer_tree_scroll")
-        .show(ui, |ui| {
-            if filtering {
-                if !state.ensure_search_cache_nonblocking(ui.ctx()) {
+    if filtering {
+        let mut ready = false;
+        let mut is_empty = false;
+        let mut match_count = 0usize;
+        let mut truncated = false;
+        if state.ensure_search_cache_nonblocking(ui.ctx()) {
+            state.ensure_filtered_cache();
+            ready = true;
+            truncated = state
+                .search_cache
+                .as_ref()
+                .map(|(_, _, _, t)| *t)
+                .unwrap_or(false);
+            match_count = state
+                .filtered_cache
+                .as_ref()
+                .map(|(_, _, _, _, idxs)| idxs.len())
+                .unwrap_or(0);
+            is_empty = match_count == 0;
+        }
+        let mut clicked_dir: Option<PathBuf> = None;
+        if !ready {
+            egui::ScrollArea::vertical()
+                .id_salt("file_explorer_tree_scroll")
+                .show(ui, |ui| {
                     ui.label(
                         RichText::new("Scanning folder…")
                             .size(12.0)
                             .italics()
                             .color(theme.text_muted),
                     );
-                    return;
-                }
-                state.ensure_filtered_cache();
-                let mut clicked_dir: Option<PathBuf> = None;
-                let (all_entries, truncated) = match state.search_cache.as_ref() {
-                    Some((_, _, entries, trunc)) => (entries.as_slice(), *trunc),
-                    None => (&[][..], false),
-                };
-                let indices = match state.filtered_cache.as_ref() {
-                    Some((_, _, _, _, idxs)) => idxs.as_slice(),
-                    None => &[][..],
-                };
-                if indices.is_empty() {
+                });
+        } else if is_empty {
+            egui::ScrollArea::vertical()
+                .id_salt("file_explorer_tree_scroll")
+                .show(ui, |ui| {
                     ui.label(
                         RichText::new("No matching files found.")
                             .size(12.0)
                             .italics()
                             .color(theme.text_muted),
                     );
-                    return;
-                }
-                for &idx in indices {
-                    let Some(entry) = all_entries.get(idx) else {
-                        continue;
+                });
+        } else {
+            egui::ScrollArea::vertical()
+                .id_salt("file_explorer_tree_scroll")
+                .show_rows(ui, 26.0, match_count, |ui, row_range| {
+                    let all_entries = match state.search_cache.as_ref() {
+                        Some((_, _, entries, _)) => entries.as_slice(),
+                        None => &[][..],
                     };
-                    if entry.is_dir {
-                        let row_resp = render_explorer_row(
+                    let indices = match state.filtered_cache.as_ref() {
+                        Some((_, _, _, _, idxs)) => idxs.as_slice(),
+                        None => &[][..],
+                    };
+                    for &idx in &indices[row_range] {
+                        let Some(entry) = all_entries.get(idx) else {
+                            continue;
+                        };
+                        if entry.is_dir {
+                            let row_resp = render_explorer_row(
+                                ui,
+                                0,
+                                "▸",
+                                &entry.name,
+                                Some(&entry.rel_path),
+                                None,
+                                false,
+                                theme,
+                            );
+                            if row_resp.clicked() {
+                                clicked_dir = Some(entry.path.clone());
+                            }
+                        } else {
+                            let is_active =
+                                active_file.is_some_and(|af| paths_equal_ci(af, &entry.path));
+                            let badge = file_badge_label(&entry.ext_lower, theme);
+                            let hint = if entry.rel_path != entry.name {
+                                Some(entry.rel_path.as_str())
+                            } else {
+                                None
+                            };
+                            let row_resp = render_explorer_row(
+                                ui,
+                                0,
+                                "",
+                                &entry.name,
+                                hint,
+                                Some(badge),
+                                is_active,
+                                theme,
+                            )
+                            .on_hover_text(entry.path.display().to_string());
+                            if row_resp.clicked() {
+                                action = ExplorerAction::OpenFile(entry.path.clone());
+                            }
+                        }
+                    }
+                });
+            if truncated {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(format!("(Showing first {MAX_SCAN_ENTRIES} scanned entries)"))
+                        .size(11.0)
+                        .weak(),
+                );
+            }
+        }
+        if let Some(dir_path) = clicked_dir {
+            state.search_query.clear();
+            state.file_filter = ExplorerFileFilter::All;
+            state.expanded_dirs.insert(dir_path);
+            state.tree_rev = state.tree_rev.wrapping_add(1);
+        }
+    } else {
+        state.ensure_flat_tree(&root_dir);
+        let row_count = state
+            .flat_tree_cache
+            .as_ref()
+            .map(|(_, _, _, r)| r.len())
+            .unwrap_or(0);
+        let mut toggle_dir: Option<PathBuf> = None;
+        egui::ScrollArea::vertical()
+            .id_salt("file_explorer_tree_scroll")
+            .show_rows(ui, 22.0, row_count, |ui, row_range| {
+                let rows = match state.flat_tree_cache.as_ref() {
+                    Some((_, _, _, r)) => r.as_slice(),
+                    None => &[][..],
+                };
+                for row in &rows[row_range] {
+                    if row.empty_hint {
+                        ui.label(
+                            RichText::new(&row.name)
+                                .size(12.0)
+                                .italics()
+                                .color(theme.text_muted),
+                        );
+                    } else if row.is_dir {
+                        let arrow = if row.expanded { "▼" } else { "▶" };
+                        let resp = render_explorer_row(
                             ui,
-                            0,
-                            "▸",
-                            &entry.name,
-                            Some(&entry.rel_path),
+                            row.depth,
+                            arrow,
+                            &row.name,
+                            None,
                             None,
                             false,
                             theme,
-                        );
-                        if row_resp.clicked() {
-                            clicked_dir = Some(entry.path.clone());
+                        )
+                        .on_hover_text(row.path.display().to_string());
+                        if resp.clicked() {
+                            toggle_dir = Some(row.path.clone());
                         }
                     } else {
-                        let is_active = active_file.is_some_and(|af| paths_equal_ci(af, &entry.path));
-                        let badge = file_badge_label(&entry.ext_lower, theme);
-                        let hint = if entry.rel_path != entry.name {
-                            Some(entry.rel_path.as_str())
-                        } else {
-                            None
-                        };
-                        let row_resp = render_explorer_row(
+                        let is_active =
+                            active_file.is_some_and(|af| paths_equal_ci(af, &row.path));
+                        let badge = file_badge_label(&row.ext_lower, theme);
+                        let resp = render_explorer_row(
                             ui,
-                            0,
+                            row.depth,
                             "",
-                            &entry.name,
-                            hint,
+                            &row.name,
+                            None,
                             Some(badge),
                             is_active,
                             theme,
                         )
-                        .on_hover_text(entry.path.display().to_string());
-                        if row_resp.clicked() {
-                            action = ExplorerAction::OpenFile(entry.path.clone());
+                        .on_hover_text(row.path.display().to_string());
+                        if resp.clicked() {
+                            action = ExplorerAction::OpenFile(row.path.clone());
                         }
                     }
                 }
-                if let Some(dir_path) = clicked_dir {
-                    state.search_query.clear();
-                    state.file_filter = ExplorerFileFilter::All;
-                    state.expanded_dirs.insert(dir_path);
-                }
-                if truncated {
-                    ui.add_space(4.0);
-                    ui.label(
-                        RichText::new(format!("(Showing first {MAX_SCAN_ENTRIES} scanned entries)"))
-                            .size(11.0)
-                            .weak(),
-                    );
-                }
-            } else {
-                render_tree_dir(
-                    ui,
-                    state,
-                    &root_dir,
-                    0,
-                    active_file,
-                    theme,
-                    &mut action,
-                );
-            }
-        });
-
-    action
-}
-
-fn render_tree_dir(
-    ui: &mut egui::Ui,
-    state: &mut FileExplorerState,
-    dir: &Path,
-    depth: usize,
-    active_file: Option<&Path>,
-    theme: &WordTheme,
-    action: &mut ExplorerAction,
-) {
-    if depth > MAX_SCAN_DEPTH {
-        return;
-    }
-    let children = state.directory_children(dir).to_vec();
-    if children.is_empty() && depth == 0 {
-        ui.label(
-            RichText::new("(Empty folder)")
-                .size(12.0)
-                .italics()
-                .color(theme.text_muted),
-        );
-        return;
-    }
-
-    for entry in children {
-        if entry.is_dir {
-            let expanded = state.is_dir_expanded(&entry.path);
-            let arrow = if expanded { "▼" } else { "▶" };
-            let resp = render_explorer_row(
-                ui,
-                depth,
-                arrow,
-                &entry.name,
-                None,
-                None,
-                false,
-                theme,
-            )
-            .on_hover_text(entry.path.display().to_string());
-            if resp.clicked() {
-                state.toggle_dir(&entry.path);
-            }
-            if expanded {
-                render_tree_dir(
-                    ui,
-                    state,
-                    &entry.path,
-                    depth + 1,
-                    active_file,
-                    theme,
-                    action,
-                );
-            }
-        } else {
-            let is_active = active_file.is_some_and(|af| paths_equal_ci(af, &entry.path));
-            let badge = file_badge_label(&entry.ext_lower, theme);
-            let resp = render_explorer_row(
-                ui,
-                depth,
-                "",
-                &entry.name,
-                None,
-                Some(badge),
-                is_active,
-                theme,
-            )
-            .on_hover_text(entry.path.display().to_string());
-            if resp.clicked() {
-                *action = ExplorerAction::OpenFile(entry.path);
-            }
+            });
+        if let Some(dir_path) = toggle_dir {
+            state.toggle_dir(&dir_path);
         }
     }
+
+    action
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1119,6 +1251,7 @@ mod tests {
             false,
             Vec::new(),
             vec![(dir.path().to_path_buf(), 0)],
+            std::collections::HashSet::new(),
             None,
         );
         for _ in 0..100 {

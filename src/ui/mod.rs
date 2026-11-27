@@ -104,8 +104,16 @@ fn open_with_os(target: &str) -> Result<(), String> {
     let cmd = "open";
     #[cfg(not(target_os = "macos"))]
     let cmd = "xdg-open";
+    let safe_arg = if target.starts_with('-')
+        && !target.contains("://")
+        && !target.to_ascii_lowercase().starts_with("mailto:")
+    {
+        format!("./{target}")
+    } else {
+        target.to_string()
+    };
     std::process::Command::new(cmd)
-        .arg(target)
+        .arg(&safe_arg)
         .spawn()
         .map(|_| ())
         .map_err(|e| e.to_string())
@@ -163,6 +171,9 @@ pub struct MarkdownApp {
     outline_items: Vec<OutlineItem>,
     pub outline_filter: String,
     pub collapsed_outline_lines: FxHashSet<usize>,
+    outline_collapse_rev: u64,
+    outline_vis_cache_key: (u64, u64, u64, String),
+    outline_vis_cache: Vec<(usize, bool, bool)>,
     word_count_cache: (u64, u64, usize),
     active_format_cache: ((u64, u64, usize, Option<usize>), ActiveFormatState),
     pending_zoom_save_at: Option<f64>,
@@ -171,6 +182,7 @@ pub struct MarkdownApp {
     font_scan_version: (u64, u64, u64),
     font_scanned_buf_key: (u64, u64),
     font_rxs: Vec<mpsc::Receiver<u8>>,
+    font_scan_rx: Option<mpsc::Receiver<((u64, u64), u8)>>,
     os_sync_rx: Option<mpsc::Receiver<PathBuf>>,
     last_window_title_key: Option<(u64, bool, usize, Option<PathBuf>)>,
     last_applied_zoom: f32,
@@ -410,6 +422,9 @@ impl MarkdownApp {
             outline_items,
             outline_filter: String::new(),
             collapsed_outline_lines: FxHashSet::default(),
+            outline_collapse_rev: 1,
+            outline_vis_cache_key: (0, 0, 0, String::new()),
+            outline_vis_cache: Vec::new(),
             word_count_cache: (doc_id, buffer.version, initial_word_count),
             active_format_cache: ((0, 0, usize::MAX, None), ActiveFormatState::default()),
             pending_zoom_save_at: None,
@@ -418,6 +433,7 @@ impl MarkdownApp {
             font_scan_version: (0, 0, 0),
             font_scanned_buf_key: (0, 0),
             font_rxs: Vec::new(),
+            font_scan_rx: None,
             os_sync_rx: None,
             last_window_title_key: None,
             last_applied_zoom: 1.0,
@@ -542,6 +558,7 @@ impl MarkdownApp {
         if self.outline_cache_key != outline_key {
             self.outline_items = build_outline_items(&self.block_index);
             self.outline_cache_key = outline_key;
+            self.outline_collapse_rev = self.outline_collapse_rev.wrapping_add(1);
         }
     }
 
@@ -1350,12 +1367,27 @@ impl MarkdownApp {
             return false;
         }
 
+        let canon_rec_dir = session::recovery_dir(&self.settings_path)
+            .canonicalize()
+            .ok();
         let mut restored_tabs: Vec<(usize, InactiveTabState)> = Vec::new();
         let mut recovered_unsaved = false;
 
         for entry in sess.tabs {
             let buf_opt = if entry.dirty || entry.file_path.is_none() {
-                if let Some(ref rec_path) = entry.recovery_file {
+                let valid_recovery = entry.recovery_file.as_ref().filter(|rec_path| {
+                    let s = rec_path.to_string_lossy();
+                    if s.starts_with(r"\\") || s.starts_with("//") {
+                        return false;
+                    }
+                    let Some(ref allowed_dir) = canon_rec_dir else {
+                        return false;
+                    };
+                    rec_path
+                        .canonicalize()
+                        .is_ok_and(|c| c.starts_with(allowed_dir) && c.is_file())
+                });
+                if let Some(rec_path) = valid_recovery {
                     let dirty_flag = entry.dirty || entry.file_path.is_none();
                     if let Ok(mut b) = DocumentBuffer::open_recovery_file(
                         rec_path,
@@ -2458,17 +2490,27 @@ impl MarkdownApp {
                             }
                         }
                     }
+                    self.outline_collapse_rev = self.outline_collapse_rev.wrapping_add(1);
                 }
             }
         });
         ui.add_space(6.0);
 
-        let visible = visible_outline_indices(
-            &self.outline_items,
-            &self.outline_filter,
-            &self.collapsed_outline_lines,
+        let vis_key = (
+            self.doc_id,
+            self.outline_cache_key.1,
+            self.outline_collapse_rev,
+            self.outline_filter.trim().to_string(),
         );
-        if visible.is_empty() {
+        if self.outline_vis_cache_key != vis_key {
+            self.outline_vis_cache = visible_outline_indices(
+                &self.outline_items,
+                &self.outline_filter,
+                &self.collapsed_outline_lines,
+            );
+            self.outline_vis_cache_key = vis_key;
+        }
+        if self.outline_vis_cache.is_empty() {
             ui.label(
                 RichText::new("No matching headings.")
                     .size(12.0)
@@ -2496,9 +2538,11 @@ impl MarkdownApp {
         let mut clicked_target: Option<(usize, f32)> = None;
 
         let scroll = egui::ScrollArea::vertical().id_salt("outline_scroll");
-        if visible.len() > 200 {
-            scroll.show_rows(ui, 24.0, visible.len(), |ui, row_range| {
-                for &(item_idx, has_children, is_collapsed) in &visible[row_range] {
+        if self.outline_vis_cache.len() > 200 {
+            scroll.show_rows(ui, 24.0, self.outline_vis_cache.len(), |ui, row_range| {
+                for &(item_idx, has_children, is_collapsed) in
+                    &self.outline_vis_cache[row_range]
+                {
                     let item = &self.outline_items[item_idx];
                     let (toggled, clicked) = render_outline_row(
                         ui,
@@ -2519,7 +2563,7 @@ impl MarkdownApp {
             });
         } else {
             scroll.show(ui, |ui| {
-                for &(item_idx, has_children, is_collapsed) in &visible {
+                for &(item_idx, has_children, is_collapsed) in &self.outline_vis_cache {
                     let item = &self.outline_items[item_idx];
                     let (toggled, clicked) = render_outline_row(
                         ui,
@@ -2540,10 +2584,12 @@ impl MarkdownApp {
             });
         }
 
-        if let Some(line) = toggled_collapse_line
-            && !self.collapsed_outline_lines.remove(&line) {
+        if let Some(line) = toggled_collapse_line {
+            if !self.collapsed_outline_lines.remove(&line) {
                 self.collapsed_outline_lines.insert(line);
             }
+            self.outline_collapse_rev = self.outline_collapse_rev.wrapping_add(1);
+        }
         if let Some((source_line, fallback_y)) = clicked_target {
             self.reader_state.active_block_lines = None;
             let c = self.buffer.line_to_char(source_line);
@@ -2607,6 +2653,10 @@ impl eframe::App for MarkdownApp {
                 }
             }
         }
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.save_session_and_recovery_now();
     }
 }
 
@@ -2735,6 +2785,7 @@ impl MarkdownApp {
     }
 
     pub fn update_ui(&mut self, ctx: &egui::Context) {
+        self.buffer.poll_dirty_check();
         let mut incoming_msgs = Vec::new();
         if let Some(rx) = &self.instance_rx {
             while let Ok(msg) = rx.try_recv() {
@@ -2884,7 +2935,7 @@ impl MarkdownApp {
                     .unwrap_or_default();
                 let is_raster_image = matches!(
                     ext.as_str(),
-                    "png" | "jpg" | "jpeg" | "gif" | "tiff" | "tif"
+                    "png" | "jpg" | "jpeg" | "gif" | "tiff" | "tif" | "webp" | "svg" | "svgz" | "bmp"
                 );
                 if is_raster_image {
                     if self.view_mode != ViewMode::Reader {
@@ -2928,13 +2979,63 @@ impl MarkdownApp {
             }
         }
         let doc_buf_key = (self.doc_id, self.buffer.buf_id());
+        if let Some(rx) = self.font_scan_rx.as_ref() {
+            match rx.try_recv() {
+                Ok((scanned_key, bg_missing)) => {
+                    self.font_scan_rx = None;
+                    if scanned_key == doc_buf_key {
+                        let already_covered = self.loaded_font_groups | self.pending_font_groups;
+                        let need = bg_missing & !already_covered;
+                        if need != 0 {
+                            let cached_bits = cached_font_groups_mask(need);
+                            if cached_bits != 0 {
+                                self.loaded_font_groups |= cached_bits;
+                                ctx.set_fonts(build_fonts_with_loaded_groups(
+                                    self.loaded_font_groups,
+                                ));
+                                ctx.request_repaint();
+                            }
+                            let uncached = need & !cached_bits;
+                            if uncached != 0 {
+                                self.pending_font_groups |= uncached;
+                                self.font_rxs.push(spawn_lazy_font_loader(uncached, ctx.clone()));
+                            }
+                        }
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.font_scan_rx = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
         let font_ver = (self.doc_id, self.buffer.buf_id(), self.buffer.version);
         if self.font_scan_version != font_ver {
             self.font_scan_version = font_ver;
             let already_covered = self.loaded_font_groups | self.pending_font_groups;
             let missing = if self.font_scanned_buf_key != doc_buf_key {
                 self.font_scanned_buf_key = doc_buf_key;
-                detect_needed_font_groups(self.buffer.rope(), already_covered)
+                if self.buffer.len_bytes() < 256 * 1024 {
+                    detect_needed_font_groups(self.buffer.rope(), already_covered)
+                } else {
+                    if (already_covered & ALL_LAZY_FONT_GROUPS) != ALL_LAZY_FONT_GROUPS {
+                        let rope_clone = self.buffer.rope().clone();
+                        let ctx_clone = ctx.clone();
+                        let (tx, rx) = mpsc::channel();
+                        self.font_scan_rx = Some(rx);
+                        let _ = std::thread::Builder::new()
+                            .name("md-font-scan".to_string())
+                            .spawn(move || {
+                                let bg_missing =
+                                    detect_needed_font_groups(&rope_clone, already_covered);
+                                let _ = tx.send((doc_buf_key, bg_missing));
+                                if bg_missing != 0 {
+                                    ctx_clone.request_repaint();
+                                }
+                            });
+                    }
+                    detect_needed_font_groups_around_cursor(&self.buffer, already_covered)
+                }
             } else {
                 detect_needed_font_groups_around_cursor(&self.buffer, already_covered)
             };
@@ -3895,7 +3996,17 @@ impl MarkdownApp {
                         format!("Linked file not found: {}", resolved.display());
                     return;
                 }
-                let is_markdown_or_text = resolved
+                let canon_resolved = resolved
+                    .canonicalize()
+                    .unwrap_or_else(|_| resolved.clone());
+                if is_dangerous_local_link_path(&canon_resolved) {
+                    self.exporter.status_text = format!(
+                        "Blocked unsafe executable or network link: {}",
+                        resolved.display()
+                    );
+                    return;
+                }
+                let is_markdown_or_text = canon_resolved
                     .extension()
                     .and_then(|e| e.to_str())
                     .is_some_and(|ext| {
@@ -3909,7 +4020,11 @@ impl MarkdownApp {
                     self.pending_anchor_after_open = fragment;
                     self.open_specific_file(&resolved);
                 } else if self.open_external_links_with_os {
-                    let target_str = resolved.to_string_lossy().to_string();
+                    let target_raw = canon_resolved.to_string_lossy();
+                    let target_str = target_raw
+                        .strip_prefix(r"\\?\")
+                        .unwrap_or(&target_raw)
+                        .to_string();
                     match open_with_os(&target_str) {
                         Ok(()) => {
                             self.exporter.status_text =
@@ -4339,17 +4454,16 @@ fn build_outline_items(index: &ViewportBlockIndex) -> Vec<OutlineItem> {
                     } else {
                         raw_title
                     };
+                    let title_lower = title.to_lowercase();
                     items.push(OutlineItem {
                         level: *level,
                         title,
+                        title_lower,
                         source_line: source_lines.start,
                         y_start: index.block_y_start(idx),
                     });
                 }
             }
-        if items.len() >= 2500 {
-            break;
-        }
     }
     items
 }
@@ -4433,7 +4547,7 @@ pub(crate) fn visible_outline_indices(
             .iter()
             .enumerate()
             .filter_map(|(i, item)| {
-                if item.title.to_lowercase().contains(&q_lower) {
+                if item.title_lower.contains(&q_lower) {
                     let has_children = i + 1 < items.len() && items[i + 1].level > item.level;
                     Some((i, has_children, false))
                 } else {
@@ -4883,7 +4997,15 @@ fn spawn_lazy_font_loader(missing_mask: u8, ctx: egui::Context) -> mpsc::Receive
 /// that must never be launched automatically via OS shell link clicks.
 pub fn is_dangerous_local_link_path(path: &Path) -> bool {
     let raw_str = path.to_string_lossy();
-    if raw_str.starts_with(r"\\") || raw_str.starts_with("//") {
+    let is_non_verbatim_unc = raw_str.starts_with(r"\\") && !raw_str.starts_with(r"\\?\");
+    let is_verbatim_unc = raw_str
+        .get(..8)
+        .is_some_and(|p| p.eq_ignore_ascii_case(r"\\?\UNC\"));
+    if is_non_verbatim_unc
+        || is_verbatim_unc
+        || raw_str.starts_with("//")
+        || raw_str.chars().any(|c| c.is_control())
+    {
         return true;
     }
     if matches!(
@@ -4896,11 +5018,34 @@ pub fn is_dangerous_local_link_path(path: &Path) -> bool {
     ) {
         return true;
     }
+    // Block NTFS Alternate Data Streams (`file.txt:stream::$DATA`) while permitting `C:\...` drive colon.
+    let mut colon_check = raw_str.as_ref();
+    if let Some(after_verbatim) = colon_check.strip_prefix(r"\\?\") {
+        colon_check = after_verbatim;
+    }
+    let bytes = colon_check.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        if colon_check[2..].contains(':') {
+            return true;
+        }
+    } else if colon_check.contains(':') {
+        return true;
+    }
+    // Block Windows trailing dots/spaces on path components (stripped by ShellExecuteW).
+    for comp in path.components() {
+        if let std::path::Component::Normal(s) = comp {
+            let s_lossy = s.to_string_lossy();
+            if s_lossy.ends_with('.') || s_lossy.ends_with(' ') {
+                return true;
+            }
+        }
+    }
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|ext| {
+            let clean_ext = ext.trim_end_matches(['.', ' ']).to_ascii_lowercase();
             matches!(
-                ext.to_ascii_lowercase().as_str(),
+                clean_ext.as_str(),
                 "exe"
                     | "bat"
                     | "cmd"
@@ -4922,13 +5067,61 @@ pub fn is_dangerous_local_link_path(path: &Path) -> bool {
                     | "hta"
                     | "jar"
                     | "lnk"
+                    | "url"
+                    | "scf"
+                    | "chm"
+                    | "inf"
+                    | "sct"
+                    | "wsc"
+                    | "iso"
+                    | "img"
+                    | "vhd"
+                    | "vhdx"
+                    | "appref-ms"
+                    | "msix"
+                    | "appx"
+                    | "diagcab"
+                    | "search-ms"
+                    | "library-ms"
+                    | "settingcontent-ms"
                     | "reg"
                     | "dll"
                     | "sys"
                     | "drv"
                     | "sh"
+                    | "bash"
+                    | "zsh"
+                    | "fish"
                     | "command"
                     | "app"
+                    | "py"
+                    | "pyw"
+                    | "rb"
+                    | "pl"
+                    | "php"
+                    | "svg"
+                    | "svgz"
+                    | "html"
+                    | "htm"
+                    | "mht"
+                    | "mhtml"
+                    | "docm"
+                    | "xlsm"
+                    | "pptm"
+                    | "dotm"
+                    | "xltm"
+                    | "potm"
+                    | "webloc"
+                    | "pkg"
+                    | "dmg"
+                    | "workflow"
+                    | "scpt"
+                    | "desktop"
+                    | "appimage"
+                    | "deb"
+                    | "rpm"
+                    | "run"
+                    | "bin"
             )
         })
 }
@@ -4962,6 +5155,7 @@ mod outline_tests {
         OutlineItem {
             level,
             title: title.to_string(),
+            title_lower: title.to_lowercase(),
             source_line: line,
             y_start: y,
         }
@@ -5055,5 +5249,24 @@ mod outline_tests {
         assert!(!is_dangerous_local_link_path(Path::new("docs/readme.txt")));
         assert!(!is_dangerous_local_link_path(Path::new("report.pdf")));
         assert!(!is_dangerous_local_link_path(Path::new("diagram.png")));
+    }
+
+    #[test]
+    fn build_outline_items_exceeds_old_2500_cap() {
+        let mut blocks = Vec::with_capacity(2_600);
+        for i in 0..2_600 {
+            blocks.push(DocBlock::Heading {
+                level: ((i % 3) + 1) as u8,
+                runs: vec![crate::export::ir::InlineRun::plain(format!("Heading {i}"))],
+                alignment: crate::document::unicode::BlockAlignment::Start,
+                direction: TextDirection::Ltr,
+                indent_level: 0,
+                source_lines: i..(i + 1),
+            });
+        }
+        let idx = ViewportBlockIndex::from_blocks(blocks, 720.0, 1);
+        let items = build_outline_items(&idx);
+        assert_eq!(items.len(), 2_600);
+        assert_eq!(items[2599].title_lower, "heading 2599");
     }
 }

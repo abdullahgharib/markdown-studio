@@ -129,6 +129,7 @@ struct PdfCursor {
     link_annotations: Vec<PdfLinkAnnotation>,
     page_layers: Vec<(PdfPageIndex, PdfLayerIndex)>,
     header_footer: PdfHeaderFooterOptions,
+    image_cache: rustc_hash::FxHashMap<String, (u32, u32, Vec<u8>)>,
 }
 
 struct CachedPdfFontBytes {
@@ -345,6 +346,7 @@ impl PdfCursor {
             link_annotations: Vec::new(),
             page_layers: vec![(page1, layer1)],
             header_footer: layout.header_footer,
+            image_cache: rustc_hash::FxHashMap::default(),
         })
     }
 
@@ -538,14 +540,20 @@ pub fn render_pdf_bytes_with_options(
     render_pdf_bytes_with_options_and_base_dir(blocks, title, layout, None, on_progress)
 }
 
-/// Compiles `blocks` into a paginated vector PDF byte buffer using custom geometry and optional asset base directory.
-pub fn render_pdf_bytes_with_options_and_base_dir(
+struct CompiledPdf {
+    bytes: Vec<u8>,
+    outline_entries: Vec<PdfOutlineEntry>,
+    anchors: HashMap<String, (usize, f32)>,
+    link_annotations: Vec<PdfLinkAnnotation>,
+}
+
+fn compile_pdf_raw_and_meta(
     blocks: &[DocBlock],
     title: &str,
     layout: PdfLayoutOptions,
     base_dir: Option<&Path>,
     mut on_progress: impl FnMut(f32),
-) -> Result<Vec<u8>, String> {
+) -> Result<CompiledPdf, String> {
     let mut pdf = PdfCursor::new(title, layout, base_dir)?;
     let total = blocks.len().max(1);
 
@@ -555,6 +563,8 @@ pub fn render_pdf_bytes_with_options_and_base_dir(
     }
 
     pdf.draw_headers_and_footers();
+    pdf.image_cache.clear();
+    pdf.image_cache.shrink_to_fit();
 
     let mut bytes = Vec::new();
     let outline_entries = std::mem::take(&mut pdf.outline_entries);
@@ -563,7 +573,29 @@ pub fn render_pdf_bytes_with_options_and_base_dir(
     pdf.doc
         .save(&mut BufWriter::new(&mut bytes))
         .map_err(|e| e.to_string())?;
-    inject_pdf_outlines_and_links(bytes, &outline_entries, &anchors, &link_annotations)
+    Ok(CompiledPdf {
+        bytes,
+        outline_entries,
+        anchors,
+        link_annotations,
+    })
+}
+
+/// Compiles `blocks` into a paginated vector PDF byte buffer using custom geometry and optional asset base directory.
+pub fn render_pdf_bytes_with_options_and_base_dir(
+    blocks: &[DocBlock],
+    title: &str,
+    layout: PdfLayoutOptions,
+    base_dir: Option<&Path>,
+    on_progress: impl FnMut(f32),
+) -> Result<Vec<u8>, String> {
+    let compiled = compile_pdf_raw_and_meta(blocks, title, layout, base_dir, on_progress)?;
+    inject_pdf_outlines_and_links(
+        compiled.bytes,
+        &compiled.outline_entries,
+        &compiled.anchors,
+        &compiled.link_annotations,
+    )
 }
 
 fn encode_pdf_outline_title(title: &str) -> LoObject {
@@ -631,17 +663,19 @@ fn resolve_anchor_target(
     anchors.get(&fn_slug).copied()
 }
 
-fn inject_pdf_outlines_and_links(
+fn inject_pdf_outlines_and_links_to_writer<W: std::io::Write>(
     pdf_bytes: Vec<u8>,
     entries: &[PdfOutlineEntry],
     anchors: &HashMap<String, (usize, f32)>,
     link_annotations: &[PdfLinkAnnotation],
-) -> Result<Vec<u8>, String> {
+    out: &mut W,
+) -> Result<(), String> {
     if entries.is_empty() && link_annotations.is_empty() {
-        return Ok(pdf_bytes);
+        return out.write_all(&pdf_bytes).map_err(|e| e.to_string());
     }
 
     let mut doc = lopdf::Document::load_mem(&pdf_bytes).map_err(|e| e.to_string())?;
+    drop(pdf_bytes);
     let pages: BTreeMap<u32, ObjectId> = doc.get_pages();
 
     let valid_entries: Vec<&PdfOutlineEntry> = entries
@@ -856,8 +890,21 @@ fn inject_pdf_outlines_and_links(
         }
     }
 
-    let mut out = Vec::with_capacity(pdf_bytes.len() + valid_entries.len() * 128 + link_annotations.len() * 96);
-    doc.save_to(&mut out).map_err(|e| e.to_string())?;
+    doc.save_to(out).map_err(|e| e.to_string())
+}
+
+fn inject_pdf_outlines_and_links(
+    pdf_bytes: Vec<u8>,
+    entries: &[PdfOutlineEntry],
+    anchors: &HashMap<String, (usize, f32)>,
+    link_annotations: &[PdfLinkAnnotation],
+) -> Result<Vec<u8>, String> {
+    if entries.is_empty() && link_annotations.is_empty() {
+        return Ok(pdf_bytes);
+    }
+    let approx = pdf_bytes.len() + entries.len() * 128 + link_annotations.len() * 96;
+    let mut out = Vec::with_capacity(approx);
+    inject_pdf_outlines_and_links_to_writer(pdf_bytes, entries, anchors, link_annotations, &mut out)?;
     Ok(out)
 }
 
@@ -891,17 +938,17 @@ pub fn export_pdf_to_file_with_options_and_base_dir(
     base_dir: Option<&Path>,
     on_progress: impl FnMut(f32),
 ) -> Result<(), String> {
-    let bytes = render_pdf_bytes_with_options_and_base_dir(
-        blocks,
-        title,
-        layout,
-        base_dir,
-        on_progress,
-    )?;
+    let compiled = compile_pdf_raw_and_meta(blocks, title, layout, base_dir, on_progress)?;
     let file = File::create(path.as_ref()).map_err(|e: io::Error| e.to_string())?;
     use std::io::Write;
-    let mut writer = BufWriter::new(file);
-    writer.write_all(&bytes).map_err(|e| e.to_string())?;
+    let mut writer = BufWriter::with_capacity(64 * 1024, file);
+    inject_pdf_outlines_and_links_to_writer(
+        compiled.bytes,
+        &compiled.outline_entries,
+        &compiled.anchors,
+        &compiled.link_annotations,
+        &mut writer,
+    )?;
     writer.flush().map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -934,12 +981,13 @@ fn aligned_line_x(
     }
 }
 
-fn rgba_to_pdf_image_xobject(rgba: &image::RgbaImage) -> Option<(ImageXObject, u32, u32)> {
+fn rgba_to_pdf_rgb_bytes(rgba: &image::RgbaImage) -> Option<(u32, u32, Vec<u8>)> {
     let (w, h) = rgba.dimensions();
     if w == 0 || h == 0 {
         return None;
     }
-    let mut rgb_bytes = Vec::with_capacity((w * h * 3) as usize);
+    let rgb_len = (w as usize).checked_mul(h as usize)?.checked_mul(3)?;
+    let mut rgb_bytes = Vec::with_capacity(rgb_len);
     for px in rgba.pixels() {
         let a = px[3] as f32 / 255.0;
         let inv = 1.0 - a;
@@ -947,7 +995,11 @@ fn rgba_to_pdf_image_xobject(rgba: &image::RgbaImage) -> Option<(ImageXObject, u
         rgb_bytes.push((px[1] as f32 * a + 255.0 * inv).round() as u8);
         rgb_bytes.push((px[2] as f32 * a + 255.0 * inv).round() as u8);
     }
-    let xobj = ImageXObject {
+    Some((w, h, rgb_bytes))
+}
+
+fn rgb_to_pdf_xobject(w: u32, h: u32, rgb_bytes: Vec<u8>) -> ImageXObject {
+    ImageXObject {
         width: Px(w as usize),
         height: Px(h as usize),
         color_space: ColorSpace::Rgb,
@@ -957,8 +1009,12 @@ fn rgba_to_pdf_image_xobject(rgba: &image::RgbaImage) -> Option<(ImageXObject, u
         image_filter: None,
         smask: None,
         clipping_bbox: None,
-    };
-    Some((xobj, w, h))
+    }
+}
+
+fn rgba_to_pdf_image_xobject(rgba: &image::RgbaImage) -> Option<(ImageXObject, u32, u32)> {
+    let (w, h, rgb_bytes) = rgba_to_pdf_rgb_bytes(rgba)?;
+    Some((rgb_to_pdf_xobject(w, h, rgb_bytes), w, h))
 }
 
 fn png_bytes_to_pdf_image_xobject(png_bytes: &[u8]) -> Option<(ImageXObject, u32, u32)> {
@@ -1010,43 +1066,18 @@ fn embed_pdf_image_xobject(
 }
 
 fn load_pdf_image_xobject(
+    pdf: &mut PdfCursor,
     url: &str,
-    base_dir: Option<&Path>,
 ) -> Option<(ImageXObject, u32, u32)> {
     let trimmed = url.trim().trim_start_matches('<').trim_end_matches('>');
-    if trimmed.is_empty()
-        || trimmed.starts_with("http://")
-        || trimmed.starts_with("https://")
-        || trimmed.starts_with("data:")
-    {
-        return None;
+    if let Some((w, h, rgb)) = pdf.image_cache.get(trimmed) {
+        return Some((rgb_to_pdf_xobject(*w, *h, rgb.clone()), *w, *h));
     }
-    let decoded = trimmed.replace("%20", " ");
-    let resolve_candidate = |candidate: &str| -> PathBuf {
-        let raw_path = Path::new(candidate);
-        if raw_path.is_absolute() || raw_path.exists() {
-            return raw_path.to_path_buf();
-        }
-        if let Some(base) = base_dir {
-            let joined = base.join(raw_path);
-            if joined.exists() {
-                return joined;
-            }
-        }
-        raw_path.to_path_buf()
-    };
-    let resolved = {
-        let primary = resolve_candidate(trimmed);
-        if primary.exists() || decoded == trimmed {
-            primary
-        } else {
-            resolve_candidate(&decoded)
-        }
-    };
-
-    let dyn_img = image::open(&resolved).ok()?;
-    let rgba = dyn_img.to_rgba8();
-    rgba_to_pdf_image_xobject(&rgba)
+    let rgba = crate::export::load_safe_export_rgba(trimmed, pdf.base_dir.as_deref(), 2400)?;
+    let (w, h, rgb) = rgba_to_pdf_rgb_bytes(&rgba)?;
+    pdf.image_cache
+        .insert(trimmed.to_string(), (w, h, rgb.clone()));
+    Some((rgb_to_pdf_xobject(w, h, rgb), w, h))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1090,9 +1121,8 @@ fn render_runs_with_images(
 
     for run in runs {
         if let Some(ref img_url) = run.image_url
-            && let Some((xobj, w_px, h_px)) =
-                load_pdf_image_xobject(img_url, pdf.base_dir.as_deref())
-            {
+            && let Some((xobj, w_px, h_px)) = load_pdf_image_xobject(pdf, img_url)
+        {
                 flush_text(pdf, &mut pending_text);
                 let max_h_mm = (pdf.top_y_mm - pdf.bottom_y_mm - 12.0).clamp(40.0, 115.0);
                 embed_pdf_image_xobject(
@@ -1827,6 +1857,25 @@ fn measure_line_width_mm(line: &[StyledSegment], font_pt: f32, force_bold: bool)
     line.iter().map(|s| s.width_mm).sum()
 }
 
+#[inline]
+fn approx_char_width_mm(c: char, font_pt: f32, bold: bool, mono: bool) -> f32 {
+    let scale = font_pt * PT_TO_MM;
+    if mono {
+        return 0.60 * scale;
+    }
+    let factor = if bold { 1.07 } else { 1.0 };
+    let unit = match c {
+        'i' | 'l' | 'I' | '!' | '.' | ',' | ':' | ';' | '|' | '\'' => 0.28,
+        'f' | 'j' | 'r' | 't' | '(' | ')' | '[' | ']' | '-' | ' ' => 0.34,
+        'm' | 'w' | 'M' | 'W' | '@' | '%' => 0.80,
+        c if (c as u32) >= 0x2E80 => 0.95,
+        c if !c.is_ascii() => 0.52,
+        c if c.is_uppercase() => 0.64,
+        _ => 0.51,
+    };
+    unit * scale * factor
+}
+
 fn approx_text_width_mm(
     text: &str,
     font_pt: f32,
@@ -1834,32 +1883,17 @@ fn approx_text_width_mm(
     mono: bool,
     unicode_enabled: bool,
 ) -> f32 {
-    let scale = font_pt * PT_TO_MM;
-    let measure_chars = |chars: &mut dyn Iterator<Item = char>| -> f32 {
-        if mono {
-            return chars.count() as f32 * 0.60 * scale;
-        }
-        let factor = if bold { 1.07 } else { 1.0 };
-        let units: f32 = chars
-            .map(|c| match c {
-                'i' | 'l' | 'I' | '!' | '.' | ',' | ':' | ';' | '|' | '\'' => 0.28,
-                'f' | 'j' | 'r' | 't' | '(' | ')' | '[' | ']' | '-' | ' ' => 0.34,
-                'm' | 'w' | 'M' | 'W' | '@' | '%' => 0.80,
-                c if (c as u32) >= 0x2E80 => 0.95,
-                c if !c.is_ascii() => 0.52,
-                c if c.is_uppercase() => 0.64,
-                _ => 0.51,
-            })
-            .sum();
-        units * scale * factor
-    };
     if unicode_enabled {
-        let mut iter = text.chars().filter(|&c| c != '\r' && c != '\n');
-        measure_chars(&mut iter)
+        text.chars()
+            .filter(|&c| c != '\r' && c != '\n')
+            .map(|c| approx_char_width_mm(c, font_pt, bold, mono))
+            .sum()
     } else {
         let sanitized = sanitize_pdf_text(text);
-        let mut iter = sanitized.chars();
-        measure_chars(&mut iter)
+        sanitized
+            .chars()
+            .map(|c| approx_char_width_mm(c, font_pt, bold, mono))
+            .sum()
     }
 }
 
@@ -1970,25 +2004,31 @@ fn push_words_wrapped(
             *cur_w = 0.0;
         }
 
-        // If a single word exceeds max_width_mm, hard-split by char
+        // If a single word exceeds max_width_mm, hard-split by char in O(len)
         if token_w > max_width_mm && !is_ws {
             let mut chunk = String::new();
+            let mut chunk_w = 0.0_f32;
+            let mut chunk_chars = 0usize;
             for ch in token.chars() {
-                chunk.push(ch);
-                let cw = approx_text_width_mm(&chunk, draw_pt, bold, template.code, unicode_enabled);
-                if cw > max_width_mm && chunk.chars().count() > 1 {
-                    let popped = chunk.pop().unwrap();
-                    let w = approx_text_width_mm(&chunk, draw_pt, bold, template.code, unicode_enabled);
-                    append_seg(lines, template, std::mem::take(&mut chunk), w);
+                if ch == '\r' || ch == '\n' {
+                    chunk.push(ch);
+                    continue;
+                }
+                let ch_w = approx_char_width_mm(ch, draw_pt, bold, template.code);
+                if chunk_chars > 0 && chunk_w + ch_w > max_width_mm {
+                    append_seg(lines, template, std::mem::take(&mut chunk), chunk_w);
                     lines.push(Vec::new());
                     *cur_w = 0.0;
-                    chunk.push(popped);
+                    chunk_w = 0.0;
+                    chunk_chars = 0;
                 }
+                chunk.push(ch);
+                chunk_w += ch_w;
+                chunk_chars += 1;
             }
             if !chunk.is_empty() {
-                let w = approx_text_width_mm(&chunk, draw_pt, bold, template.code, unicode_enabled);
-                append_seg(lines, template, chunk, w);
-                *cur_w += w;
+                append_seg(lines, template, chunk, chunk_w);
+                *cur_w += chunk_w;
             }
         } else {
             append_seg(lines, template, token.to_string(), token_w);
@@ -2039,10 +2079,13 @@ fn wrap_code_lines(code: &str, max_width_mm: f32, font_pt: f32) -> Vec<String> {
             continue;
         }
         let mut cur = String::new();
+        let mut cur_chars = 0usize;
         for ch in expanded.chars() {
             cur.push(ch);
-            if cur.chars().count() >= max_chars {
+            cur_chars += 1;
+            if cur_chars >= max_chars {
                 out.push(std::mem::take(&mut cur));
+                cur_chars = 0;
             }
         }
         if !cur.is_empty() {
@@ -2097,5 +2140,18 @@ mod tests {
         assert_eq!(date.len(), 10);
         assert_eq!(&date[4..5], "-");
         assert_eq!(&date[7..8], "-");
+    }
+
+    #[test]
+    fn rgba_to_pdf_rgb_bytes_composites_alpha_and_rejects_empty() {
+        let empty = image::RgbaImage::new(0, 0);
+        assert!(rgba_to_pdf_rgb_bytes(&empty).is_none());
+
+        let mut img = image::RgbaImage::new(1, 2);
+        img.put_pixel(0, 0, image::Rgba([0, 0, 0, 0]));
+        img.put_pixel(0, 1, image::Rgba([100, 150, 200, 255]));
+        let (w, h, rgb) = rgba_to_pdf_rgb_bytes(&img).expect("valid RGB bytes");
+        assert_eq!((w, h), (1, 2));
+        assert_eq!(rgb, vec![255, 255, 255, 100, 150, 200]);
     }
 }

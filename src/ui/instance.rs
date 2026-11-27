@@ -1,21 +1,18 @@
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-use rustc_hash::FxHasher;
+use std::time::Duration;
 
 use crate::ui::settings::AppSettings;
 
-static NONCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 const HANDOFF_HEADER: &str = "MDSTUDIO_HANDOFF_V1";
+const MAX_IPC_LINE_BYTES: u64 = 64 * 1024;
+const MAX_IPC_CMDS_PER_CONN: usize = 64;
 
 /// Parsed command-line launch configuration for Markdown Studio.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -164,16 +161,49 @@ fn unescape_ipc_field(s: &str) -> String {
     out
 }
 
+fn create_private_dir_all(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
+    }
+}
+
+fn open_private_new_file(path: &Path) -> io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+}
+
+/// Returns the private per-user directory used for detached-tab handoff snapshots.
+pub fn default_handoff_dir() -> PathBuf {
+    let lock = default_instance_lock_path();
+    let parent = lock
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    parent.join("handoffs")
+}
+
 fn create_unique_handoff_file() -> io::Result<(PathBuf, std::fs::File)> {
-    let dir = std::env::temp_dir();
+    let dir = default_handoff_dir();
+    create_private_dir_all(&dir)?;
     for _ in 0..16 {
-        let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let candidate = dir.join(format!("mdstudio_handoff_{}_{}.handoff", std::process::id(), seq));
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
+        let rand_id = crate::document::os_random_hex_16();
+        let candidate = dir.join(format!("mdstudio_handoff_{rand_id}.handoff"));
+        match open_private_new_file(&candidate) {
             Ok(file) => return Ok((candidate, file)),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
@@ -201,7 +231,7 @@ fn write_handoff_header(
     writer.write_all(b"\n---\n")
 }
 
-/// Writes a temporary `.handoff` snapshot into `std::env::temp_dir()` for a newly spawned window.
+/// Writes a temporary `.handoff` snapshot into the private per-user handoffs directory.
 pub fn write_handoff_file(handoff: &DetachedTabHandoff) -> io::Result<PathBuf> {
     let (candidate, file) = create_unique_handoff_file()?;
     let mut writer = BufWriter::with_capacity(64 * 1024, file);
@@ -228,42 +258,99 @@ pub fn write_handoff_file_from_rope(
     Ok(candidate)
 }
 
-/// Reads and immediately deletes a `.handoff` file created by `write_handoff_file`.
+/// Reads and deletes a validated `.handoff` file created by `write_handoff_file`.
+/// Validates directory confinement, file type, extension, and header before removing the file.
 pub fn read_and_remove_handoff_file(path: &Path) -> io::Result<DetachedTabHandoff> {
-    let raw = std::fs::read_to_string(path)?;
-    let _ = std::fs::remove_file(path);
-
-    let (header, content) = raw.split_once("\n---\n").ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "Missing handoff delimiter")
-    })?;
-    let mut lines = header.lines();
-    if lines.next() != Some(HANDOFF_HEADER) {
+    let raw_s = path.to_string_lossy();
+    let is_unc = (raw_s.starts_with(r"\\") && !raw_s.starts_with(r"\\?\"))
+        || raw_s
+            .get(..8)
+            .is_some_and(|p| p.eq_ignore_ascii_case(r"\\?\UNC\"))
+        || raw_s.starts_with("//");
+    if is_unc {
         return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Invalid handoff header",
+            io::ErrorKind::InvalidInput,
+            "UNC paths are not permitted for handoff files",
         ));
     }
-    let path_line = lines
-        .next()
-        .and_then(|l| l.strip_prefix("PATH:"))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Missing PATH line"))?;
-    let dirty_line = lines
-        .next()
-        .and_then(|l| l.strip_prefix("DIRTY:"))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Missing DIRTY line"))?;
+    if !path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("handoff"))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Invalid handoff file extension",
+        ));
+    }
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Handoff target must be a regular non-symlink file",
+        ));
+    }
+    let allowed_dir = default_handoff_dir().canonicalize()?;
+    let canon_path = path.canonicalize()?;
+    if !canon_path.starts_with(&allowed_dir) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Handoff file lies outside private handoffs directory",
+        ));
+    }
 
-    let file_path = if path_line.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(unescape_ipc_field(path_line)))
+    let loaded = {
+        let file = std::fs::File::open(&canon_path)?;
+        let mut reader = BufReader::with_capacity(64 * 1024, file);
+        let mut header_line = String::new();
+        reader.by_ref().take(256).read_line(&mut header_line)?;
+        if header_line.trim_end_matches(['\r', '\n']) != HANDOFF_HEADER {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid handoff header",
+            ));
+        }
+
+        let mut path_line = String::new();
+        reader.by_ref().take(64 * 1024).read_line(&mut path_line)?;
+        let path_val = path_line
+            .trim_end_matches(['\r', '\n'])
+            .strip_prefix("PATH:")
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Missing PATH line"))?;
+
+        let mut dirty_line = String::new();
+        reader.by_ref().take(256).read_line(&mut dirty_line)?;
+        let dirty_val = dirty_line
+            .trim_end_matches(['\r', '\n'])
+            .strip_prefix("DIRTY:")
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Missing DIRTY line"))?;
+
+        let mut sep_line = String::new();
+        reader.by_ref().take(64).read_line(&mut sep_line)?;
+        if sep_line.trim_end_matches(['\r', '\n']) != "---" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Missing handoff delimiter",
+            ));
+        }
+
+        let file_path = if path_val.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(unescape_ipc_field(path_val)))
+        };
+        let dirty = dirty_val.trim().eq_ignore_ascii_case("true");
+        let mut content = String::new();
+        reader.read_to_string(&mut content)?;
+        DetachedTabHandoff {
+            file_path,
+            dirty,
+            content,
+        }
     };
-    let dirty = dirty_line.trim().eq_ignore_ascii_case("true");
 
-    Ok(DetachedTabHandoff {
-        file_path,
-        dirty,
-        content: content.to_string(),
-    })
+    let _ = std::fs::remove_file(&canon_path);
+    Ok(loaded)
 }
 
 /// Messages forwarded from external launches or sibling windows to a Markdown Studio window.
@@ -290,50 +377,49 @@ pub fn default_instance_lock_path() -> PathBuf {
 }
 
 fn generate_nonce() -> String {
-    let now_nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let seq = NONCE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let pid = std::process::id();
-
-    let mut fx = FxHasher::default();
-    now_nanos.hash(&mut fx);
-    pid.hash(&mut fx);
-    seq.hash(&mut fx);
-
-    let mut std_h = DefaultHasher::new();
-    seq.hash(&mut std_h);
-    now_nanos.hash(&mut std_h);
-
-    let combined = fx.finish() ^ std_h.finish().rotate_left(17);
-    format!("{combined:016x}")
+    crate::document::os_random_hex_16()
 }
 
 fn write_file_atomic(target: &Path, body: &[u8]) -> io::Result<()> {
     if let Some(parent) = target.parent()
-        && !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
-    let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp_name = format!(
-        "{}.tmp.{}.{}",
-        target
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("ipc"),
-        std::process::id(),
-        seq
-    );
-    let tmp_path = target.with_file_name(tmp_name);
-    std::fs::write(&tmp_path, body)?;
-    match std::fs::rename(&tmp_path, target) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            let _ = std::fs::remove_file(&tmp_path);
-            std::fs::write(target, body)
+        && !parent.as_os_str().is_empty()
+    {
+        create_private_dir_all(parent)?;
+    }
+    let name = target
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("ipc");
+    for _ in 0..16 {
+        let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp_name = format!(".{name}.tmp.{}.{seq}", std::process::id());
+        let tmp_path = target.with_file_name(tmp_name);
+        match open_private_new_file(&tmp_path) {
+            Ok(mut file) => {
+                let res = (|| {
+                    file.write_all(body)?;
+                    file.flush()?;
+                    Ok(())
+                })();
+                drop(file);
+                if let Err(e) = res {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return Err(e);
+                }
+                if let Err(e) = crate::document::atomic_replace_file(&tmp_path, target) {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return Err(e);
+                }
+                return Ok(());
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
         }
     }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "Unable to allocate unique temp IPC file",
+    ))
 }
 
 fn write_lock_file_atomic(lock_path: &Path, port: u16, nonce: &str) -> io::Result<()> {
@@ -448,12 +534,19 @@ impl SingleInstanceServer {
                     };
                     let mut reader = BufReader::new(reader_stream);
                     let mut line = String::new();
-                    loop {
+                    for _cmd_idx in 0..MAX_IPC_CMDS_PER_CONN {
                         line.clear();
-                        let Ok(n) = reader.read_line(&mut line) else {
+                        let Ok(n) = reader
+                            .by_ref()
+                            .take(MAX_IPC_LINE_BYTES)
+                            .read_line(&mut line)
+                        else {
                             break;
                         };
-                        if n == 0 {
+                        if n == 0 || !line.ends_with('\n') {
+                            if n > 0 && !line.ends_with('\n') {
+                                let _ = stream.write_all(b"ERR\n");
+                            }
                             break;
                         }
                         let trimmed = line.trim_end_matches(['\r', '\n']);
@@ -461,7 +554,9 @@ impl SingleInstanceServer {
                         let tok = parts.next().unwrap_or("");
                         let cmd = parts.next().unwrap_or("");
                         let arg = parts.next().unwrap_or("");
-                        if tok == nonce_bg && !arg.is_empty() && matches!(cmd, "OPEN" | "HANDOFF")
+                        if crate::document::constant_time_eq(tok.as_bytes(), nonce_bg.as_bytes())
+                            && !arg.is_empty()
+                            && matches!(cmd, "OPEN" | "HANDOFF")
                         {
                             let path = PathBuf::from(unescape_ipc_field(arg));
                             let msg = if cmd == "HANDOFF" {

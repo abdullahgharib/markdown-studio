@@ -3,20 +3,52 @@ use std::ops::Range;
 use crate::document::ast::{build_table_markdown, extract_tables, TableData};
 use crate::document::unicode::{
     detect_paragraph_direction, format_line_block_meta, is_extending_char, parse_line_block_meta,
-    snap_to_grapheme_end, snap_to_grapheme_start, BlockAlignment, TextDirection,
+    snap_grapheme_end_in_rope_line, snap_grapheme_start_in_rope_line, snap_to_grapheme_end,
+    snap_to_grapheme_start, BlockAlignment, TextDirection,
 };
 use crate::document::DocumentBuffer;
 use crate::export::ir::TableAlign;
 
+#[inline]
+fn is_rope_line_blank(buf: &DocumentBuffer, line_idx: usize) -> bool {
+    if line_idx >= buf.len_lines() {
+        return true;
+    }
+    buf.rope()
+        .line(line_idx)
+        .chars()
+        .all(|c| c.is_whitespace())
+}
+
+#[inline]
+fn chars_end_with_ascii(slice: &[char], pat: &str) -> bool {
+    let pat_len = pat.len();
+    slice.len() >= pat_len
+        && slice[slice.len() - pat_len..]
+            .iter()
+            .zip(pat.bytes())
+            .all(|(&c, b)| c as u32 == u32::from(b))
+}
+
+#[inline]
+fn chars_start_with_ascii(slice: &[char], pat: &str) -> bool {
+    let pat_len = pat.len();
+    slice.len() >= pat_len
+        && slice[..pat_len]
+            .iter()
+            .zip(pat.bytes())
+            .all(|(&c, b)| c as u32 == u32::from(b))
+}
+
 fn snap_range_to_graphemes(buf: &DocumentBuffer, range: Range<usize>) -> Range<usize> {
     let (s_line, s_col) = buf.char_to_line_col(range.start);
-    let s_str = buf.line_text(s_line);
-    let s_snap = snap_to_grapheme_start(&s_str, s_col);
+    let s_len = buf.line_len_without_newline(s_line);
+    let s_snap = snap_grapheme_start_in_rope_line(buf.rope().line(s_line), s_col, s_len);
     let start = buf.line_col_to_char(s_line, s_snap);
 
     let (e_line, e_col) = buf.char_to_line_col(range.end);
-    let e_str = buf.line_text(e_line);
-    let e_snap = snap_to_grapheme_end(&e_str, e_col);
+    let e_len = buf.line_len_without_newline(e_line);
+    let e_snap = snap_grapheme_end_in_rope_line(buf.rope().line(e_line), e_col, e_len);
     let end = buf.line_col_to_char(e_line, e_snap);
     if start < end {
         start..end
@@ -57,22 +89,24 @@ fn find_surrounding_marker_layer(
 
     loop {
         let mut peeled = false;
-        let before: String = line_chars[..cur_s].iter().collect();
-        let after: String = line_chars[cur_e..].iter().collect();
+        let before = &line_chars[..cur_s];
+        let after = &line_chars[cur_e..];
         for &(om, cm) in &wrappers {
             let om_chars = om.chars().count();
             let cm_chars = cm.chars().count();
-            if before.ends_with(om) && after.starts_with(cm) {
+            if chars_end_with_ascii(before, om) && chars_start_with_ascii(after, cm) {
                 // Prevent splitting a single `*` or `$` out of `**...**` / `$$...$$`.
-                if (om == "*" || om == "$")
-                    && before.ends_with(&om.repeat(2))
-                    && after.starts_with(&cm.repeat(2))
-                {
-                    let ch = om.chars().next().unwrap();
-                    let b_cnt = line_chars[..cur_s].iter().rev().take_while(|&&c| c == ch).count();
-                    let a_cnt = line_chars[cur_e..].iter().take_while(|&&c| c == ch).count();
-                    if b_cnt % 2 == 0 && a_cnt % 2 == 0 {
-                        continue;
+                if (om == "*" || om == "$") && om_chars == 1 && cm_chars == 1 {
+                    let double_pat = if om == "*" { "**" } else { "$$" };
+                    if chars_end_with_ascii(before, double_pat)
+                        && chars_start_with_ascii(after, double_pat)
+                    {
+                        let ch = if om == "*" { '*' } else { '$' };
+                        let b_cnt = before.iter().rev().take_while(|&&c| c == ch).count();
+                        let a_cnt = after.iter().take_while(|&&c| c == ch).count();
+                        if b_cnt % 2 == 0 && a_cnt % 2 == 0 {
+                            continue;
+                        }
                     }
                 }
                 let open_range = (line_start + cur_s - om_chars)..(line_start + cur_s);
@@ -1665,21 +1699,20 @@ pub fn insert_table(buf: &mut DocumentBuffer, total_rows: usize, cols: usize) {
     }
 }
 
-/// Finds and parses the GFM table containing `line_idx` in O(block_lines * log n), safe for 10 MB files.
+/// Finds and parses the GFM table containing `line_idx` by expanding to blank separator lines on the `Rope`.
 pub fn table_at_line(buf: &DocumentBuffer, line_idx: usize) -> Option<TableData> {
-    if line_idx >= buf.len_lines() {
+    let total_lines = buf.len_lines();
+    if line_idx >= total_lines {
         return None;
     }
-    // Expand outward to blank lines (capped at 4096 lines each way) so we never clone a 10 MB buffer.
     let mut block_start = line_idx;
-    let min_start = line_idx.saturating_sub(4096);
-    while block_start > min_start && !buf.line_text(block_start - 1).trim().is_empty() {
+    while block_start > 0 && !is_rope_line_blank(buf, block_start - 1) {
         block_start -= 1;
     }
 
     let mut block_end = line_idx;
-    let max_end = (line_idx + 4096).min(buf.len_lines().saturating_sub(1));
-    while block_end < max_end && !buf.line_text(block_end + 1).trim().is_empty() {
+    let last_line_idx = total_lines.saturating_sub(1);
+    while block_end < last_line_idx && !is_rope_line_blank(buf, block_end + 1) {
         block_end += 1;
     }
 
@@ -1717,14 +1750,13 @@ pub fn delete_block_lines(buf: &mut DocumentBuffer, src_lines: &std::ops::Range<
         return false;
     }
     let end_excl = src_lines.end.min(total_lines);
-    let has_next_content = (end_excl..total_lines).any(|l| !buf.line_text(l).trim().is_empty());
+    let has_next_content = (end_excl..total_lines).any(|l| !is_rope_line_blank(buf, l));
 
     let (start_char, end_char) = if has_next_content {
         let start_c = buf.line_to_char(src_lines.start);
         let mut stop_line = end_excl;
-        let prev_blank =
-            src_lines.start == 0 || buf.line_text(src_lines.start - 1).trim().is_empty();
-        if stop_line < total_lines && buf.line_text(stop_line).trim().is_empty() && prev_blank {
+        let prev_blank = src_lines.start == 0 || is_rope_line_blank(buf, src_lines.start - 1);
+        if stop_line < total_lines && is_rope_line_blank(buf, stop_line) && prev_blank {
             stop_line += 1;
         }
         let end_c = if stop_line < total_lines {
@@ -1735,7 +1767,7 @@ pub fn delete_block_lines(buf: &mut DocumentBuffer, src_lines: &std::ops::Range<
         (start_c, end_c)
     } else {
         let mut del_start_line = src_lines.start;
-        if del_start_line > 0 && buf.line_text(del_start_line - 1).trim().is_empty() {
+        if del_start_line > 0 && is_rope_line_blank(buf, del_start_line - 1) {
             del_start_line -= 1;
         }
         if del_start_line == 0 {

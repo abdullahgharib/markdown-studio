@@ -1,10 +1,13 @@
 use std::ops::Range;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 use ropey::Rope;
 
-use crate::document::ast::{is_math_code_info, is_mermaid_code_info, parse_rope_to_ir, parse_to_ir};
+use crate::document::ast::{
+    is_math_code_info, is_mermaid_code_info, parse_rope_to_ir_cancellable, parse_to_ir,
+};
 use crate::export::ir::DocBlock;
 
 const BLOCK_VERTICAL_GAP: f32 = 10.0;
@@ -289,6 +292,24 @@ impl ViewportBlockIndex {
             return;
         }
 
+        if !self.non_virtual_y_override {
+            let strictly_sorted_valid = updates.windows(2).all(|w| w[0].0 < w[1].0)
+                && updates.last().is_some_and(|w| w.0 < n);
+            if strictly_sorted_valid {
+                for &(idx, measured) in updates {
+                    let latest = measured.max(0.0);
+                    let delta = latest - self.blocks[idx].height;
+                    if delta.abs() >= 1.0 {
+                        self.blocks[idx].height = latest;
+                        self.stride_tree.add(idx, delta as f64);
+                    }
+                }
+                self.total_height =
+                    (DOCUMENT_TOP_PAD + self.stride_tree.total() as f32).max(100.0);
+                return;
+            }
+        }
+
         if self.non_virtual_y_override {
             let mut sorted: Vec<(usize, f32)> = updates
                 .iter()
@@ -404,7 +425,13 @@ pub fn estimate_block_height(block: &DocBlock, content_width: f32) -> f32 {
             inner.max(26.0) + 8.0
         }
         DocBlock::CodeBlock { info, code, .. } => {
-            let line_count = code.lines().count().max(1) as f32;
+            let nl_count = memchr::memchr_iter(b'\n', code.as_bytes()).count();
+            let trailing = if code.is_empty() || code.ends_with('\n') {
+                0
+            } else {
+                1
+            };
+            let line_count = (nl_count + trailing).max(1) as f32;
             if is_mermaid_code_info(info) {
                 (160.0 + line_count * 18.0).clamp(220.0, 360.0)
             } else if is_math_code_info(info) {
@@ -453,8 +480,9 @@ pub fn estimate_block_height(block: &DocBlock, content_width: f32) -> f32 {
     }
 }
 
-/// Parses only a small line window of a large `Rope` for instant local preview while full AST builds.
+/// Parses only a small bounded window of a large `Rope` for instant local preview while full AST builds.
 pub fn parse_rope_line_window(rope: &Rope, start_line: usize, line_count: usize) -> Vec<DocBlock> {
+    const MAX_LOCAL_PREVIEW_BYTES: usize = 256 * 1024;
     let total = rope.len_lines();
     if total == 0 {
         return Vec::new();
@@ -462,11 +490,17 @@ pub fn parse_rope_line_window(rope: &Rope, start_line: usize, line_count: usize)
     let s = start_line.min(total - 1);
     let e = (s + line_count).min(total);
     let c_start = rope.line_to_char(s);
-    let c_end = if e >= total {
+    let mut c_end = if e >= total {
         rope.len_chars()
     } else {
         rope.line_to_char(e)
     };
+    let b_start = rope.char_to_byte(c_start);
+    let b_end = rope.char_to_byte(c_end);
+    if b_end.saturating_sub(b_start) > MAX_LOCAL_PREVIEW_BYTES {
+        let capped_byte = (b_start + MAX_LOCAL_PREVIEW_BYTES).min(rope.len_bytes());
+        c_end = rope.byte_to_char(capped_byte).max(c_start);
+    }
     let slice_str = rope.slice(c_start..c_end).to_string();
     parse_to_ir(&slice_str)
 }
@@ -476,17 +510,42 @@ struct ParseRequest {
     content_width: f32,
     version: u64,
     doc_id: u64,
+    epoch: u64,
 }
 
-/// Non-blocking background `comrak` parser thread that keeps the 120 FPS UI thread stutter-free.
+#[derive(Default)]
+struct ParseMailboxInner {
+    pending: Option<ParseRequest>,
+    latest_result: Option<ViewportBlockIndex>,
+    closed: bool,
+}
+
+struct SharedParseMailbox {
+    state: Mutex<ParseMailboxInner>,
+    cv: Condvar,
+    cancel_epoch: Arc<AtomicU64>,
+    worker_alive: AtomicBool,
+}
+
+/// Non-blocking, latest-wins cancellable background `comrak` parser that keeps the 120 FPS UI thread stutter-free.
 pub struct BackgroundAstParser {
-    tx: Sender<ParseRequest>,
-    rx: Receiver<ViewportBlockIndex>,
+    mailbox: Arc<SharedParseMailbox>,
 }
 
 impl Default for BackgroundAstParser {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for BackgroundAstParser {
+    fn drop(&mut self) {
+        self.mailbox.cancel_epoch.fetch_add(1, Ordering::Release);
+        if let Ok(mut guard) = self.mailbox.state.lock() {
+            guard.closed = true;
+            guard.pending = None;
+        }
+        self.mailbox.cv.notify_all();
     }
 }
 
@@ -500,46 +559,77 @@ impl BackgroundAstParser {
     }
 
     fn spawn_with_ctx(repaint_ctx: Option<egui::Context>) -> Self {
-        let (req_tx, req_rx) = mpsc::channel::<ParseRequest>();
-        let (res_tx, res_rx) = mpsc::channel::<ViewportBlockIndex>();
+        let mailbox = Arc::new(SharedParseMailbox {
+            state: Mutex::new(ParseMailboxInner::default()),
+            cv: Condvar::new(),
+            cancel_epoch: Arc::new(AtomicU64::new(0)),
+            worker_alive: AtomicBool::new(true),
+        });
+        let worker_box = Arc::clone(&mailbox);
 
-        thread::Builder::new()
+        if thread::Builder::new()
             .name("md-ast-parser".to_string())
             .spawn(move || {
-                while let Ok(mut req) = req_rx.recv() {
-                    // Coalesce bursty keystrokes: drain to the latest pending request.
-                    while let Ok(newer) = req_rx.try_recv() {
-                        req = newer;
+                loop {
+                    let req = {
+                        let Ok(mut guard) = worker_box.state.lock() else {
+                            break;
+                        };
+                        while guard.pending.is_none() && !guard.closed {
+                            let Ok(next) = worker_box.cv.wait(guard) else {
+                                return;
+                            };
+                            guard = next;
+                        }
+                        if guard.closed {
+                            break;
+                        }
+                        guard.pending.take()
+                    };
+                    let Some(req) = req else {
+                        continue;
+                    };
+                    let Some(blocks) = parse_rope_to_ir_cancellable(
+                        &req.rope,
+                        Some((&worker_box.cancel_epoch, req.epoch)),
+                    ) else {
+                        continue;
+                    };
+                    if worker_box.cancel_epoch.load(Ordering::Acquire) != req.epoch {
+                        continue;
                     }
-                    let blocks = parse_rope_to_ir(&req.rope);
                     let index = ViewportBlockIndex::from_blocks_with_doc(
                         blocks,
                         req.content_width,
                         req.version,
                         req.doc_id,
                     );
-                    if res_tx.send(index).is_err() {
-                        break;
+                    if let Ok(mut guard) = worker_box.state.lock() {
+                        if guard.closed {
+                            break;
+                        }
+                        guard.latest_result = Some(index);
                     }
                     if let Some(ref c) = repaint_ctx {
                         c.request_repaint();
                     }
                 }
+                worker_box.worker_alive.store(false, Ordering::Release);
             })
-            .expect("failed to spawn background AST parser thread");
-
-        Self {
-            tx: req_tx,
-            rx: res_rx,
+            .is_err()
+        {
+            mailbox.worker_alive.store(false, Ordering::Release);
         }
+
+        Self { mailbox }
     }
 
-    /// Queues an O(1) cloned `Rope` snapshot for background AST parsing.
+    /// Queues an O(1) cloned `Rope` snapshot for background AST parsing, cancelling stale work.
     pub fn request_parse(&self, rope: Rope, content_width: f32, version: u64) {
         self.request_parse_for_doc(rope, content_width, version, 0);
     }
 
-    /// Queues an O(1) cloned `Rope` snapshot tagged with a document session id.
+    /// Queues an O(1) cloned `Rope` snapshot tagged with a document session id, cancelling stale work.
     pub fn request_parse_for_doc(
         &self,
         rope: Rope,
@@ -547,21 +637,44 @@ impl BackgroundAstParser {
         version: u64,
         doc_id: u64,
     ) {
-        let _ = self.tx.send(ParseRequest {
+        let epoch = self
+            .mailbox
+            .cancel_epoch
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        let req = ParseRequest {
             rope,
             content_width,
             version,
             doc_id,
-        });
+            epoch,
+        };
+        if !self.mailbox.worker_alive.load(Ordering::Acquire) {
+            if let Some(blocks) = parse_rope_to_ir_cancellable(&req.rope, None) {
+                let index = ViewportBlockIndex::from_blocks_with_doc(
+                    blocks,
+                    req.content_width,
+                    req.version,
+                    req.doc_id,
+                );
+                if let Ok(mut guard) = self.mailbox.state.lock() {
+                    guard.latest_result = Some(index);
+                }
+            }
+            return;
+        }
+        if let Ok(mut guard) = self.mailbox.state.lock()
+            && !guard.closed
+        {
+            guard.pending = Some(req);
+            self.mailbox.cv.notify_one();
+        }
     }
 
     /// Polls for the most recently completed `ViewportBlockIndex` without blocking.
     pub fn poll_latest(&self) -> Option<ViewportBlockIndex> {
-        let mut latest = None;
-        while let Ok(idx) = self.rx.try_recv() {
-            latest = Some(idx);
-        }
-        latest
+        let mut guard = self.mailbox.state.lock().ok()?;
+        guard.latest_result.take()
     }
 }
 

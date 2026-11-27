@@ -1,21 +1,22 @@
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Weak};
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::Duration;
 
 use egui::{Align2, Color32, CornerRadius, FontId, Key, ProgressBar, RichText, Sense, Stroke, Vec2};
 use ropey::Rope;
-use rustc_hash::FxHasher;
+use rustc_hash::{FxHashMap, FxHasher};
 
 use crate::document::ast::TableData;
 use crate::document::calc;
 use crate::document::editing::{apply_table_edit, word_range_in_line};
 use crate::document::search::{
-    find_all_matches, find_all_matches_in_rope, is_unicode_word_char, replace_all_matches,
-    replace_single_match_with_opts, SearchOptions, SearchResult,
+    find_all_matches, find_all_matches_in_rope_cancellable, is_unicode_word_char,
+    replace_all_matches, replace_single_match_with_opts, SearchOptions, SearchResult,
 };
 use crate::document::unicode::{
     build_visual_bidi_line_map, detect_paragraph_direction, grapheme_char_boundaries,
@@ -38,6 +39,9 @@ pub struct TableEditorModal {
     pub open: bool,
     pub table: Option<TableData>,
     pub selected_cell: Option<(usize, usize)>,
+    eval_revision: u64,
+    cached_eval_revision: u64,
+    cached_evaluated: Vec<Vec<String>>,
 }
 
 impl TableEditorModal {
@@ -57,6 +61,9 @@ impl TableEditorModal {
         };
         self.table = Some(table);
         self.open = true;
+        self.eval_revision = self.eval_revision.wrapping_add(1);
+        self.cached_eval_revision = 0;
+        self.cached_evaluated.clear();
     }
 
     pub fn show(&mut self, ctx: &egui::Context, buf: &mut DocumentBuffer) {
@@ -71,6 +78,7 @@ impl TableEditorModal {
         let mut keep_open = true;
         let mut cancel_clicked = false;
         let mut apply = false;
+        let mut mark_dirty = false;
 
         egui::Window::new("Interactive GFM Table Editor")
             .open(&mut keep_open)
@@ -80,9 +88,11 @@ impl TableEditorModal {
                 ui.horizontal(|ui| {
                     if ui.button("+ Add Row").clicked() {
                         table.add_row(None);
+                        mark_dirty = true;
                     }
                     if ui.button("+ Add Column").clicked() {
                         table.add_column(None);
+                        mark_dirty = true;
                     }
                     if ui
                         .button("fx Recalculate")
@@ -90,6 +100,7 @@ impl TableEditorModal {
                         .clicked()
                     {
                         let _ = calc::recalculate_table(&mut table);
+                        mark_dirty = true;
                     }
                     ui.separator();
                     ui.label(
@@ -125,11 +136,16 @@ impl TableEditorModal {
                         ui.label(RichText::new(format!("[{cell_ref}]")).strong().monospace());
                         ui.label(RichText::new("fx").strong().italics());
                         let cell_mut = &mut table.rows[sel_r][sel_c];
-                        ui.add(
-                            egui::TextEdit::singleline(cell_mut)
-                                .desired_width(210.0)
-                                .hint_text("Value or =SUM(A1:B2) / =SUM(ABOVE)"),
-                        );
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(cell_mut)
+                                    .desired_width(210.0)
+                                    .hint_text("Value or =SUM(A1:B2) / =SUM(ABOVE)"),
+                            )
+                            .changed()
+                        {
+                            mark_dirty = true;
+                        }
                         let dir_arg = if sel_r > 0 {
                             "ABOVE"
                         } else if sel_c > 0 {
@@ -150,6 +166,7 @@ impl TableEditorModal {
                                 .clicked()
                             {
                                 *cell_mut = format!("{tmpl}({dir_arg})");
+                                mark_dirty = true;
                             }
                         }
                         if ui
@@ -158,15 +175,36 @@ impl TableEditorModal {
                             .clicked()
                         {
                             *cell_mut = "=IF(A1>0, 1, 0)".to_string();
+                            mark_dirty = true;
                         }
                     });
                 }
 
                 ui.separator();
 
-                let evaluated = calc::evaluate_table_grid(&table.rows);
+                if mark_dirty || self.cached_eval_revision != self.eval_revision {
+                    self.cached_evaluated = calc::evaluate_table_grid(&table.rows);
+                    self.cached_eval_revision = self.eval_revision;
+                }
+                let evaluated = &self.cached_evaluated;
+
+                let scroll_id = ui.make_persistent_id("table_editor_both_scroll");
+                let scroll_y = egui::scroll_area::State::load(ctx, scroll_id)
+                    .map(|s| s.offset.y)
+                    .unwrap_or(0.0);
+                let total_rows = table.rows.len();
+                let est_row_h = 28.0_f32;
+                let virt_range = if total_rows > 80 {
+                    let body_scroll = (scroll_y - 90.0).max(0.0);
+                    let start = ((body_scroll / est_row_h).floor() as usize).saturating_sub(6);
+                    let end = (start + 32).min(total_rows);
+                    start..end
+                } else {
+                    0..total_rows
+                };
 
                 egui::ScrollArea::both()
+                    .id_salt("table_editor_both_scroll")
                     .max_height(360.0)
                     .show(ui, |ui| {
                         let cols = table.col_count();
@@ -210,6 +248,7 @@ impl TableEditorModal {
                                                 TableAlign::Right => TableAlign::None,
                                             };
                                             table.set_alignment(c, next);
+                                            mark_dirty = true;
                                         }
                                         if cols > 1
                                             && ui
@@ -223,6 +262,7 @@ impl TableEditorModal {
                                 }
                                 if let Some(c) = col_to_delete {
                                     table.delete_column(c);
+                                    mark_dirty = true;
                                     if let Some((sr, sc)) = self.selected_cell {
                                         self.selected_cell = Some((sr, sc.saturating_sub(if sc >= c { 1 } else { 0 })));
                                     }
@@ -237,16 +277,28 @@ impl TableEditorModal {
                                 }
                                 ui.label(RichText::new("Header").strong());
                                 for cell in table.header.iter_mut().take(cur_cols) {
-                                    ui.add(
-                                        egui::TextEdit::singleline(cell).desired_width(120.0),
-                                    );
+                                    if ui
+                                        .add(egui::TextEdit::singleline(cell).desired_width(120.0))
+                                        .changed()
+                                    {
+                                        mark_dirty = true;
+                                    }
                                 }
                                 ui.label("");
                                 ui.end_row();
 
-                                // Body rows
+                                if virt_range.start > 0 {
+                                    ui.add_space(virt_range.start as f32 * est_row_h);
+                                    for _ in 0..=cur_cols {
+                                        ui.label("");
+                                    }
+                                    ui.end_row();
+                                }
+
+                                // Visible body rows
                                 let mut row_to_delete: Option<usize> = None;
-                                for (r_idx, row) in table.rows.iter_mut().enumerate() {
+                                for r_idx in virt_range.clone() {
+                                    let row = &mut table.rows[r_idx];
                                     while row.len() < cur_cols {
                                         row.push(String::new());
                                     }
@@ -272,6 +324,9 @@ impl TableEditorModal {
                                                     if eval_badge.is_some() { 82.0 } else { 120.0 },
                                                 ),
                                             );
+                                            if te.changed() {
+                                                mark_dirty = true;
+                                            }
                                             if te.gained_focus() || te.clicked() || te.has_focus() {
                                                 self.selected_cell = Some((r_idx, c_idx));
                                             }
@@ -290,8 +345,16 @@ impl TableEditorModal {
                                     }
                                     ui.end_row();
                                 }
+                                if virt_range.end < total_rows {
+                                    ui.add_space((total_rows - virt_range.end) as f32 * est_row_h);
+                                    for _ in 0..=cur_cols {
+                                        ui.label("");
+                                    }
+                                    ui.end_row();
+                                }
                                 if let Some(r_idx) = row_to_delete {
                                     table.delete_row(r_idx);
+                                    mark_dirty = true;
                                     if table.rows.is_empty() {
                                         self.selected_cell = None;
                                     } else if let Some((sr, sc)) = self.selected_cell {
@@ -321,6 +384,10 @@ impl TableEditorModal {
                 });
             });
 
+        if mark_dirty {
+            self.eval_revision = self.eval_revision.wrapping_add(1);
+        }
+
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
             cancel_clicked = true;
         } else if ctx.input(|i| i.modifiers.command && i.key_pressed(Key::Enter)) {
@@ -333,12 +400,14 @@ impl TableEditorModal {
             self.open = false;
             self.table = None;
             self.selected_cell = None;
+            self.cached_evaluated.clear();
         } else if keep_open && !cancel_clicked {
             self.table = Some(table);
         } else {
             self.open = false;
             self.table = None;
             self.selected_cell = None;
+            self.cached_evaluated.clear();
         }
     }
 }
@@ -1469,6 +1538,7 @@ struct SearchJob {
     key: SearchKey,
     rope: Rope,
     repaint_ctx: Option<egui::Context>,
+    cancel: Arc<AtomicBool>,
 }
 
 struct SearchJobResult {
@@ -1476,31 +1546,52 @@ struct SearchJobResult {
     res: SearchResult,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct BackgroundSearcher {
     tx: Option<Sender<SearchJob>>,
     rx: Option<Receiver<SearchJobResult>>,
     in_flight: Option<SearchKey>,
-    handle: Option<JoinHandle<()>>,
+    active_cancel: Arc<AtomicBool>,
+}
+
+impl Default for BackgroundSearcher {
+    fn default() -> Self {
+        Self {
+            tx: None,
+            rx: None,
+            in_flight: None,
+            active_cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
 }
 
 impl BackgroundSearcher {
+    fn cancel_in_flight(&mut self) {
+        self.active_cancel.store(true, Ordering::Release);
+        self.in_flight = None;
+    }
+
     fn request(&mut self, key: SearchKey, rope: Rope, repaint_ctx: Option<egui::Context>) {
         if self.in_flight.as_ref() == Some(&key) {
             return;
         }
+        self.active_cancel.store(true, Ordering::Release);
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.active_cancel = Arc::clone(&cancel);
+
         if let Some(ref tx) = self.tx
             && tx
                 .send(SearchJob {
                     key: key.clone(),
                     rope: rope.clone(),
                     repaint_ctx: repaint_ctx.clone(),
+                    cancel: Arc::clone(&cancel),
                 })
                 .is_ok()
-            {
-                self.in_flight = Some(key);
-                return;
-            }
+        {
+            self.in_flight = Some(key);
+            return;
+        }
         let (job_tx, job_rx) = mpsc::channel::<SearchJob>();
         let (res_tx, res_rx) = mpsc::channel::<SearchJobResult>();
         if job_tx
@@ -1508,19 +1599,31 @@ impl BackgroundSearcher {
                 key: key.clone(),
                 rope,
                 repaint_ctx,
+                cancel,
             })
             .is_err()
         {
             return;
         }
-        if let Ok(handle) = thread::Builder::new()
+        if thread::Builder::new()
             .name("md-bg-search".to_string())
             .spawn(move || {
                 while let Ok(mut job) = job_rx.recv() {
                     while let Ok(newer) = job_rx.try_recv() {
                         job = newer;
                     }
-                    let res = find_all_matches_in_rope(&job.rope, &job.key.query, &job.key.opts);
+                    if job.cancel.load(Ordering::Relaxed) {
+                        continue;
+                    }
+                    let res = find_all_matches_in_rope_cancellable(
+                        &job.rope,
+                        &job.key.query,
+                        &job.key.opts,
+                        Some(job.cancel.as_ref()),
+                    );
+                    if job.cancel.load(Ordering::Relaxed) {
+                        continue;
+                    }
                     let repaint = job.repaint_ctx.clone();
                     if res_tx
                         .send(SearchJobResult {
@@ -1536,11 +1639,11 @@ impl BackgroundSearcher {
                     }
                 }
             })
+            .is_ok()
         {
             self.tx = Some(job_tx);
             self.rx = Some(res_rx);
             self.in_flight = Some(key);
-            self.handle = Some(handle);
         }
     }
 
@@ -1580,11 +1683,9 @@ impl BackgroundSearcher {
 
 impl Drop for BackgroundSearcher {
     fn drop(&mut self) {
+        self.active_cancel.store(true, Ordering::Release);
         drop(self.tx.take());
         drop(self.rx.take());
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
     }
 }
 
@@ -1645,7 +1746,10 @@ impl FindReplaceBar {
             if self.in_selection && self.selection_scope.is_none() {
                 self.selection_scope = Some(sel.clone());
             }
-            if !self.in_selection && !self.matches.contains(&sel) {
+            if !self.in_selection
+                && sel.end.saturating_sub(sel.start) <= 160
+                && !self.matches.contains(&sel)
+            {
                 let selected = buf.rope().slice(sel).to_string();
                 if !selected.is_empty()
                     && !selected.contains('\n')
@@ -1699,7 +1803,7 @@ impl FindReplaceBar {
         self.status.clear();
         self.last_buf_version = 0;
         self.last_search_key = None;
-        self.bg_searcher.in_flight = None;
+        self.bg_searcher.cancel_in_flight();
     }
 
     pub fn active_match_range(&self) -> Option<Range<usize>> {
@@ -1779,7 +1883,7 @@ impl FindReplaceBar {
 
     pub fn refresh_matches(&mut self, buf: &DocumentBuffer) {
         let key = self.make_search_key(buf);
-        self.bg_searcher.in_flight = None;
+        self.bg_searcher.cancel_in_flight();
         let res = find_all_matches(buf, &key.query, &key.opts);
         self.apply_search_result(buf, key, res);
     }
@@ -2599,9 +2703,6 @@ fn format_bytes(bytes: usize) -> String {
     }
 }
 
-const MAX_EXTERNAL_DIFF_LINES: usize = 2_000;
-const MAX_LCS_MIDDLE_LINES: usize = 800;
-
 /// Line classification for `ExternalDiffModal`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiffLineKind {
@@ -2611,7 +2712,7 @@ pub enum DiffLineKind {
     Separator,
 }
 
-/// Single rendered row in the bounded unified diff viewer.
+/// Single rendered row in the scalable unified diff viewer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffRow {
     pub kind: DiffLineKind,
@@ -2627,7 +2728,224 @@ pub enum ExternalDiffChoice {
     KeepLocal,
 }
 
-/// Computes a bounded unified line diff from `local_lines` (current buffer) to `disk_lines` (on disk).
+const DIFF_DP_CELL_LIMIT: usize = 2_500_000;
+
+fn hash_diff_line(s: &str) -> u64 {
+    let mut h = FxHasher::default();
+    s.hash(&mut h);
+    h.finish()
+}
+
+fn find_unique_anchor_pairs(old_mid: &[String], new_mid: &[String]) -> Vec<(usize, usize)> {
+    let mut old_pos: FxHashMap<u64, Option<usize>> = FxHashMap::default();
+    for (i, line) in old_mid.iter().enumerate() {
+        let h = hash_diff_line(line);
+        old_pos
+            .entry(h)
+            .and_modify(|slot| *slot = None)
+            .or_insert(Some(i));
+    }
+    let mut new_pos: FxHashMap<u64, Option<usize>> = FxHashMap::default();
+    for (j, line) in new_mid.iter().enumerate() {
+        let h = hash_diff_line(line);
+        new_pos
+            .entry(h)
+            .and_modify(|slot| *slot = None)
+            .or_insert(Some(j));
+    }
+
+    let mut candidates: Vec<(usize, usize)> = Vec::new();
+    for (i, line) in old_mid.iter().enumerate() {
+        let h = hash_diff_line(line);
+        if let (Some(Some(oi)), Some(Some(nj))) = (old_pos.get(&h), new_pos.get(&h))
+            && *oi == i
+            && old_mid[*oi] == new_mid[*nj]
+        {
+            candidates.push((*oi, *nj));
+        }
+    }
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    // Standard patience-sort LIS on `nj` to keep anchor pairs strictly increasing.
+    let mut piles: Vec<(usize, usize)> = Vec::new();
+    let mut back: Vec<Option<usize>> = vec![None; candidates.len()];
+    for (idx, &(_, nj)) in candidates.iter().enumerate() {
+        let p = piles.partition_point(|&(tail_nj, _)| tail_nj < nj);
+        if p > 0 {
+            back[idx] = Some(piles[p - 1].1);
+        }
+        if p == piles.len() {
+            piles.push((nj, idx));
+        } else {
+            piles[p] = (nj, idx);
+        }
+    }
+
+    let mut anchors = Vec::with_capacity(piles.len());
+    let mut cur = piles.last().map(|&(_, idx)| idx);
+    while let Some(idx) = cur {
+        anchors.push(candidates[idx]);
+        cur = back[idx];
+    }
+    anchors.reverse();
+    anchors
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_middle_diff_rows(
+    old_mid: &[String],
+    new_mid: &[String],
+    old_base: usize,
+    new_base: usize,
+    raw_rows: &mut Vec<DiffRow>,
+    added_count: &mut usize,
+    removed_count: &mut usize,
+    depth: usize,
+) {
+    let m = old_mid.len();
+    let n = new_mid.len();
+    if m == 0 {
+        for (j, line) in new_mid.iter().enumerate() {
+            raw_rows.push(DiffRow {
+                kind: DiffLineKind::Added,
+                old_line: None,
+                new_line: Some(new_base + j + 1),
+                text: line.clone(),
+            });
+            *added_count += 1;
+        }
+        return;
+    }
+    if n == 0 {
+        for (i, line) in old_mid.iter().enumerate() {
+            raw_rows.push(DiffRow {
+                kind: DiffLineKind::Removed,
+                old_line: Some(old_base + i + 1),
+                new_line: None,
+                text: line.clone(),
+            });
+            *removed_count += 1;
+        }
+        return;
+    }
+
+    if m.saturating_mul(n) <= DIFF_DP_CELL_LIMIT {
+        let cols = n + 1;
+        let mut dp = vec![0u32; (m + 1) * cols];
+        for i in (0..m).rev() {
+            for j in (0..n).rev() {
+                dp[i * cols + j] = if old_mid[i] == new_mid[j] {
+                    dp[(i + 1) * cols + (j + 1)] + 1
+                } else {
+                    dp[(i + 1) * cols + j].max(dp[i * cols + (j + 1)])
+                };
+            }
+        }
+        let mut i = 0usize;
+        let mut j = 0usize;
+        while i < m || j < n {
+            if i < m && j < n && old_mid[i] == new_mid[j] {
+                raw_rows.push(DiffRow {
+                    kind: DiffLineKind::Context,
+                    old_line: Some(old_base + i + 1),
+                    new_line: Some(new_base + j + 1),
+                    text: old_mid[i].clone(),
+                });
+                i += 1;
+                j += 1;
+            } else if j < n
+                && (i == m || dp[i * cols + (j + 1)] >= dp[(i + 1) * cols + j])
+            {
+                raw_rows.push(DiffRow {
+                    kind: DiffLineKind::Added,
+                    old_line: None,
+                    new_line: Some(new_base + j + 1),
+                    text: new_mid[j].clone(),
+                });
+                *added_count += 1;
+                j += 1;
+            } else {
+                raw_rows.push(DiffRow {
+                    kind: DiffLineKind::Removed,
+                    old_line: Some(old_base + i + 1),
+                    new_line: None,
+                    text: old_mid[i].clone(),
+                });
+                *removed_count += 1;
+                i += 1;
+            }
+        }
+        return;
+    }
+
+    // Large region: anchor on unique matching lines (Patience diff) and recurse on gaps.
+    if depth < 8 {
+        let anchors = find_unique_anchor_pairs(old_mid, new_mid);
+        if !anchors.is_empty() {
+            let mut prev_i = 0usize;
+            let mut prev_j = 0usize;
+            for (ai, aj) in anchors {
+                if ai > prev_i || aj > prev_j {
+                    append_middle_diff_rows(
+                        &old_mid[prev_i..ai],
+                        &new_mid[prev_j..aj],
+                        old_base + prev_i,
+                        new_base + prev_j,
+                        raw_rows,
+                        added_count,
+                        removed_count,
+                        depth + 1,
+                    );
+                }
+                raw_rows.push(DiffRow {
+                    kind: DiffLineKind::Context,
+                    old_line: Some(old_base + ai + 1),
+                    new_line: Some(new_base + aj + 1),
+                    text: old_mid[ai].clone(),
+                });
+                prev_i = ai + 1;
+                prev_j = aj + 1;
+            }
+            if prev_i < m || prev_j < n {
+                append_middle_diff_rows(
+                    &old_mid[prev_i..],
+                    &new_mid[prev_j..],
+                    old_base + prev_i,
+                    new_base + prev_j,
+                    raw_rows,
+                    added_count,
+                    removed_count,
+                    depth + 1,
+                );
+            }
+            return;
+        }
+    }
+
+    // No shared anchors left in an immense disjoint block: emit all differing lines completely.
+    for (i, line) in old_mid.iter().enumerate() {
+        raw_rows.push(DiffRow {
+            kind: DiffLineKind::Removed,
+            old_line: Some(old_base + i + 1),
+            new_line: None,
+            text: line.clone(),
+        });
+        *removed_count += 1;
+    }
+    for (j, line) in new_mid.iter().enumerate() {
+        raw_rows.push(DiffRow {
+            kind: DiffLineKind::Added,
+            old_line: None,
+            new_line: Some(new_base + j + 1),
+            text: line.clone(),
+        });
+        *added_count += 1;
+    }
+}
+
+/// Computes a scalable unified line diff from `local_lines` (current buffer) to `disk_lines` (on disk).
 /// Returns `(rows, added_count, removed_count, truncated)`.
 pub fn compute_bounded_line_diff(
     local_lines: &[String],
@@ -2649,13 +2967,11 @@ pub fn compute_bounded_line_diff(
 
     let old_mid = &local_lines[prefix..local_lines.len() - suffix];
     let new_mid = &disk_lines[prefix..disk_lines.len() - suffix];
-    let mut truncated = false;
 
     let mut raw_rows: Vec<DiffRow> = Vec::new();
     let mut added_count = 0usize;
     let mut removed_count = 0usize;
 
-    // Emit prefix lines (will be context-collapsed below)
     for (i, line) in local_lines[..prefix].iter().enumerate() {
         raw_rows.push(DiffRow {
             kind: DiffLineKind::Context,
@@ -2665,76 +2981,16 @@ pub fn compute_bounded_line_diff(
         });
     }
 
-    if old_mid.len() <= MAX_LCS_MIDDLE_LINES && new_mid.len() <= MAX_LCS_MIDDLE_LINES {
-        let m = old_mid.len();
-        let n = new_mid.len();
-        let cols = n + 1;
-        let mut dp = vec![0u16; (m + 1) * cols];
-        for i in (0..m).rev() {
-            for j in (0..n).rev() {
-                dp[i * cols + j] = if old_mid[i] == new_mid[j] {
-                    dp[(i + 1) * cols + (j + 1)].saturating_add(1)
-                } else {
-                    dp[(i + 1) * cols + j].max(dp[i * cols + (j + 1)])
-                };
-            }
-        }
-        let mut i = 0usize;
-        let mut j = 0usize;
-        while i < m || j < n {
-            if i < m && j < n && old_mid[i] == new_mid[j] {
-                raw_rows.push(DiffRow {
-                    kind: DiffLineKind::Context,
-                    old_line: Some(prefix + i + 1),
-                    new_line: Some(prefix + j + 1),
-                    text: old_mid[i].clone(),
-                });
-                i += 1;
-                j += 1;
-            } else if j < n
-                && (i == m || dp[i * cols + (j + 1)] >= dp[(i + 1) * cols + j])
-            {
-                raw_rows.push(DiffRow {
-                    kind: DiffLineKind::Added,
-                    old_line: None,
-                    new_line: Some(prefix + j + 1),
-                    text: new_mid[j].clone(),
-                });
-                added_count += 1;
-                j += 1;
-            } else {
-                raw_rows.push(DiffRow {
-                    kind: DiffLineKind::Removed,
-                    old_line: Some(prefix + i + 1),
-                    new_line: None,
-                    text: old_mid[i].clone(),
-                });
-                removed_count += 1;
-                i += 1;
-            }
-        }
-    } else {
-        truncated = true;
-        let cap = 400usize;
-        for (i, line) in old_mid.iter().take(cap).enumerate() {
-            raw_rows.push(DiffRow {
-                kind: DiffLineKind::Removed,
-                old_line: Some(prefix + i + 1),
-                new_line: None,
-                text: line.clone(),
-            });
-            removed_count += 1;
-        }
-        for (j, line) in new_mid.iter().take(cap).enumerate() {
-            raw_rows.push(DiffRow {
-                kind: DiffLineKind::Added,
-                old_line: None,
-                new_line: Some(prefix + j + 1),
-                text: line.clone(),
-            });
-            added_count += 1;
-        }
-    }
+    append_middle_diff_rows(
+        old_mid,
+        new_mid,
+        prefix,
+        prefix,
+        &mut raw_rows,
+        &mut added_count,
+        &mut removed_count,
+        0,
+    );
 
     let old_tail_start = local_lines.len() - suffix;
     let new_tail_start = disk_lines.len() - suffix;
@@ -2749,7 +3005,7 @@ pub fn compute_bounded_line_diff(
 
     // Collapse long unchanged context runs (retain 2 lines before/after every change)
     if added_count == 0 && removed_count == 0 {
-        return (Vec::new(), 0, 0, truncated);
+        return (Vec::new(), 0, 0, false);
     }
 
     const CONTEXT_RADIUS: usize = 2;
@@ -2786,14 +3042,23 @@ pub fn compute_bounded_line_diff(
         }
     }
 
-    (collapsed, added_count, removed_count, truncated)
+    (collapsed, added_count, removed_count, false)
 }
 
-fn read_bounded_lines_from_rope(rope: &Rope, limit: usize) -> (Vec<String>, bool) {
-    let total = rope.len_lines();
-    let take = total.min(limit);
-    let mut out = Vec::with_capacity(take);
-    for line in rope.lines().take(take) {
+fn adaptive_diff_byte_budget() -> usize {
+    (crate::document::system_total_memory_bytes() / 128)
+        .clamp(16 * 1024 * 1024, 256 * 1024 * 1024) as usize
+}
+
+fn read_adaptive_lines_from_rope(rope: &Rope, byte_budget: usize) -> (Vec<String>, bool) {
+    let mut out = Vec::with_capacity(rope.len_lines().min(65_536));
+    let mut total_bytes = 0usize;
+    let mut truncated = false;
+    for line in rope.lines() {
+        if total_bytes >= byte_budget && !out.is_empty() {
+            truncated = true;
+            break;
+        }
         let mut s = line.to_string();
         if s.ends_with('\n') {
             s.pop();
@@ -2801,17 +3066,22 @@ fn read_bounded_lines_from_rope(rope: &Rope, limit: usize) -> (Vec<String>, bool
         if s.ends_with('\r') {
             s.pop();
         }
+        total_bytes = total_bytes.saturating_add(s.len());
         out.push(s);
     }
-    (out, total > limit)
+    (out, truncated)
 }
 
-fn read_bounded_lines_from_disk(path: &std::path::Path, limit: usize) -> Result<(Vec<String>, bool), String> {
+fn read_adaptive_lines_from_disk(
+    path: &std::path::Path,
+    byte_budget: usize,
+) -> Result<(Vec<String>, bool), String> {
     use std::io::BufRead;
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
     let mut out = Vec::new();
     let mut buf = Vec::with_capacity(256);
+    let mut total_bytes = 0usize;
     let mut truncated = false;
     loop {
         buf.clear();
@@ -2819,7 +3089,7 @@ fn read_bounded_lines_from_disk(path: &std::path::Path, limit: usize) -> Result<
         if n == 0 {
             break;
         }
-        if out.len() >= limit {
+        if total_bytes >= byte_budget && !out.is_empty() {
             truncated = true;
             break;
         }
@@ -2833,6 +3103,7 @@ fn read_bounded_lines_from_disk(path: &std::path::Path, limit: usize) -> Result<
         if s.ends_with('\r') {
             s.pop();
         }
+        total_bytes = total_bytes.saturating_add(s.len());
         out.push(s);
     }
     Ok((out, truncated))
@@ -2859,8 +3130,9 @@ impl ExternalDiffModal {
             .unwrap_or_else(|| disk_path.display().to_string());
         self.error_message = None;
 
-        let (local_lines, local_trunc) = read_bounded_lines_from_rope(buf.rope(), MAX_EXTERNAL_DIFF_LINES);
-        match read_bounded_lines_from_disk(disk_path, MAX_EXTERNAL_DIFF_LINES) {
+        let budget = adaptive_diff_byte_budget();
+        let (local_lines, local_trunc) = read_adaptive_lines_from_rope(buf.rope(), budget);
+        match read_adaptive_lines_from_disk(disk_path, budget) {
             Ok((disk_lines, disk_trunc)) => {
                 let (rows, added, removed, mid_trunc) =
                     compute_bounded_line_diff(&local_lines, &disk_lines);
@@ -2935,9 +3207,9 @@ impl ExternalDiffModal {
 
                 if self.truncated {
                     ui.label(
-                        RichText::new(format!(
-                            "Showing bounded preview (first {MAX_EXTERNAL_DIFF_LINES} lines / {MAX_LCS_MIDDLE_LINES} middle diff lines)."
-                        ))
+                        RichText::new(
+                            "Showing diff within adaptive hardware memory preview budget.",
+                        )
                         .size(11.0)
                         .color(theme.warning_amber),
                     );
@@ -2955,71 +3227,79 @@ impl ExternalDiffModal {
                             .color(theme.text_muted),
                     );
                 } else {
-                    egui::ScrollArea::both()
-                        .id_salt("external_diff_scroll")
-                        .max_height(330.0)
-                        .auto_shrink([false, false])
+                    let row_h = 19.0_f32;
+                    egui::ScrollArea::horizontal()
+                        .id_salt("external_diff_hscroll")
                         .show(ui, |ui| {
-                            let mono = FontId::monospace(12.0);
-                            let avail_w = ui.available_width().max(520.0);
-                            for row in &self.rows {
-                                let (prefix, bg, fg) = match row.kind {
-                                    DiffLineKind::Added => {
-                                        let bg = if theme.dark {
-                                            Color32::from_rgba_unmultiplied(35, 115, 65, 75)
-                                        } else {
-                                            Color32::from_rgb(220, 252, 231)
+                            egui::ScrollArea::vertical()
+                                .id_salt("external_diff_scroll")
+                                .max_height(330.0)
+                                .auto_shrink([false, false])
+                                .show_rows(ui, row_h, self.rows.len(), |ui, row_range| {
+                                    let mono = FontId::monospace(12.0);
+                                    let avail_w = ui.available_width().max(520.0);
+                                    for row in &self.rows[row_range] {
+                                        let (prefix, bg, fg) = match row.kind {
+                                            DiffLineKind::Added => {
+                                                let bg = if theme.dark {
+                                                    Color32::from_rgba_unmultiplied(35, 115, 65, 75)
+                                                } else {
+                                                    Color32::from_rgb(220, 252, 231)
+                                                };
+                                                let fg = if theme.dark {
+                                                    Color32::from_rgb(134, 239, 172)
+                                                } else {
+                                                    Color32::from_rgb(22, 101, 52)
+                                                };
+                                                ("+", bg, fg)
+                                            }
+                                            DiffLineKind::Removed => {
+                                                let bg = if theme.dark {
+                                                    Color32::from_rgba_unmultiplied(150, 45, 45, 75)
+                                                } else {
+                                                    Color32::from_rgb(254, 226, 226)
+                                                };
+                                                let fg = if theme.dark {
+                                                    Color32::from_rgb(252, 165, 165)
+                                                } else {
+                                                    Color32::from_rgb(153, 27, 27)
+                                                };
+                                                ("-", bg, fg)
+                                            }
+                                            DiffLineKind::Separator => {
+                                                (" ", theme.ribbon_bg, theme.text_muted)
+                                            }
+                                            DiffLineKind::Context => {
+                                                (" ", Color32::TRANSPARENT, theme.text_primary)
+                                            }
                                         };
-                                        let fg = if theme.dark {
-                                            Color32::from_rgb(134, 239, 172)
+                                        let old_s = row
+                                            .old_line
+                                            .map(|n| format!("{n:>4}"))
+                                            .unwrap_or_else(|| "    ".to_string());
+                                        let new_s = row
+                                            .new_line
+                                            .map(|n| format!("{n:>4}"))
+                                            .unwrap_or_else(|| "    ".to_string());
+                                        let line_text = if row.kind == DiffLineKind::Separator {
+                                            format!("          {}", row.text)
                                         } else {
-                                            Color32::from_rgb(22, 101, 52)
+                                            format!("{old_s} {new_s} {prefix} {}", row.text)
                                         };
-                                        ("+", bg, fg)
+                                        egui::Frame::new().fill(bg).show(ui, |ui| {
+                                            ui.set_min_width(avail_w);
+                                            ui.set_min_height(row_h);
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(line_text)
+                                                        .font(mono.clone())
+                                                        .color(fg),
+                                                )
+                                                .wrap_mode(egui::TextWrapMode::Extend),
+                                            );
+                                        });
                                     }
-                                    DiffLineKind::Removed => {
-                                        let bg = if theme.dark {
-                                            Color32::from_rgba_unmultiplied(150, 45, 45, 75)
-                                        } else {
-                                            Color32::from_rgb(254, 226, 226)
-                                        };
-                                        let fg = if theme.dark {
-                                            Color32::from_rgb(252, 165, 165)
-                                        } else {
-                                            Color32::from_rgb(153, 27, 27)
-                                        };
-                                        ("-", bg, fg)
-                                    }
-                                    DiffLineKind::Separator => {
-                                        (" ", theme.ribbon_bg, theme.text_muted)
-                                    }
-                                    DiffLineKind::Context => {
-                                        (" ", Color32::TRANSPARENT, theme.text_primary)
-                                    }
-                                };
-                                let old_s = row
-                                    .old_line
-                                    .map(|n| format!("{n:>4}"))
-                                    .unwrap_or_else(|| "    ".to_string());
-                                let new_s = row
-                                    .new_line
-                                    .map(|n| format!("{n:>4}"))
-                                    .unwrap_or_else(|| "    ".to_string());
-                                let line_text = if row.kind == DiffLineKind::Separator {
-                                    format!("          {}", row.text)
-                                } else {
-                                    format!("{old_s} {new_s} {prefix} {}", row.text)
-                                };
-                                egui::Frame::new().fill(bg).show(ui, |ui| {
-                                    ui.set_min_width(avail_w);
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(line_text).font(mono.clone()).color(fg),
-                                        )
-                                        .wrap_mode(egui::TextWrapMode::Extend),
-                                    );
                                 });
-                            }
                         });
                 }
 

@@ -477,18 +477,30 @@ pub(crate) struct RgbaCanvas {
     pub data: Vec<u8>,
 }
 
+pub(crate) const MAX_CANVAS_PIXELS: u64 = 16_000_000;
+const MAX_MATH_DEPTH: usize = 128;
+
 impl RgbaCanvas {
     pub fn new(logical_w: f32, logical_h: f32, scale: f32, bg: [u8; 4]) -> Self {
-        let w = ((logical_w * scale).ceil() as u32).clamp(1, 8192);
-        let h = ((logical_h * scale).ceil() as u32).clamp(1, 8192);
-        let mut data = Vec::with_capacity((w * h * 4) as usize);
-        for _ in 0..(w * h) {
-            data.extend_from_slice(&bg);
+        let mut eff_scale = scale.max(0.1);
+        let mut w = ((logical_w * eff_scale).ceil() as u32).clamp(1, 8192);
+        let mut h = ((logical_h * eff_scale).ceil() as u32).clamp(1, 8192);
+        let pixels = (w as u64).saturating_mul(h as u64);
+        if pixels > MAX_CANVAS_PIXELS {
+            let factor = (MAX_CANVAS_PIXELS as f64 / pixels as f64).sqrt() as f32;
+            eff_scale = (eff_scale * factor).max(0.05);
+            w = ((logical_w * eff_scale).ceil() as u32).clamp(1, 8192);
+            h = ((logical_h * eff_scale).ceil() as u32).clamp(1, 8192);
+        }
+        let byte_len = (w as usize).saturating_mul(h as usize).saturating_mul(4);
+        let mut data = vec![0u8; byte_len];
+        for px in data.as_chunks_mut::<4>().0 {
+            px.copy_from_slice(&bg);
         }
         Self {
             width: w,
             height: h,
-            scale,
+            scale: eff_scale,
             data,
         }
     }
@@ -943,6 +955,7 @@ fn tokenize_latex(input: &str) -> Vec<Token> {
 struct Parser<'a> {
     tokens: &'a [Token],
     pos: usize,
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -965,6 +978,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_sequence(&mut self, stop_at_rbrace: bool, stop_at_right_cmd: bool) -> MathNode {
+        if self.depth >= MAX_MATH_DEPTH {
+            return MathNode::Empty;
+        }
+        self.depth += 1;
         let mut items: Vec<MathNode> = Vec::new();
         while let Some(tok) = self.peek() {
             if stop_at_rbrace && matches!(tok, Token::RBrace) {
@@ -991,6 +1008,7 @@ impl<'a> Parser<'a> {
                     den: Box::new(den),
                     has_bar: cmd == "over",
                 };
+                self.depth -= 1;
                 return if cmd == "choose" {
                     MathNode::Delimited {
                         left: Some("(".to_string()),
@@ -1006,6 +1024,7 @@ impl<'a> Parser<'a> {
                     items.push(atom);
                 }
         }
+        self.depth -= 1;
         simplify_row(items)
     }
 
@@ -1042,7 +1061,7 @@ impl<'a> Parser<'a> {
                         1 => "′".to_string(),
                         2 => "″".to_string(),
                         3 => "‴".to_string(),
-                        n => "′".repeat(n),
+                        n => "′".repeat(n.min(16)),
                     };
                     let p_node = MathNode::Text {
                         text: primes,
@@ -1196,7 +1215,11 @@ impl<'a> Parser<'a> {
     fn parse_atom(&mut self) -> Option<MathNode> {
         self.skip_spaces();
         let tok = self.next()?.clone();
-        match tok {
+        if self.depth >= MAX_MATH_DEPTH {
+            return Some(MathNode::Empty);
+        }
+        self.depth += 1;
+        let out = match tok {
             Token::LBrace => {
                 let inner = self.parse_sequence(true, false);
                 if matches!(self.peek(), Some(Token::RBrace)) {
@@ -1220,7 +1243,9 @@ impl<'a> Parser<'a> {
             Token::Space | Token::Sup | Token::Sub | Token::Amp | Token::NewRow => {
                 Some(MathNode::Empty)
             }
-        }
+        };
+        self.depth -= 1;
+        out
     }
 
     fn parse_command(&mut self, cmd: &str) -> MathNode {
@@ -1806,6 +1831,7 @@ pub fn parse_latex_math(input: &str) -> MathNode {
     let mut parser = Parser {
         tokens: &tokens,
         pos: 0,
+        depth: 0,
     };
     let mut rows: Vec<Vec<MathNode>> = Vec::new();
     let mut cur_row: Vec<MathNode> = Vec::new();
@@ -2855,7 +2881,10 @@ struct MathLayoutCache {
 }
 
 impl MathLayoutCache {
-    const MAX_ENTRIES: usize = 256;
+    fn max_entries() -> usize {
+        let ram_gb = (crate::document::system_total_memory_bytes() / (1024 * 1024 * 1024)).max(1);
+        (ram_gb.saturating_mul(128) as usize).clamp(256, 4_096)
+    }
 
     fn sync_atlas(&mut self, cur_atlas: &Arc<egui::epaint::mutex::Mutex<egui::epaint::TextureAtlas>>) {
         if self.atlas.as_ptr() != Arc::as_ptr(cur_atlas) {
@@ -2877,13 +2906,14 @@ impl MathLayoutCache {
     }
 
     fn insert(&mut self, key: (u64, u32, bool, u32), latex: &str, layout: Arc<MathLayout>) {
-        if self.entries.len() >= Self::MAX_ENTRIES && !self.entries.contains_key(&key) {
+        let cap = Self::max_entries();
+        if self.entries.len() >= cap && !self.entries.contains_key(&key) {
             let mut ticks: Vec<u64> = self.entries.values().map(|e| e.last_tick).collect();
             let mid = ticks.len() / 2;
             let (_, cutoff, _) = ticks.select_nth_unstable(mid);
             let cutoff_val = *cutoff;
             self.entries.retain(|_, v| v.last_tick > cutoff_val);
-            if self.entries.len() >= Self::MAX_ENTRIES {
+            if self.entries.len() >= cap {
                 self.entries.clear();
             }
         }
@@ -3289,8 +3319,9 @@ mod tests {
     #[test]
     fn math_layout_cache_hits_and_evicts_oldest_half_when_full() {
         let mut cache = MathLayoutCache::default();
+        let cap = MathLayoutCache::max_entries();
         let sample = Arc::new(layout_math(&parse_latex_math("x^2 + 1"), 17.5, true));
-        for i in 0..MathLayoutCache::MAX_ENTRIES {
+        for i in 0..cap {
             let expr = format!("x_{i} + 1");
             let key = (
                 hash_latex_str(&expr),
@@ -3300,7 +3331,7 @@ mod tests {
             );
             cache.insert(key, &expr, Arc::clone(&sample));
         }
-        assert_eq!(cache.entries.len(), MathLayoutCache::MAX_ENTRIES);
+        assert_eq!(cache.entries.len(), cap);
 
         let expr0 = "x_0 + 1";
         let key0 = (
@@ -3319,8 +3350,8 @@ mod tests {
             1.0_f32.to_bits(),
         );
         cache.insert(extra_key, extra, Arc::clone(&sample));
-        assert!(cache.entries.len() < MathLayoutCache::MAX_ENTRIES);
-        assert!(cache.entries.len() >= MathLayoutCache::MAX_ENTRIES / 2);
+        assert!(cache.entries.len() < cap);
+        assert!(cache.entries.len() >= cap / 2);
         assert!(cache.get(key0, expr0).is_some());
         assert!(cache.get(extra_key, extra).is_some());
     }

@@ -1,13 +1,15 @@
 use std::collections::HashSet;
-use std::fmt::Write as _;
-use std::fs::{self, File};
-use std::io::{BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::fs::File;
+use std::io::{self, BufWriter, Write};
+use std::path::Path;
+
+use rustc_hash::FxHashMap;
 
 use crate::document::ast::{is_math_code_info, is_mermaid_code_info};
 use crate::document::math;
 use crate::document::mermaid;
 use crate::document::unicode::{BlockAlignment, TextDirection};
+use crate::export::encode_base64;
 use crate::export::ir::{
     heading_slug, runs_to_plain_text, DocBlock, InlineRun, SlugTracker, TableAlign,
 };
@@ -31,10 +33,12 @@ pub fn render_html_string_with_base_dir(
     title: &str,
     base_dir: Option<&Path>,
 ) -> String {
-    render_html_internal(blocks, title, base_dir, |_| {})
+    let mut buf = Vec::with_capacity(blocks.len() * 192 + 4096);
+    let _ = write_html_stream(&mut buf, blocks, title, base_dir, |_| {});
+    String::from_utf8(buf).unwrap_or_default()
 }
 
-/// Writes a standalone HTML5 file to `path` with progress reporting.
+/// Streams a standalone HTML5 file directly to `path` with progress reporting.
 pub fn export_html_to_file_with_base_dir(
     blocks: &[DocBlock],
     title: &str,
@@ -42,41 +46,27 @@ pub fn export_html_to_file_with_base_dir(
     base_dir: Option<&Path>,
     on_progress: impl FnMut(f32),
 ) -> Result<(), String> {
-    let html = render_html_internal(blocks, title, base_dir, on_progress);
     let file = File::create(path.as_ref()).map_err(|e| e.to_string())?;
-    let mut writer = BufWriter::new(file);
-    writer
-        .write_all(html.as_bytes())
+    let mut writer = BufWriter::with_capacity(64 * 1024, file);
+    write_html_stream(&mut writer, blocks, title, base_dir, on_progress)
         .map_err(|e| e.to_string())?;
-    writer.flush().map_err(|e| e.to_string())?;
-    Ok(())
+    writer.flush().map_err(|e| e.to_string())
 }
 
-fn render_html_internal(
+fn write_html_stream<W: Write>(
+    w: &mut W,
     blocks: &[DocBlock],
     title: &str,
     base_dir: Option<&Path>,
     mut on_progress: impl FnMut(f32),
-) -> String {
+) -> io::Result<()> {
     let mut collect_slugs = SlugTracker::new();
     let mut outline = Vec::new();
     collect_outline_headings(blocks, &mut collect_slugs, &mut outline);
 
     let known_slugs: HashSet<String> = outline.iter().map(|h| h.slug.clone()).collect();
     let mut render_slugs = SlugTracker::new();
-    let mut body_html = String::with_capacity(blocks.len() * 160 + 512);
-
-    let total = blocks.len().max(1);
-    for (idx, block) in blocks.iter().enumerate() {
-        render_block_html(
-            &mut body_html,
-            block,
-            base_dir,
-            &mut render_slugs,
-            &known_slugs,
-        );
-        on_progress((idx + 1) as f32 / total as f32);
-    }
+    let mut image_cache: FxHashMap<String, String> = FxHashMap::default();
 
     let safe_title = if title.trim().is_empty() {
         "Markdown Studio Document"
@@ -84,40 +74,48 @@ fn render_html_internal(
         title.trim()
     };
 
-    let mut out = String::with_capacity(body_html.len() + 4096);
-    out.push_str("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n");
-    out.push_str("<meta charset=\"utf-8\">\n");
-    out.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n");
-    let _ = writeln!(out, "<title>{}</title>", escape_html(safe_title));
-    out.push_str("<style>\n");
-    out.push_str(HTML_STYLESHEET);
-    out.push_str("\n</style>\n</head>\n<body>\n");
-    out.push_str("<div class=\"layout\">\n");
+    w.write_all(b"<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n")?;
+    w.write_all(b"<meta charset=\"utf-8\">\n")?;
+    w.write_all(b"<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n")?;
+    w.write_all(
+        b"<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; img-src data: https: http:; style-src 'unsafe-inline';\">\n",
+    )?;
+    w.write_all(b"<title>")?;
+    write_escaped_html(w, safe_title)?;
+    w.write_all(b"</title>\n<style>\n")?;
+    w.write_all(HTML_STYLESHEET.as_bytes())?;
+    w.write_all(b"\n</style>\n</head>\n<body>\n<div class=\"layout\">\n")?;
 
     if !outline.is_empty() {
-        out.push_str("<nav class=\"outline\" aria-label=\"Document Outline\">\n");
-        out.push_str("  <details open>\n");
-        out.push_str("    <summary class=\"outline-title\">Outline</summary>\n");
-        out.push_str("    <ul class=\"outline-list\">\n");
+        w.write_all(b"<nav class=\"outline\" aria-label=\"Document Outline\">\n")?;
+        w.write_all(b"  <details open>\n")?;
+        w.write_all(b"    <summary class=\"outline-title\">Outline</summary>\n")?;
+        w.write_all(b"    <ul class=\"outline-list\">\n")?;
         for item in &outline {
             let lvl = item.level.clamp(1, 6);
-            let _ = writeln!(
-                out,
-                "      <li class=\"outline-item lvl-{lvl}\"><a href=\"#{}\">{}</a></li>",
-                escape_html_attr(&item.slug),
-                escape_html(&item.title),
-            );
+            write!(w, "      <li class=\"outline-item lvl-{lvl}\"><a href=\"#")?;
+            write_escaped_html(w, &item.slug)?;
+            w.write_all(b"\">")?;
+            write_escaped_html(w, &item.title)?;
+            w.write_all(b"</a></li>\n")?;
         }
-        out.push_str("    </ul>\n");
-        out.push_str("  </details>\n");
-        out.push_str("</nav>\n");
+        w.write_all(b"    </ul>\n  </details>\n</nav>\n")?;
     }
 
-    out.push_str("<main class=\"document\" role=\"main\">\n");
-    out.push_str(&body_html);
-    out.push_str("</main>\n");
-    out.push_str("</div>\n</body>\n</html>\n");
-    out
+    w.write_all(b"<main class=\"document\" role=\"main\">\n")?;
+    let total = blocks.len().max(1);
+    for (idx, block) in blocks.iter().enumerate() {
+        write_block_html(
+            w,
+            block,
+            base_dir,
+            &mut render_slugs,
+            &known_slugs,
+            &mut image_cache,
+        )?;
+        on_progress((idx + 1) as f32 / total as f32);
+    }
+    w.write_all(b"</main>\n</div>\n</body>\n</html>\n")
 }
 
 fn collect_outline_headings(
@@ -152,8 +150,11 @@ fn collect_outline_headings(
     }
 }
 
-fn block_attrs(alignment: BlockAlignment, direction: TextDirection) -> String {
-    let mut attrs = String::new();
+fn write_block_attrs<W: Write>(
+    w: &mut W,
+    alignment: BlockAlignment,
+    direction: TextDirection,
+) -> io::Result<()> {
     let align_cls = match alignment {
         BlockAlignment::Center => Some("align-center"),
         BlockAlignment::Right => Some("align-right"),
@@ -168,21 +169,33 @@ fn block_attrs(alignment: BlockAlignment, direction: TextDirection) -> String {
         BlockAlignment::Start | BlockAlignment::Left => None,
     };
     if let Some(cls) = align_cls {
-        let _ = write!(attrs, " class=\"{cls}\"");
+        write!(w, " class=\"{cls}\"")?;
     }
     if direction == TextDirection::Rtl {
-        attrs.push_str(" dir=\"rtl\"");
+        w.write_all(b" dir=\"rtl\"")?;
     }
-    attrs
+    Ok(())
 }
 
-fn render_block_html(
-    out: &mut String,
+fn write_indent_style<W: Write>(w: &mut W, indent_level: u8) -> io::Result<()> {
+    if indent_level > 0 {
+        write!(
+            w,
+            " style=\"margin-inline-start: {}em\"",
+            indent_level as f32 * 1.5
+        )?;
+    }
+    Ok(())
+}
+
+fn write_block_html<W: Write>(
+    w: &mut W,
     block: &DocBlock,
     base_dir: Option<&Path>,
     slug_tracker: &mut SlugTracker,
     known_slugs: &HashSet<String>,
-) {
+    image_cache: &mut FxHashMap<String, String>,
+) -> io::Result<()> {
     match block {
         DocBlock::Heading {
             level,
@@ -200,20 +213,17 @@ fn render_block_html(
             } else {
                 String::new()
             };
-            let id_attr = if slug.is_empty() {
-                String::new()
-            } else {
-                format!(" id=\"{}\"", escape_html_attr(&slug))
-            };
-            let indent_style = if *indent_level > 0 {
-                format!(" style=\"margin-inline-start: {}em\"", *indent_level as f32 * 1.5)
-            } else {
-                String::new()
-            };
-            let attrs = block_attrs(*alignment, *direction);
-            let _ = write!(out, "<h{lvl}{id_attr}{attrs}{indent_style}>");
-            render_runs_html(out, runs, base_dir, known_slugs);
-            let _ = writeln!(out, "</h{lvl}>");
+            write!(w, "<h{lvl}")?;
+            if !slug.is_empty() {
+                w.write_all(b" id=\"")?;
+                write_escaped_html(w, &slug)?;
+                w.write_all(b"\"")?;
+            }
+            write_block_attrs(w, *alignment, *direction)?;
+            write_indent_style(w, *indent_level)?;
+            w.write_all(b">")?;
+            write_runs_html(w, runs, base_dir, known_slugs, image_cache)?;
+            writeln!(w, "</h{lvl}>")
         }
         DocBlock::Paragraph {
             runs,
@@ -222,15 +232,12 @@ fn render_block_html(
             indent_level,
             ..
         } => {
-            let attrs = block_attrs(*alignment, *direction);
-            let indent_style = if *indent_level > 0 {
-                format!(" style=\"margin-inline-start: {}em\"", *indent_level as f32 * 1.5)
-            } else {
-                String::new()
-            };
-            let _ = write!(out, "<p{attrs}{indent_style}>");
-            render_runs_html(out, runs, base_dir, known_slugs);
-            out.push_str("</p>\n");
+            w.write_all(b"<p")?;
+            write_block_attrs(w, *alignment, *direction)?;
+            write_indent_style(w, *indent_level)?;
+            w.write_all(b">")?;
+            write_runs_html(w, runs, base_dir, known_slugs, image_cache)?;
+            w.write_all(b"</p>\n")
         }
         DocBlock::BlockQuote {
             blocks,
@@ -238,36 +245,32 @@ fn render_block_html(
             indent_level,
             ..
         } => {
-            let dir_attr = if *direction == TextDirection::Rtl {
-                " dir=\"rtl\""
-            } else {
-                ""
-            };
-            let indent_style = if *indent_level > 0 {
-                format!(" style=\"margin-inline-start: {}em\"", *indent_level as f32 * 1.5)
-            } else {
-                String::new()
-            };
-            let _ = writeln!(out, "<blockquote{dir_attr}{indent_style}>");
-            for inner in blocks {
-                render_block_html(out, inner, base_dir, slug_tracker, known_slugs);
+            w.write_all(b"<blockquote")?;
+            if *direction == TextDirection::Rtl {
+                w.write_all(b" dir=\"rtl\"")?;
             }
-            out.push_str("</blockquote>\n");
+            write_indent_style(w, *indent_level)?;
+            w.write_all(b">\n")?;
+            for inner in blocks {
+                write_block_html(w, inner, base_dir, slug_tracker, known_slugs, image_cache)?;
+            }
+            w.write_all(b"</blockquote>\n")
         }
         DocBlock::CodeBlock { info, code, .. } => {
-            if is_mermaid_code_info(info) && !code.trim().is_empty()
-                && let Some((png_bytes, _, _)) = mermaid::render_mermaid_to_png_bytes(code, 2.0) {
-                    let b64 = encode_base64(&png_bytes);
-                    let _ = writeln!(
-                        out,
-                        "<figure class=\"diagram mermaid-diagram\"><img src=\"data:image/png;base64,{b64}\" alt=\"Mermaid diagram\"></figure>"
-                    );
-                    return;
-                }
+            if is_mermaid_code_info(info)
+                && !code.trim().is_empty()
+                && let Some((png_bytes, _, _)) = mermaid::render_mermaid_to_png_bytes(code, 2.0)
+            {
+                let b64 = encode_base64(&png_bytes);
+                return writeln!(
+                    w,
+                    "<figure class=\"diagram mermaid-diagram\"><img src=\"data:image/png;base64,{b64}\" alt=\"Mermaid diagram\"></figure>"
+                );
+            }
             if is_math_code_info(info) {
                 let trimmed = code.trim();
                 if trimmed.is_empty() {
-                    return;
+                    return Ok(());
                 }
                 if let Some((png_bytes, _, _)) = math::render_math_to_png_bytes(
                     trimmed,
@@ -277,24 +280,26 @@ fn render_block_html(
                     [255, 255, 255, 255],
                 ) {
                     let b64 = encode_base64(&png_bytes);
-                    let _ = writeln!(
-                        out,
-                        "<figure class=\"diagram math-block\"><img src=\"data:image/png;base64,{b64}\" alt=\"{}\"></figure>",
-                        escape_html_attr(trimmed),
-                    );
-                    return;
+                    w.write_all(
+                        b"<figure class=\"diagram math-block\"><img src=\"data:image/png;base64,",
+                    )?;
+                    w.write_all(b64.as_bytes())?;
+                    w.write_all(b"\" alt=\"")?;
+                    write_escaped_html(w, trimmed)?;
+                    return w.write_all(b"\"></figure>\n");
                 }
             }
             let lang = info.split_whitespace().next().unwrap_or("");
             if lang.is_empty() {
-                let _ = writeln!(out, "<pre><code>{}</code></pre>", escape_html(code));
+                w.write_all(b"<pre><code>")?;
+                write_escaped_html(w, code)?;
+                w.write_all(b"</code></pre>\n")
             } else {
-                let _ = writeln!(
-                    out,
-                    "<pre><code class=\"language-{}\">{}</code></pre>",
-                    escape_html_attr(lang),
-                    escape_html(code),
-                );
+                w.write_all(b"<pre><code class=\"language-")?;
+                write_escaped_html(w, lang)?;
+                w.write_all(b"\">")?;
+                write_escaped_html(w, code)?;
+                w.write_all(b"</code></pre>\n")
             }
         }
         DocBlock::List {
@@ -306,42 +311,31 @@ fn render_block_html(
             ..
         } => {
             let tag = if *ordered { "ol" } else { "ul" };
-            let start_attr = if *ordered && *start != 1 {
-                format!(" start=\"{start}\"")
-            } else {
-                String::new()
-            };
-            let dir_attr = if *direction == TextDirection::Rtl {
-                " dir=\"rtl\""
-            } else {
-                ""
-            };
-            let indent_style = if *indent_level > 0 {
-                format!(" style=\"margin-inline-start: {}em\"", *indent_level as f32 * 1.5)
-            } else {
-                String::new()
-            };
-            let _ = writeln!(out, "<{tag}{start_attr}{dir_attr}{indent_style}>");
+            write!(w, "<{tag}")?;
+            if *ordered && *start != 1 {
+                write!(w, " start=\"{start}\"")?;
+            }
+            if *direction == TextDirection::Rtl {
+                w.write_all(b" dir=\"rtl\"")?;
+            }
+            write_indent_style(w, *indent_level)?;
+            w.write_all(b">\n")?;
             for item in items {
-                let task_cls = if item.checked.is_some() {
-                    " class=\"task-item\""
+                if item.checked.is_some() {
+                    w.write_all(b"<li class=\"task-item\">\n")?;
                 } else {
-                    ""
-                };
-                let _ = writeln!(out, "<li{task_cls}>");
+                    w.write_all(b"<li>\n")?;
+                }
                 if let Some(checked) = item.checked {
                     let chk = if checked { " checked" } else { "" };
-                    let _ = writeln!(
-                        out,
-                        "<input type=\"checkbox\" disabled{chk}> "
-                    );
+                    writeln!(w, "<input type=\"checkbox\" disabled{chk}> ")?;
                 }
                 for b in &item.blocks {
-                    render_block_html(out, b, base_dir, slug_tracker, known_slugs);
+                    write_block_html(w, b, base_dir, slug_tracker, known_slugs, image_cache)?;
                 }
-                out.push_str("</li>\n");
+                w.write_all(b"</li>\n")?;
             }
-            let _ = writeln!(out, "</{tag}>");
+            writeln!(w, "</{tag}>")
         }
         DocBlock::Table {
             alignments,
@@ -349,33 +343,31 @@ fn render_block_html(
             rows,
             ..
         } => {
-            out.push_str("<div class=\"table-wrap\"><table>\n");
+            w.write_all(b"<div class=\"table-wrap\"><table>\n")?;
             if !header.is_empty() {
-                out.push_str("<thead><tr>\n");
+                w.write_all(b"<thead><tr>\n")?;
                 for (c, cell) in header.iter().enumerate() {
                     let align = table_align_attr(alignments.get(c).copied().unwrap_or_default());
-                    let _ = write!(out, "<th{align}>");
-                    render_runs_html(out, cell, base_dir, known_slugs);
-                    out.push_str("</th>");
+                    write!(w, "<th{align}>")?;
+                    write_runs_html(w, cell, base_dir, known_slugs, image_cache)?;
+                    w.write_all(b"</th>")?;
                 }
-                out.push_str("\n</tr></thead>\n");
+                w.write_all(b"\n</tr></thead>\n")?;
             }
-            out.push_str("<tbody>\n");
+            w.write_all(b"<tbody>\n")?;
             for row in rows {
-                out.push_str("<tr>");
+                w.write_all(b"<tr>")?;
                 for (c, cell) in row.iter().enumerate() {
                     let align = table_align_attr(alignments.get(c).copied().unwrap_or_default());
-                    let _ = write!(out, "<td{align}>");
-                    render_runs_html(out, cell, base_dir, known_slugs);
-                    out.push_str("</td>");
+                    write!(w, "<td{align}>")?;
+                    write_runs_html(w, cell, base_dir, known_slugs, image_cache)?;
+                    w.write_all(b"</td>")?;
                 }
-                out.push_str("</tr>\n");
+                w.write_all(b"</tr>\n")?;
             }
-            out.push_str("</tbody>\n</table></div>\n");
+            w.write_all(b"</tbody>\n</table></div>\n")
         }
-        DocBlock::ThematicBreak { .. } => {
-            out.push_str("<hr>\n");
-        }
+        DocBlock::ThematicBreak { .. } => w.write_all(b"<hr>\n"),
         DocBlock::FootnoteDefinition { name, blocks, .. } => {
             let fn_slug = heading_slug(name);
             let id_val = if fn_slug.is_empty() {
@@ -383,16 +375,15 @@ fn render_block_html(
             } else {
                 format!("fn-{fn_slug}")
             };
-            let _ = writeln!(
-                out,
-                "<section class=\"footnote-def\" id=\"{}\">\n<span class=\"footnote-label\">[^{}]:</span>",
-                escape_html_attr(&id_val),
-                escape_html(name),
-            );
+            w.write_all(b"<section class=\"footnote-def\" id=\"")?;
+            write_escaped_html(w, &id_val)?;
+            w.write_all(b"\">\n<span class=\"footnote-label\">[^")?;
+            write_escaped_html(w, name)?;
+            w.write_all(b"]:</span>\n")?;
             for inner in blocks {
-                render_block_html(out, inner, base_dir, slug_tracker, known_slugs);
+                write_block_html(w, inner, base_dir, slug_tracker, known_slugs, image_cache)?;
             }
-            out.push_str("</section>\n");
+            w.write_all(b"</section>\n")
         }
     }
 }
@@ -406,24 +397,24 @@ fn table_align_attr(align: TableAlign) -> &'static str {
     }
 }
 
-fn render_runs_html(
-    out: &mut String,
+fn write_runs_html<W: Write>(
+    w: &mut W,
     runs: &[InlineRun],
     base_dir: Option<&Path>,
     known_slugs: &HashSet<String>,
-) {
+    image_cache: &mut FxHashMap<String, String>,
+) -> io::Result<()> {
     for run in runs {
-        if let Some(ref img_url) = run.image_url
-            && !is_unsafe_scheme(img_url) {
-                let src = resolve_html_image_src(img_url, base_dir);
-                let _ = write!(
-                    out,
-                    "<img src=\"{}\" alt=\"{}\">",
-                    escape_html_attr(&src),
-                    escape_html_attr(&run.text),
-                );
-                continue;
+        if let Some(ref img_url) = run.image_url {
+            if let Some(src) = resolve_safe_html_image_src(img_url, base_dir, image_cache) {
+                w.write_all(b"<img src=\"")?;
+                write_escaped_html(w, &src)?;
+                w.write_all(b"\" alt=\"")?;
+                write_escaped_html(w, &run.text)?;
+                w.write_all(b"\">")?;
             }
+            continue;
+        }
 
         if run.is_footnote_ref {
             let name = run.text.trim_matches(|c| matches!(c, '[' | ']' | '^'));
@@ -433,79 +424,111 @@ fn render_runs_html(
             } else {
                 format!("#fn-{slug}")
             };
-            let _ = write!(
-                out,
-                "<sup><a href=\"{}\" class=\"footnote-ref\">{}</a></sup>",
-                escape_html_attr(&href),
-                escape_html(&run.text),
-            );
+            w.write_all(b"<sup><a href=\"")?;
+            write_escaped_html(w, &href)?;
+            w.write_all(b"\" class=\"footnote-ref\">")?;
+            write_escaped_html(w, &run.text)?;
+            w.write_all(b"</a></sup>")?;
             continue;
         }
 
-        let inner_html = if run.is_math {
-            let plain = math::math_to_plain_text(&run.text);
-            format!(
-                "<span class=\"math-inline\" title=\"{}\">{}</span>",
-                escape_html_attr(&run.text),
-                escape_html(&plain)
-            )
-        } else {
-            let escaped = escape_html(&run.text);
-            if run.code {
-                format!("<code>{escaped}</code>")
+        let link_info = run
+            .link_url
+            .as_deref()
+            .and_then(|raw_url| classify_html_href(raw_url, known_slugs));
+        if let Some((ref href, external)) = link_info {
+            w.write_all(b"<a href=\"")?;
+            write_escaped_html(w, href)?;
+            if external {
+                w.write_all(b"\" target=\"_blank\" rel=\"noopener noreferrer\">")?;
             } else {
-                escaped
+                w.write_all(b"\">")?;
             }
-        };
-
-        let mut wrapped = inner_html;
-        if run.bold {
-            wrapped = format!("<strong>{wrapped}</strong>");
-        }
-        if run.italic {
-            wrapped = format!("<em>{wrapped}</em>");
-        }
-        if run.underline {
-            wrapped = format!("<u>{wrapped}</u>");
         }
         if run.strikethrough {
-            wrapped = format!("<del>{wrapped}</del>");
+            w.write_all(b"<del>")?;
+        }
+        if run.underline {
+            w.write_all(b"<u>")?;
+        }
+        if run.italic {
+            w.write_all(b"<em>")?;
+        }
+        if run.bold {
+            w.write_all(b"<strong>")?;
         }
 
-        if let Some(ref raw_url) = run.link_url
-            && let Some((href, external)) = classify_html_href(raw_url, known_slugs) {
-                if external {
-                    let _ = write!(
-                        out,
-                        "<a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">{wrapped}</a>",
-                        escape_html_attr(&href),
-                    );
-                } else {
-                    let _ = write!(
-                        out,
-                        "<a href=\"{}\">{wrapped}</a>",
-                        escape_html_attr(&href),
-                    );
-                }
-                continue;
-            }
+        if run.is_math {
+            let plain = math::math_to_plain_text(&run.text);
+            w.write_all(b"<span class=\"math-inline\" title=\"")?;
+            write_escaped_html(w, &run.text)?;
+            w.write_all(b"\">")?;
+            write_escaped_html(w, &plain)?;
+            w.write_all(b"</span>")?;
+        } else if run.code {
+            w.write_all(b"<code>")?;
+            write_escaped_html(w, &run.text)?;
+            w.write_all(b"</code>")?;
+        } else {
+            write_escaped_html(w, &run.text)?;
+        }
 
-        out.push_str(&wrapped);
+        if run.bold {
+            w.write_all(b"</strong>")?;
+        }
+        if run.italic {
+            w.write_all(b"</em>")?;
+        }
+        if run.underline {
+            w.write_all(b"</u>")?;
+        }
+        if run.strikethrough {
+            w.write_all(b"</del>")?;
+        }
+        if link_info.is_some() {
+            w.write_all(b"</a>")?;
+        }
     }
+    Ok(())
+}
+
+fn strip_control_chars(s: &str) -> String {
+    if !s.chars().any(|c| c.is_control()) {
+        return s.to_string();
+    }
+    s.chars().filter(|c| !c.is_control()).collect()
 }
 
 fn is_unsafe_scheme(url: &str) -> bool {
-    let trimmed = url.trim().trim_start_matches('<').trim_end_matches('>').trim();
+    let trimmed = strip_control_chars(url.trim().trim_start_matches('<').trim_end_matches('>').trim());
     let lower = trimmed.to_ascii_lowercase();
-    lower.starts_with("javascript:") || lower.starts_with("vbscript:") || lower.starts_with("data:text/html")
+    lower.is_empty()
+        || lower.starts_with("javascript:")
+        || lower.starts_with("vbscript:")
+        || lower.starts_with("data:")
+        || lower.starts_with("file:")
+}
+
+fn is_safe_raster_data_uri(trimmed: &str) -> bool {
+    let clean = strip_control_chars(trimmed);
+    let lower = clean.to_ascii_lowercase();
+    lower.starts_with("data:image/png;base64,")
+        || lower.starts_with("data:image/jpeg;base64,")
+        || lower.starts_with("data:image/jpg;base64,")
+        || lower.starts_with("data:image/gif;base64,")
+        || lower.starts_with("data:image/webp;base64,")
 }
 
 fn classify_html_href(raw_url: &str, known_slugs: &HashSet<String>) -> Option<(String, bool)> {
-    let trimmed = raw_url
+    let trimmed_raw = raw_url
         .trim()
         .trim_start_matches('<')
         .trim_end_matches('>')
         .trim();
+    if trimmed_raw.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    let trimmed = trimmed_raw;
     if trimmed.is_empty() || is_unsafe_scheme(trimmed) {
         return None;
     }
@@ -532,6 +555,10 @@ fn classify_html_href(raw_url: &str, known_slugs: &HashSet<String>) -> Option<(S
         return Some((format!("https://{trimmed}"), true));
     }
 
+    if trimmed.starts_with(r"\\") || trimmed.starts_with("//") {
+        return None;
+    }
+
     // Reject unknown explicit schemes (`data:`, `custom:`, etc.) while allowing relative links.
     if let Some(colon) = trimmed.find(':') {
         let before = &trimmed[..colon];
@@ -543,121 +570,72 @@ fn classify_html_href(raw_url: &str, known_slugs: &HashSet<String>) -> Option<(S
     Some((trimmed.to_string(), false))
 }
 
-fn resolve_html_image_src(raw_url: &str, base_dir: Option<&Path>) -> String {
+fn resolve_safe_html_image_src(
+    raw_url: &str,
+    base_dir: Option<&Path>,
+    cache: &mut FxHashMap<String, String>,
+) -> Option<String> {
     let trimmed = raw_url
         .trim()
         .trim_start_matches('<')
         .trim_end_matches('>')
         .trim();
+    if trimmed.is_empty() || trimmed.chars().any(|c| c.is_control()) {
+        return None;
+    }
     let lower = trimmed.to_ascii_lowercase();
-    if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("data:") {
-        return trimmed.to_string();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        return Some(trimmed.to_string());
     }
-
-    let decoded = trimmed.replace("%20", " ");
-    let resolve_candidate = |candidate: &str| -> PathBuf {
-        let raw_path = Path::new(candidate);
-        if raw_path.is_absolute() || raw_path.exists() {
-            return raw_path.to_path_buf();
-        }
-        if let Some(base) = base_dir {
-            let joined = base.join(raw_path);
-            if joined.exists() {
-                return joined;
-            }
-        }
-        raw_path.to_path_buf()
-    };
-
-    let resolved = {
-        let primary = resolve_candidate(trimmed);
-        if primary.exists() || decoded == trimmed {
-            primary
-        } else {
-            resolve_candidate(&decoded)
-        }
-    };
-
-    if let Ok(bytes) = fs::read(&resolved) {
-        let mime = detect_image_mime(&resolved, &bytes);
-        let b64 = encode_base64(&bytes);
-        return format!("data:{mime};base64,{b64}");
+    if lower.starts_with("data:") {
+        return is_safe_raster_data_uri(trimmed).then(|| trimmed.to_string());
     }
-
-    trimmed.to_string()
-}
-
-fn detect_image_mime(path: &Path, bytes: &[u8]) -> &'static str {
-    if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
-        return "image/png";
+    if let Some(cached) = cache.get(trimmed) {
+        return (!cached.is_empty()).then(|| cached.clone());
     }
-    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
-        return "image/jpeg";
-    }
-    if bytes.starts_with(b"GIF8") {
-        return "image/gif";
-    }
-    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
-        return "image/webp";
-    }
-    match path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|s| s.to_ascii_lowercase())
-        .as_deref()
+    if let Some((mime, bytes)) = crate::export::load_safe_export_web_image(trimmed, base_dir, 2048)
     {
-        Some("svg") => "image/svg+xml",
-        Some("jpg") | Some("jpeg") => "image/jpeg",
-        Some("gif") => "image/gif",
-        Some("webp") => "image/webp",
-        Some("bmp") => "image/bmp",
-        Some("tif") | Some("tiff") => "image/tiff",
-        _ => "image/png",
+        let uri = format!("data:{mime};base64,{}", encode_base64(&bytes));
+        cache.insert(trimmed.to_string(), uri.clone());
+        return Some(uri);
+    }
+    cache.insert(trimmed.to_string(), String::new());
+    // Reject UNC, file:, or absolute local paths if image load failed; keep safe relative URLs as-is
+    if trimmed.starts_with(r"\\")
+        || trimmed.starts_with("//")
+        || lower.starts_with("file:")
+        || Path::new(trimmed).is_absolute()
+    {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
 }
 
-pub(crate) fn encode_base64(input: &[u8]) -> String {
-    const TABLE: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    for chunk in input.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-        out.push(TABLE[((triple >> 18) & 0x3F) as usize] as char);
-        out.push(TABLE[((triple >> 12) & 0x3F) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(TABLE[((triple >> 6) & 0x3F) as usize] as char);
-        } else {
-            out.push('=');
-        }
-        if chunk.len() > 2 {
-            out.push(TABLE[(triple & 0x3F) as usize] as char);
-        } else {
-            out.push('=');
+fn write_escaped_html<W: Write>(w: &mut W, text: &str) -> io::Result<()> {
+    let bytes = text.as_bytes();
+    let mut last = 0usize;
+    for (i, &b) in bytes.iter().enumerate() {
+        let esc: Option<&[u8]> = match b {
+            b'&' => Some(b"&amp;"),
+            b'<' => Some(b"&lt;"),
+            b'>' => Some(b"&gt;"),
+            b'"' => Some(b"&quot;"),
+            b'\'' => Some(b"&#39;"),
+            _ => None,
+        };
+        if let Some(seq) = esc {
+            if i > last {
+                w.write_all(&bytes[last..i])?;
+            }
+            w.write_all(seq)?;
+            last = i + 1;
         }
     }
-    out
-}
-
-fn escape_html(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for ch in text.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            _ => out.push(ch),
-        }
+    if last < bytes.len() {
+        w.write_all(&bytes[last..])?;
     }
-    out
-}
-
-fn escape_html_attr(text: &str) -> String {
-    escape_html(text)
+    Ok(())
 }
 
 const HTML_STYLESHEET: &str = r#"

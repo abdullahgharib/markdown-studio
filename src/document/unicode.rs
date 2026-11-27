@@ -205,102 +205,416 @@ fn is_regional_indicator(c: char) -> bool {
     ('\u{1F1E6}'..='\u{1F1FF}').contains(&c)
 }
 
+#[inline]
+fn next_is_grapheme_boundary(
+    prev: char,
+    cur: char,
+    cluster_has_person_emoji: &mut bool,
+    ri_run: &mut usize,
+) -> bool {
+    let join = if prev == '\r' && cur == '\n' {
+        true
+    } else if prev == '\r' || prev == '\n' || cur == '\r' || cur == '\n' {
+        false
+    } else {
+        prev == '\u{200D}'
+            || is_extending_char(cur)
+            || (*cluster_has_person_emoji && is_person_family_emoji(cur))
+            || (is_regional_indicator(cur) && (*ri_run) % 2 == 1)
+    };
+    if !join {
+        *cluster_has_person_emoji = is_person_family_emoji(cur);
+        *ri_run = usize::from(is_regional_indicator(cur));
+        true
+    } else {
+        if is_person_family_emoji(cur) {
+            *cluster_has_person_emoji = true;
+        }
+        if is_regional_indicator(cur) {
+            *ri_run += 1;
+        } else {
+            *ri_run = 0;
+        }
+        false
+    }
+}
+
 /// Returns sorted grapheme-cluster boundary offsets in `char` coordinates `[0, ..., char_count]`.
 pub fn grapheme_char_boundaries(text: &str) -> Vec<usize> {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.is_empty() {
+    if text.is_empty() {
         return vec![0];
     }
-
-    let mut bounds = Vec::with_capacity(chars.len() + 1);
-    bounds.push(0);
-
-    let mut cluster_has_person_emoji = is_person_family_emoji(chars[0]);
-    let mut ri_run = usize::from(is_regional_indicator(chars[0]));
-
-    for i in 1..chars.len() {
-        let prev = chars[i - 1];
-        let cur = chars[i];
-
-        let join = if prev == '\r' && cur == '\n' {
-            true
-        } else if prev == '\r' || prev == '\n' || cur == '\r' || cur == '\n' {
-            false
-        } else {
-            prev == '\u{200D}'
-                || is_extending_char(cur)
-                || (cluster_has_person_emoji && is_person_family_emoji(cur))
-                || (is_regional_indicator(cur) && ri_run % 2 == 1)
-        };
-
-        if !join {
-            bounds.push(i);
-            cluster_has_person_emoji = is_person_family_emoji(cur);
-            ri_run = usize::from(is_regional_indicator(cur));
-        } else {
-            if is_person_family_emoji(cur) {
-                cluster_has_person_emoji = true;
-            }
-            if is_regional_indicator(cur) {
-                ri_run += 1;
-            } else {
-                ri_run = 0;
+    if text.is_ascii() {
+        let bytes = text.as_bytes();
+        if !bytes.contains(&b'\r') {
+            return (0..=bytes.len()).collect();
+        }
+        let mut bounds = Vec::with_capacity(bytes.len() + 1);
+        bounds.push(0);
+        for i in 1..bytes.len() {
+            if !(bytes[i - 1] == b'\r' && bytes[i] == b'\n') {
+                bounds.push(i);
             }
         }
+        bounds.push(bytes.len());
+        return bounds;
     }
 
-    bounds.push(chars.len());
+    let mut iter = text.chars().enumerate();
+    let Some((_, mut prev)) = iter.next() else {
+        return vec![0];
+    };
+    let mut bounds = Vec::with_capacity(text.len().min(64) + 2);
+    bounds.push(0);
+    let mut cluster_has_person_emoji = is_person_family_emoji(prev);
+    let mut ri_run = usize::from(is_regional_indicator(prev));
+    let mut total_chars = 1usize;
+
+    for (i, cur) in iter {
+        total_chars = i + 1;
+        if next_is_grapheme_boundary(prev, cur, &mut cluster_has_person_emoji, &mut ri_run) {
+            bounds.push(i);
+        }
+        prev = cur;
+    }
+
+    bounds.push(total_chars);
     bounds
+}
+
+/// Zero-allocation grapheme cluster boundary scan returning `(start, end)` of the cluster around `char_idx`.
+#[inline]
+fn grapheme_cluster_around(text: &str, char_idx: usize) -> (usize, usize, usize) {
+    if text.is_empty() {
+        return (0, 0, 0);
+    }
+    let mut iter = text.chars();
+    let Some(mut prev) = iter.next() else {
+        return (0, 0, 0);
+    };
+    let mut cluster_start = 0usize;
+    let mut cluster_has_person_emoji = is_person_family_emoji(prev);
+    let mut ri_run = usize::from(is_regional_indicator(prev));
+    let mut idx = 1usize;
+    let mut target_start = 0usize;
+    let mut target_end = None;
+
+    for cur in iter {
+        if next_is_grapheme_boundary(prev, cur, &mut cluster_has_person_emoji, &mut ri_run) {
+            if target_end.is_none() && idx > char_idx {
+                target_start = cluster_start;
+                target_end = Some(idx);
+            }
+            cluster_start = idx;
+        }
+        prev = cur;
+        idx += 1;
+    }
+    let total = idx;
+    if let Some(end) = target_end {
+        (target_start, end, total)
+    } else {
+        (cluster_start, total, total)
+    }
 }
 
 /// Returns the nearest grapheme boundary strictly before `char_idx` (or `0`).
 pub fn prev_grapheme_char_idx(text: &str, char_idx: usize) -> usize {
-    let bounds = grapheme_char_boundaries(text);
-    let max_c = *bounds.last().unwrap_or(&0);
-    let c = char_idx.min(max_c);
-    bounds
-        .iter()
-        .copied()
-        .rev()
-        .find(|&b| b < c)
-        .unwrap_or(0)
+    if char_idx == 0 || text.is_empty() {
+        return 0;
+    }
+    if text.is_ascii() {
+        let b = text.as_bytes();
+        let c = char_idx.min(b.len());
+        if c >= 2 && b[c - 1] == b'\n' && b[c - 2] == b'\r' {
+            return c - 2;
+        }
+        return c - 1;
+    }
+
+    let mut iter = text.chars();
+    let Some(mut prev) = iter.next() else {
+        return 0;
+    };
+    let mut prev_bound = 0usize;
+    let mut cur_bound = 0usize;
+    let mut cluster_has_person_emoji = is_person_family_emoji(prev);
+    let mut ri_run = usize::from(is_regional_indicator(prev));
+
+    for (idx, cur) in (1usize..).zip(iter) {
+        if idx >= char_idx {
+            if next_is_grapheme_boundary(prev, cur, &mut cluster_has_person_emoji, &mut ri_run)
+                && idx == char_idx
+            {
+                return cur_bound;
+            }
+            return if cur_bound < char_idx {
+                cur_bound
+            } else {
+                prev_bound
+            };
+        }
+        if next_is_grapheme_boundary(prev, cur, &mut cluster_has_person_emoji, &mut ri_run) {
+            prev_bound = cur_bound;
+            cur_bound = idx;
+        }
+        prev = cur;
+    }
+    cur_bound
 }
 
 /// Returns the nearest grapheme boundary strictly after `char_idx` (or `char_count`).
 pub fn next_grapheme_char_idx(text: &str, char_idx: usize) -> usize {
-    let bounds = grapheme_char_boundaries(text);
-    let max_c = *bounds.last().unwrap_or(&0);
-    let c = char_idx.min(max_c);
-    bounds
-        .iter()
-        .copied()
-        .find(|&b| b > c)
-        .unwrap_or(max_c)
+    if text.is_empty() {
+        return 0;
+    }
+    if text.is_ascii() {
+        let b = text.as_bytes();
+        if char_idx >= b.len() {
+            return b.len();
+        }
+        if b[char_idx] == b'\r' && char_idx + 1 < b.len() && b[char_idx + 1] == b'\n' {
+            return char_idx + 2;
+        }
+        return char_idx + 1;
+    }
+
+    let mut iter = text.chars();
+    let Some(mut prev) = iter.next() else {
+        return 0;
+    };
+    let mut cluster_has_person_emoji = is_person_family_emoji(prev);
+    let mut ri_run = usize::from(is_regional_indicator(prev));
+    let mut idx = 1usize;
+
+    for cur in iter {
+        if next_is_grapheme_boundary(prev, cur, &mut cluster_has_person_emoji, &mut ri_run)
+            && idx > char_idx
+        {
+            return idx;
+        }
+        prev = cur;
+        idx += 1;
+    }
+    idx
 }
 
 /// Snaps `char_idx` backward to the start of the grapheme cluster containing it.
 pub fn snap_to_grapheme_start(text: &str, char_idx: usize) -> usize {
-    let bounds = grapheme_char_boundaries(text);
-    let max_c = *bounds.last().unwrap_or(&0);
-    let c = char_idx.min(max_c);
-    bounds
-        .iter()
-        .copied()
-        .rev()
-        .find(|&b| b <= c)
-        .unwrap_or(0)
+    if char_idx == 0 || text.is_empty() {
+        return 0;
+    }
+    if text.is_ascii() {
+        let b = text.as_bytes();
+        let c = char_idx.min(b.len());
+        if c < b.len() && c >= 1 && b[c - 1] == b'\r' && b[c] == b'\n' {
+            return c - 1;
+        }
+        return c;
+    }
+
+    let mut iter = text.chars();
+    let Some(mut prev) = iter.next() else {
+        return 0;
+    };
+    let mut cur_bound = 0usize;
+    let mut cluster_has_person_emoji = is_person_family_emoji(prev);
+    let mut ri_run = usize::from(is_regional_indicator(prev));
+    let mut idx = 1usize;
+
+    for cur in iter {
+        if next_is_grapheme_boundary(prev, cur, &mut cluster_has_person_emoji, &mut ri_run) {
+            if idx == char_idx {
+                return idx;
+            }
+            if idx > char_idx {
+                return cur_bound;
+            }
+            cur_bound = idx;
+        } else if idx > char_idx {
+            return cur_bound;
+        }
+        prev = cur;
+        idx += 1;
+    }
+    if char_idx >= idx {
+        idx
+    } else {
+        cur_bound
+    }
 }
 
 /// Snaps `char_idx` forward to the end of the grapheme cluster containing it (if inside a cluster).
 pub fn snap_to_grapheme_end(text: &str, char_idx: usize) -> usize {
-    let bounds = grapheme_char_boundaries(text);
-    let max_c = *bounds.last().unwrap_or(&0);
-    let c = char_idx.min(max_c);
-    bounds
-        .iter()
-        .copied()
-        .find(|&b| b >= c)
-        .unwrap_or(max_c)
+    if char_idx == 0 || text.is_empty() {
+        return 0;
+    }
+    if text.is_ascii() {
+        let b = text.as_bytes();
+        let c = char_idx.min(b.len());
+        if c < b.len() && c >= 1 && b[c - 1] == b'\r' && b[c] == b'\n' {
+            return c + 1;
+        }
+        return c;
+    }
+
+    let mut iter = text.chars();
+    let Some(mut prev) = iter.next() else {
+        return 0;
+    };
+    let mut cluster_has_person_emoji = is_person_family_emoji(prev);
+    let mut ri_run = usize::from(is_regional_indicator(prev));
+    let mut idx = 1usize;
+
+    for cur in iter {
+        if next_is_grapheme_boundary(prev, cur, &mut cluster_has_person_emoji, &mut ri_run)
+            && idx >= char_idx
+        {
+            return idx;
+        }
+        prev = cur;
+        idx += 1;
+    }
+    idx
+}
+
+/// Extracts a bounded local char window `[win_start, win_end)` around `col` on a `ropey::RopeSlice`
+/// so grapheme navigation stays O(1) even on multi-megabyte single lines.
+fn extract_rope_grapheme_window(
+    line: ropey::RopeSlice<'_>,
+    line_len: usize,
+    col: usize,
+) -> (usize, String, usize) {
+    const WINDOW_HALF: usize = 64;
+    let clamped_col = col.min(line_len);
+    let mut win_start = clamped_col.saturating_sub(WINDOW_HALF);
+    while win_start > 0 && win_start < clamped_col {
+        let ch = line.char(win_start);
+        if !(is_extending_char(ch)
+            || is_person_family_emoji(ch)
+            || is_regional_indicator(ch)
+            || line.char(win_start - 1) == '\u{200D}')
+        {
+            break;
+        }
+        win_start -= 1;
+        if clamped_col - win_start >= 1024 {
+            break;
+        }
+    }
+    // Preserve regional-indicator pair parity if a long flag chain precedes win_start
+    if win_start > 0 && is_regional_indicator(line.char(win_start)) {
+        let mut prior_ri = 0usize;
+        let mut k = win_start;
+        while k > 0 && is_regional_indicator(line.char(k - 1)) {
+            prior_ri += 1;
+            k -= 1;
+            if prior_ri >= 512 {
+                break;
+            }
+        }
+        if prior_ri % 2 == 1 && win_start > 0 {
+            win_start -= 1;
+        }
+    }
+
+    let mut win_end = (clamped_col + WINDOW_HALF).min(line_len);
+    while win_end < line_len {
+        let ch = line.char(win_end);
+        let prev = line.char(win_end - 1);
+        if !(prev == '\u{200D}'
+            || is_extending_char(ch)
+            || is_person_family_emoji(ch)
+            || is_regional_indicator(ch))
+        {
+            break;
+        }
+        win_end += 1;
+        if win_end - clamped_col >= 1024 {
+            break;
+        }
+    }
+
+    let mut window = String::with_capacity((win_end - win_start) * 2);
+    for chunk in line.slice(win_start..win_end).chunks() {
+        window.push_str(chunk);
+    }
+    (win_start, window, clamped_col - win_start)
+}
+
+/// Returns the previous grapheme boundary before `col` on a `RopeSlice` line in O(1) for ASCII
+/// and O(local cluster window) for complex Unicode.
+pub fn prev_grapheme_in_rope_line(line: ropey::RopeSlice<'_>, col: usize) -> usize {
+    if col == 0 {
+        return 0;
+    }
+    let len = line.len_chars();
+    let c = col.min(len);
+    if c == 0 {
+        return 0;
+    }
+    let prev = line.char(c - 1);
+    if prev.is_ascii() && prev != '\n' {
+        return c - 1;
+    }
+    let (win_start, win, local_col) = extract_rope_grapheme_window(line, len, c);
+    win_start + prev_grapheme_char_idx(&win, local_col)
+}
+
+/// Returns the next grapheme boundary after `col` within `[0..=line_len]` on a `RopeSlice` line.
+pub fn next_grapheme_in_rope_line(
+    line: ropey::RopeSlice<'_>,
+    col: usize,
+    line_len: usize,
+) -> usize {
+    if col >= line_len {
+        return line_len;
+    }
+    let cur = line.char(col);
+    if cur.is_ascii()
+        && cur != '\r'
+        && (col + 1 >= line_len || line.char(col + 1).is_ascii())
+    {
+        return col + 1;
+    }
+    let (win_start, win, local_col) = extract_rope_grapheme_window(line, line_len, col);
+    (win_start + next_grapheme_char_idx(&win, local_col)).min(line_len)
+}
+
+/// Snaps `col` backward to the start of its grapheme cluster on a `RopeSlice` line.
+pub fn snap_grapheme_start_in_rope_line(
+    line: ropey::RopeSlice<'_>,
+    col: usize,
+    line_len: usize,
+) -> usize {
+    let c = col.min(line_len);
+    if c == 0 || c == line_len {
+        return c;
+    }
+    let cur = line.char(c);
+    if cur.is_ascii() && cur != '\n' {
+        return c;
+    }
+    let (win_start, win, local_col) = extract_rope_grapheme_window(line, line_len, c);
+    win_start + snap_to_grapheme_start(&win, local_col)
+}
+
+/// Snaps `col` forward to the end of its grapheme cluster on a `RopeSlice` line.
+pub fn snap_grapheme_end_in_rope_line(
+    line: ropey::RopeSlice<'_>,
+    col: usize,
+    line_len: usize,
+) -> usize {
+    let c = col.min(line_len);
+    if c == 0 || c == line_len {
+        return c;
+    }
+    let cur = line.char(c);
+    if cur.is_ascii() && cur != '\n' {
+        return c;
+    }
+    let (win_start, win, local_col) = extract_rope_grapheme_window(line, line_len, c);
+    (win_start + snap_to_grapheme_end(&win, local_col)).min(line_len)
 }
 
 /// Maps isolated Arabic letters (`U+0621..=U+064A` and Tatweel `U+0640`) to Presentation Forms-B:
@@ -399,6 +713,27 @@ fn has_arabic_or_bidi_controls(text: &str) -> bool {
             .any(|c| ('\u{0600}'..='\u{06FF}').contains(&c) || matches!(c, '\u{200D}'..='\u{200F}'))
 }
 
+#[inline]
+fn shape_arabic_1to1_at(chars: &[char], idx: usize) -> char {
+    let c = chars[idx];
+    if let Some((iso, fin, init, med)) = arabic_forms(c) {
+        let join_prev =
+            connects_before(c) && prev_base_char(chars, idx).is_some_and(connects_after);
+        let join_next = connects_after(c)
+            && next_base_char_idx(chars, idx)
+                .map(|j| chars[j])
+                .is_some_and(connects_before);
+        match (join_prev, join_next) {
+            (true, true) => med.unwrap_or(fin),
+            (true, false) => fin,
+            (false, true) => init.unwrap_or(iso),
+            (false, false) => iso,
+        }
+    } else {
+        c
+    }
+}
+
 /// Performs 1-to-1 Arabic contextual shaping preserving exact character indices and logical order.
 pub fn shape_arabic_1to1(text: &str) -> String {
     if !has_arabic_or_bidi_controls(text) {
@@ -406,23 +741,8 @@ pub fn shape_arabic_1to1(text: &str) -> String {
     }
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(text.len() + 8);
-    for (i, &c) in chars.iter().enumerate() {
-        if let Some((iso, fin, init, med)) = arabic_forms(c) {
-            let join_prev = connects_before(c) && prev_base_char(&chars, i).is_some_and(connects_after);
-            let join_next = connects_after(c)
-                && next_base_char_idx(&chars, i)
-                    .map(|j| chars[j])
-                    .is_some_and(connects_before);
-            let shaped = match (join_prev, join_next) {
-                (true, true) => med.unwrap_or(fin),
-                (true, false) => fin,
-                (false, true) => init.unwrap_or(iso),
-                (false, false) => iso,
-            };
-            out.push(shaped);
-        } else {
-            out.push(c);
-        }
+    for i in 0..chars.len() {
+        out.push(shape_arabic_1to1_at(&chars, i));
     }
     out
 }
@@ -523,28 +843,30 @@ fn resolve_neutral_directions(
         }
     }
 
-    let mut next_strong = vec![None; n];
+    let mut resolved = vec![base_dir; n];
     let mut cur_next: Option<TextDirection> = None;
     for i in (0..n).rev() {
-        next_strong[i] = cur_next;
+        let next_s = cur_next;
         match dirs[i] {
-            ClusterDir::Rtl => cur_next = Some(TextDirection::Rtl),
-            ClusterDir::LtrStrong => cur_next = Some(TextDirection::Ltr),
-            ClusterDir::Number => cur_next = Some(number_neutral_dir),
-            ClusterDir::Neutral => {}
+            ClusterDir::Rtl => {
+                resolved[i] = TextDirection::Rtl;
+                cur_next = Some(TextDirection::Rtl);
+            }
+            ClusterDir::LtrStrong => {
+                resolved[i] = TextDirection::Ltr;
+                cur_next = Some(TextDirection::Ltr);
+            }
+            ClusterDir::Number => {
+                resolved[i] = TextDirection::Ltr;
+                cur_next = Some(number_neutral_dir);
+            }
+            ClusterDir::Neutral => {
+                resolved[i] = match (prev_strong[i], next_s) {
+                    (Some(a), Some(b)) if a == b => a,
+                    _ => base_dir,
+                };
+            }
         }
-    }
-
-    let mut resolved = vec![base_dir; n];
-    for i in 0..n {
-        resolved[i] = match dirs[i] {
-            ClusterDir::Rtl => TextDirection::Rtl,
-            ClusterDir::LtrStrong | ClusterDir::Number => TextDirection::Ltr,
-            ClusterDir::Neutral => match (prev_strong[i], next_strong[i]) {
-                (Some(a), Some(b)) if a == b => a,
-                _ => base_dir,
-            },
-        };
     }
     resolved
 }
@@ -658,6 +980,8 @@ pub struct VisualBidiLineMap {
     pub logical_char_len: usize,
     pub vis_to_log: Vec<usize>,
     pub clusters: Vec<BidiClusterMap>,
+    /// Indices into `clusters` sorted by `log_range.start` for O(log k) logical->visual lookups.
+    log_order: Vec<usize>,
 }
 
 impl VisualBidiLineMap {
@@ -668,7 +992,12 @@ impl VisualBidiLineMap {
             return col;
         }
         if col == self.logical_char_len {
-            if let Some(c) = self.clusters.iter().find(|c| c.log_range.end == self.logical_char_len) {
+            if let Some(c) = self
+                .log_order
+                .last()
+                .map(|&idx| &self.clusters[idx])
+                .filter(|c| c.log_range.end == self.logical_char_len)
+            {
                 return match c.dir {
                     TextDirection::Rtl => c.vis_range.start,
                     TextDirection::Ltr => c.vis_range.end,
@@ -676,23 +1005,29 @@ impl VisualBidiLineMap {
             }
             return self.logical_char_len;
         }
-        if let Some(c) = self.clusters.iter().find(|c| col >= c.log_range.start && col < c.log_range.end) {
-            return match c.dir {
-                TextDirection::Rtl => {
-                    if col == c.log_range.start {
-                        c.vis_range.end
-                    } else {
-                        c.vis_range.start
+        let pos = self
+            .log_order
+            .partition_point(|&idx| self.clusters[idx].log_range.end <= col);
+        if let Some(&idx) = self.log_order.get(pos) {
+            let c = &self.clusters[idx];
+            if col >= c.log_range.start && col < c.log_range.end {
+                return match c.dir {
+                    TextDirection::Rtl => {
+                        if col == c.log_range.start {
+                            c.vis_range.end
+                        } else {
+                            c.vis_range.start
+                        }
                     }
-                }
-                TextDirection::Ltr => {
-                    if col == c.log_range.start {
-                        c.vis_range.start
-                    } else {
-                        c.vis_range.end
+                    TextDirection::Ltr => {
+                        if col == c.log_range.start {
+                            c.vis_range.start
+                        } else {
+                            c.vis_range.end
+                        }
                     }
-                }
-            };
+                };
+            }
         }
         col
     }
@@ -700,17 +1035,20 @@ impl VisualBidiLineMap {
     /// Maps a visual `CCursor` index in `visual_text` back to a grapheme-snapped logical char column.
     pub fn logical_col_for_visual(&self, line_str: &str, vis_col: usize) -> usize {
         if self.is_identity || self.clusters.is_empty() {
-            let bounds = grapheme_char_boundaries(line_str);
-            let max_c = *bounds.last().unwrap_or(&0);
-            let vc = vis_col.min(max_c);
-            for w in bounds.windows(2) {
-                let s = w[0];
-                let e = w[1];
-                if vc >= s && vc < e {
-                    return if (vc - s) * 2 >= (e - s) { e } else { s };
+            if line_str.is_ascii() {
+                let vc = vis_col.min(line_str.len());
+                let b = line_str.as_bytes();
+                if vc < b.len() && vc >= 1 && b[vc - 1] == b'\r' && b[vc] == b'\n' {
+                    return vc - 1;
                 }
+                return vc;
             }
-            return max_c;
+            let (s, e, total) = grapheme_cluster_around(line_str, vis_col);
+            let vc = vis_col.min(total);
+            if vc >= total {
+                return total;
+            }
+            return if (vc - s) * 2 >= (e - s) { e } else { s };
         }
         let vc = vis_col.min(self.logical_char_len);
         if vc == 0 {
@@ -727,8 +1065,12 @@ impl VisualBidiLineMap {
                 TextDirection::Ltr => last.log_range.end,
             };
         }
-        // Check if vc is inside a cluster or at a cluster boundary
-        if let Some(c) = self.clusters.iter().find(|c| vc >= c.vis_range.start && vc < c.vis_range.end) {
+        // Clusters are strictly partitioned in visual order -> O(log k) lookup
+        let pos = self.clusters.partition_point(|c| c.vis_range.end <= vc);
+        if let Some(c) = self.clusters.get(pos)
+            && vc >= c.vis_range.start
+            && vc < c.vis_range.end
+        {
             let rel = vc - c.vis_range.start;
             let len = c.vis_range.end - c.vis_range.start;
             return match c.dir {
@@ -765,9 +1107,16 @@ impl VisualBidiLineMap {
         if self.is_identity {
             return std::iter::once(s..e).collect();
         }
+        let start_pos = self
+            .log_order
+            .partition_point(|&idx| self.clusters[idx].log_range.end <= s);
         let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
-        for c in &self.clusters {
-            if c.log_range.end > s && c.log_range.start < e {
+        for &idx in &self.log_order[start_pos..] {
+            let c = &self.clusters[idx];
+            if c.log_range.start >= e {
+                break;
+            }
+            if c.log_range.end > s {
                 ranges.push(c.vis_range.clone());
             }
         }
@@ -839,13 +1188,26 @@ pub fn build_visual_bidi_line_map(line: &str) -> VisualBidiLineMap {
             logical_char_len: line.len(),
             vis_to_log: Vec::new(),
             clusters: Vec::new(),
+            log_order: Vec::new(),
         };
     }
 
     let base_dir = detect_paragraph_direction(line);
-    let logical_chars: Vec<char> = line.chars().collect();
+    let mut logical_chars: Vec<char> = Vec::with_capacity(line.len());
+    let mut has_rtl = false;
+    let mut has_arabic_or_ctrl = false;
+    for c in line.chars() {
+        if !has_rtl && is_rtl_char(c) {
+            has_rtl = true;
+        }
+        if !has_arabic_or_ctrl
+            && (('\u{0600}'..='\u{06FF}').contains(&c) || matches!(c, '\u{200D}'..='\u{200F}'))
+        {
+            has_arabic_or_ctrl = true;
+        }
+        logical_chars.push(c);
+    }
     let n = logical_chars.len();
-    let has_rtl = logical_chars.iter().copied().any(is_rtl_char);
 
     if !has_rtl && base_dir == TextDirection::Ltr {
         return VisualBidiLineMap {
@@ -855,42 +1217,55 @@ pub fn build_visual_bidi_line_map(line: &str) -> VisualBidiLineMap {
             logical_char_len: n,
             vis_to_log: Vec::new(),
             clusters: Vec::new(),
+            log_order: Vec::new(),
         };
     }
 
     let ltr_markup_mask = compute_ltr_markup_mask(&logical_chars);
-    let shaped_chars: Vec<char> = shape_arabic_1to1(line).chars().collect();
-    let bounds = grapheme_char_boundaries(line);
-    let mut raw_ranges: Vec<Range<usize>> = Vec::with_capacity(bounds.len().saturating_sub(1));
-    let mut raw_dirs: Vec<ClusterDir> = Vec::with_capacity(bounds.len().saturating_sub(1));
+    let mut raw_ranges: Vec<Range<usize>> = Vec::with_capacity(n);
+    let mut raw_dirs: Vec<ClusterDir> = Vec::with_capacity(n);
 
-    for w in bounds.windows(2) {
-        let s = w[0];
-        let e = w[1];
-        if s >= e {
-            continue;
+    if n > 0 {
+        let mut cluster_start = 0usize;
+        let mut prev = logical_chars[0];
+        let mut cluster_has_person_emoji = is_person_family_emoji(prev);
+        let mut ri_run = usize::from(is_regional_indicator(prev));
+        for (i, &cur) in logical_chars.iter().enumerate().skip(1) {
+            if next_is_grapheme_boundary(prev, cur, &mut cluster_has_person_emoji, &mut ri_run) {
+                let in_ltr_markup = (cluster_start..i).all(|idx| ltr_markup_mask[idx]);
+                let cls = if in_ltr_markup {
+                    ClusterDir::LtrStrong
+                } else {
+                    classify_display_char(logical_chars[cluster_start])
+                };
+                raw_ranges.push(cluster_start..i);
+                raw_dirs.push(cls);
+                cluster_start = i;
+            }
+            prev = cur;
         }
-        let in_ltr_markup = (s..e).all(|idx| ltr_markup_mask[idx]);
+        let in_ltr_markup = (cluster_start..n).all(|idx| ltr_markup_mask[idx]);
         let cls = if in_ltr_markup {
             ClusterDir::LtrStrong
         } else {
-            classify_display_char(logical_chars[s])
+            classify_display_char(logical_chars[cluster_start])
         };
-        raw_ranges.push(s..e);
+        raw_ranges.push(cluster_start..n);
         raw_dirs.push(cls);
     }
 
     let resolved = resolve_neutral_directions(&raw_dirs, base_dir, TextDirection::Ltr);
 
-    let mut runs: Vec<(TextDirection, Vec<std::ops::Range<usize>>)> = Vec::new();
-    for (i, log_r) in raw_ranges.into_iter().enumerate() {
-        let d = resolved[i];
+    // Store run headers `(dir, start_cluster_idx..end_cluster_idx)` referencing `raw_ranges` flatly.
+    let mut runs: Vec<(TextDirection, Range<usize>)> = Vec::new();
+    for (i, &d) in resolved.iter().enumerate() {
         if let Some(last) = runs.last_mut()
-            && last.0 == d {
-                last.1.push(log_r);
-                continue;
-            }
-        runs.push((d, vec![log_r]));
+            && last.0 == d
+        {
+            last.1.end = i + 1;
+            continue;
+        }
+        runs.push((d, i..(i + 1)));
     }
 
     if base_dir == TextDirection::Rtl {
@@ -899,31 +1274,60 @@ pub fn build_visual_bidi_line_map(line: &str) -> VisualBidiLineMap {
 
     let mut visual_text = String::with_capacity(line.len() + 8);
     let mut vis_to_log = Vec::with_capacity(n);
-    let mut clusters = Vec::new();
+    let mut clusters = Vec::with_capacity(raw_ranges.len());
+    let mut log_order = vec![0usize; raw_ranges.len()];
     let mut vis_cursor = 0usize;
 
-    for (dir, mut run_clusters) in runs {
+    for (dir, run_span) in runs {
         if dir == TextDirection::Rtl {
-            run_clusters.reverse();
-        }
-        for log_r in run_clusters {
-            let v_start = vis_cursor;
-            for idx in log_r.clone() {
-                let raw_ch = shaped_chars[idx];
-                let disp_ch = if dir == TextDirection::Rtl && !ltr_markup_mask[idx] {
-                    mirror_rtl_bracket(raw_ch)
-                } else {
-                    raw_ch
-                };
-                visual_text.push(disp_ch);
-                vis_to_log.push(idx);
-                vis_cursor += 1;
+            for cluster_log_idx in run_span.rev() {
+                let log_r = raw_ranges[cluster_log_idx].clone();
+                let v_start = vis_cursor;
+                for idx in log_r.clone() {
+                    let raw_ch = if has_arabic_or_ctrl {
+                        shape_arabic_1to1_at(&logical_chars, idx)
+                    } else {
+                        logical_chars[idx]
+                    };
+                    let disp_ch = if !ltr_markup_mask[idx] {
+                        mirror_rtl_bracket(raw_ch)
+                    } else {
+                        raw_ch
+                    };
+                    visual_text.push(disp_ch);
+                    vis_to_log.push(idx);
+                    vis_cursor += 1;
+                }
+                let c_idx = clusters.len();
+                log_order[cluster_log_idx] = c_idx;
+                clusters.push(BidiClusterMap {
+                    log_range: log_r,
+                    vis_range: v_start..vis_cursor,
+                    dir,
+                });
             }
-            clusters.push(BidiClusterMap {
-                log_range: log_r,
-                vis_range: v_start..vis_cursor,
-                dir,
-            });
+        } else {
+            for cluster_log_idx in run_span {
+                let log_r = raw_ranges[cluster_log_idx].clone();
+                let v_start = vis_cursor;
+                for idx in log_r.clone() {
+                    let raw_ch = if has_arabic_or_ctrl {
+                        shape_arabic_1to1_at(&logical_chars, idx)
+                    } else {
+                        logical_chars[idx]
+                    };
+                    visual_text.push(raw_ch);
+                    vis_to_log.push(idx);
+                    vis_cursor += 1;
+                }
+                let c_idx = clusters.len();
+                log_order[cluster_log_idx] = c_idx;
+                clusters.push(BidiClusterMap {
+                    log_range: log_r,
+                    vis_range: v_start..vis_cursor,
+                    dir,
+                });
+            }
         }
     }
 
@@ -934,6 +1338,7 @@ pub fn build_visual_bidi_line_map(line: &str) -> VisualBidiLineMap {
         logical_char_len: n,
         vis_to_log,
         clusters,
+        log_order,
     }
 }
 
@@ -1064,15 +1469,14 @@ impl MultilineBidiMap {
             return log_idx.min(self.total_chars);
         }
         let c = log_idx.min(self.total_chars);
-        for entry in &self.lines {
-            if c <= entry.log_end {
-                let clean_len = entry.map.logical_char_len;
-                let local = c.saturating_sub(entry.log_start);
-                if entry.has_cr && local > clean_len {
-                    return entry.vis_start + clean_len + 1;
-                }
-                return entry.vis_start + entry.map.visual_col_for_logical(local.min(clean_len));
+        let idx = self.lines.partition_point(|entry| entry.log_end < c);
+        if let Some(entry) = self.lines.get(idx) {
+            let clean_len = entry.map.logical_char_len;
+            let local = c.saturating_sub(entry.log_start);
+            if entry.has_cr && local > clean_len {
+                return entry.vis_start + clean_len + 1;
             }
+            return entry.vis_start + entry.map.visual_col_for_logical(local.min(clean_len));
         }
         c
     }
@@ -1082,19 +1486,18 @@ impl MultilineBidiMap {
         if self.is_identity {
             return snap_to_grapheme_start(text, vc);
         }
-        for entry in &self.lines {
-            if vc <= entry.vis_end {
-                let clean_len = entry.map.logical_char_len;
-                let local_v = vc.saturating_sub(entry.vis_start);
-                if entry.has_cr && local_v > clean_len {
-                    return entry.log_start + clean_len;
-                }
-                let line_slice = text.get(entry.byte_start..entry.byte_end).unwrap_or("");
-                return entry.log_start
-                    + entry
-                        .map
-                        .logical_col_for_visual(line_slice, local_v.min(clean_len));
+        let idx = self.lines.partition_point(|entry| entry.vis_end < vc);
+        if let Some(entry) = self.lines.get(idx) {
+            let clean_len = entry.map.logical_char_len;
+            let local_v = vc.saturating_sub(entry.vis_start);
+            if entry.has_cr && local_v > clean_len {
+                return entry.log_start + clean_len;
             }
+            let line_slice = text.get(entry.byte_start..entry.byte_end).unwrap_or("");
+            return entry.log_start
+                + entry
+                    .map
+                    .logical_col_for_visual(line_slice, local_v.min(clean_len));
         }
         vc
     }
@@ -1112,14 +1515,16 @@ impl MultilineBidiMap {
         if self.is_identity {
             return std::iter::once(s..e).collect();
         }
+        let start_idx = self.lines.partition_point(|entry| entry.log_end <= s);
         let mut out = Vec::new();
-        for entry in &self.lines {
-            if e > entry.log_start && s < entry.log_end {
-                let ls = s.max(entry.log_start) - entry.log_start;
-                let le = e.min(entry.log_end) - entry.log_start;
-                for vr in entry.map.visual_ranges_for_logical_span(ls, le) {
-                    out.push((entry.vis_start + vr.start)..(entry.vis_start + vr.end));
-                }
+        for entry in &self.lines[start_idx..] {
+            if entry.log_start >= e {
+                break;
+            }
+            let ls = s.max(entry.log_start) - entry.log_start;
+            let le = e.min(entry.log_end) - entry.log_start;
+            for vr in entry.map.visual_ranges_for_logical_span(ls, le) {
+                out.push((entry.vis_start + vr.start)..(entry.vis_start + vr.end));
             }
         }
         out

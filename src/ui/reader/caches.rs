@@ -70,8 +70,15 @@ pub(super) struct TableEvalCache {
     entries: FxHashMap<usize, CachedTableEval>,
 }
 
+fn adaptive_cache_cap(per_gb: u64, min_cap: usize, max_cap: usize) -> usize {
+    let ram_gb = (crate::document::system_total_memory_bytes() / (1024 * 1024 * 1024)).max(1);
+    (ram_gb.saturating_mul(per_gb) as usize).clamp(min_cap, max_cap)
+}
+
 impl TableEvalCache {
-    pub(super) const MAX_ENTRIES: usize = 256;
+    pub(super) fn max_entries() -> usize {
+        adaptive_cache_cap(64, 256, 2_048)
+    }
 
     pub(super) fn get(&mut self, start_line: usize) -> Option<Option<Arc<EvaluatedTableGrid>>> {
         let entry = self.entries.get_mut(&start_line)?;
@@ -86,7 +93,7 @@ impl TableEvalCache {
         value: Option<Arc<EvaluatedTableGrid>>,
     ) {
         if !self.entries.contains_key(&start_line) {
-            evict_oldest_half(&mut self.entries, Self::MAX_ENTRIES, |e| e.last_tick);
+            evict_oldest_half(&mut self.entries, Self::max_entries(), |e| e.last_tick);
         }
         self.tick = self.tick.wrapping_add(1);
         self.entries.insert(
@@ -133,7 +140,9 @@ pub(super) fn hash_inline_runs(runs: &[InlineRun], hasher: &mut FxHasher) {
 }
 
 impl ReaderGalleyCache {
-    pub(super) const MAX_ENTRIES: usize = 1024;
+    pub(super) fn max_entries() -> usize {
+        adaptive_cache_cap(512, 1_024, 8_192)
+    }
 
     pub(super) fn get(&mut self, key: &(usize, usize, u64)) -> Option<CachedGalley> {
         self.tick = self.tick.wrapping_add(1);
@@ -150,7 +159,7 @@ impl ReaderGalleyCache {
         link_spans: Arc<Vec<GalleyLinkSpan>>,
     ) -> CachedGalley {
         if !self.entries.contains_key(&key) {
-            evict_oldest_half(&mut self.entries, Self::MAX_ENTRIES, |e| e.last_tick);
+            evict_oldest_half(&mut self.entries, Self::max_entries(), |e| e.last_tick);
         }
         self.tick = self.tick.wrapping_add(1);
         let entry = CachedGalley {

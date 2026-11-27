@@ -347,6 +347,9 @@ fn factorial_f64(n: f64) -> Result<f64, String> {
     Ok(acc)
 }
 
+const MAX_CALC_DEPTH: usize = 128;
+const MAX_ITER_TOTAL_OPS: usize = 100_000;
+
 fn binom_f64(n_val: f64, k_val: f64) -> Result<f64, String> {
     if (n_val - n_val.round()).abs() > 1e-9 || (k_val - k_val.round()).abs() > 1e-9 {
         return Err("Binomial coefficient requires integers".to_string());
@@ -361,6 +364,9 @@ fn binom_f64(n_val: f64, k_val: f64) -> Result<f64, String> {
     let mut res = 1.0_f64;
     for i in 1..=k {
         res = res * ((n - k + i) as f64) / (i as f64);
+        if !res.is_finite() {
+            break;
+        }
     }
     Ok(res)
 }
@@ -547,8 +553,10 @@ fn apply_math_func(name: &str, args: &[f64]) -> Result<f64, String> {
 struct MathParser<'a> {
     tokens: &'a [MathTok],
     pos: usize,
-    vars: HashMap<String, f64>,
+    vars: &'a mut HashMap<String, f64>,
     abs_depth: usize,
+    depth: usize,
+    iter_budget: &'a mut usize,
 }
 
 impl<'a> MathParser<'a> {
@@ -581,21 +589,29 @@ impl<'a> MathParser<'a> {
     }
 
     fn parse_add_sub(&mut self) -> Result<f64, String> {
-        let mut val = self.parse_mul_div()?;
-        loop {
-            match self.peek() {
-                Some(MathTok::Plus) => {
-                    self.next();
-                    val += self.parse_mul_div()?;
-                }
-                Some(MathTok::Minus) => {
-                    self.next();
-                    val -= self.parse_mul_div()?;
-                }
-                _ => break,
-            }
+        if self.depth >= MAX_CALC_DEPTH {
+            return Err("Expression nesting depth exceeds limit".to_string());
         }
-        Ok(val)
+        self.depth += 1;
+        let res = (|| {
+            let mut val = self.parse_mul_div()?;
+            loop {
+                match self.peek() {
+                    Some(MathTok::Plus) => {
+                        self.next();
+                        val += self.parse_mul_div()?;
+                    }
+                    Some(MathTok::Minus) => {
+                        self.next();
+                        val -= self.parse_mul_div()?;
+                    }
+                    _ => break,
+                }
+            }
+            Ok(val)
+        })();
+        self.depth -= 1;
+        res
     }
 
     fn parse_mul_div(&mut self) -> Result<f64, String> {
@@ -632,14 +648,23 @@ impl<'a> MathParser<'a> {
     }
 
     fn parse_unary(&mut self) -> Result<f64, String> {
+        if self.depth >= MAX_CALC_DEPTH {
+            return Err("Expression nesting depth exceeds limit".to_string());
+        }
         match self.peek() {
             Some(MathTok::Plus) => {
                 self.next();
-                self.parse_unary()
+                self.depth += 1;
+                let r = self.parse_unary();
+                self.depth -= 1;
+                r
             }
             Some(MathTok::Minus) => {
                 self.next();
-                Ok(-self.parse_unary()?)
+                self.depth += 1;
+                let r = self.parse_unary();
+                self.depth -= 1;
+                Ok(-r?)
             }
             _ => self.parse_power(),
         }
@@ -721,8 +746,10 @@ impl<'a> MathParser<'a> {
                         let mut sub_p = MathParser {
                             tokens: &slice[eq_idx + 1..],
                             pos: 0,
-                            vars: self.vars.clone(),
+                            vars: self.vars,
                             abs_depth: 0,
+                            depth: self.depth + 1,
+                            iter_budget: self.iter_budget,
                         };
                         start_val = Some(sub_p.parse_add_sub()?);
                     }
@@ -738,8 +765,10 @@ impl<'a> MathParser<'a> {
                     let mut sub_p = MathParser {
                         tokens: &self.tokens[s..e],
                         pos: 0,
-                        vars: self.vars.clone(),
+                        vars: self.vars,
                         abs_depth: 0,
+                        depth: self.depth + 1,
+                        iter_budget: self.iter_budget,
                     };
                     end_val = Some(sub_p.parse_add_sub()?);
                     self.pos = if matches!(self.tokens.get(self.pos), Some(MathTok::LBrace)) {
@@ -804,22 +833,46 @@ impl<'a> MathParser<'a> {
 
         let mut acc = if is_sum { 0.0 } else { 1.0 };
         if hi >= lo {
-            let mut local_vars = self.vars.clone();
+            let prev_binding = self.vars.get(&var_name).copied();
+            let mut loop_res: Result<(), String> = Ok(());
             for k in lo..=hi {
-                local_vars.insert(var_name.clone(), k as f64);
+                if *self.iter_budget == 0 {
+                    loop_res = Err("Summation/product operation budget exceeded".to_string());
+                    break;
+                }
+                *self.iter_budget -= 1;
+                self.vars.insert(var_name.clone(), k as f64);
                 let mut body_p = MathParser {
                     tokens: body_slice,
                     pos: 0,
-                    vars: local_vars.clone(),
+                    vars: self.vars,
                     abs_depth: 0,
+                    depth: self.depth + 1,
+                    iter_budget: self.iter_budget,
                 };
-                let term = body_p.parse_add_sub()?;
-                if is_sum {
-                    acc += term;
-                } else {
-                    acc *= term;
+                match body_p.parse_add_sub() {
+                    Ok(term) => {
+                        if is_sum {
+                            acc += term;
+                        } else {
+                            acc *= term;
+                        }
+                    }
+                    Err(e) => {
+                        loop_res = Err(e);
+                        break;
+                    }
                 }
             }
+            match prev_binding {
+                Some(v) => {
+                    self.vars.insert(var_name, v);
+                }
+                None => {
+                    self.vars.remove(&var_name);
+                }
+            }
+            loop_res?;
         }
         Ok(acc)
     }
@@ -982,11 +1035,15 @@ pub fn eval_math_expression_with_vars(
     if tokens.is_empty() {
         return Err("Empty expression".to_string());
     }
+    let mut local_vars = vars.clone();
+    let mut iter_budget = MAX_ITER_TOTAL_OPS;
     let mut parser = MathParser {
         tokens: &tokens,
         pos: 0,
-        vars: vars.clone(),
+        vars: &mut local_vars,
         abs_depth: 0,
+        depth: 0,
+        iter_budget: &mut iter_budget,
     };
     let val = parser.parse_add_sub()?;
     if parser.pos < tokens.len() {
@@ -1445,6 +1502,9 @@ impl<'a> TableEvalCtx<'a> {
         if let Some(cached) = self.memo.get(&(r, c)) {
             return cached.clone();
         }
+        if self.visiting.len() >= MAX_CALC_DEPTH {
+            return Err("#DEPTH!".to_string());
+        }
         if !self.visiting.insert((r, c)) {
             return Err("#CYCLE!".to_string());
         }
@@ -1460,6 +1520,7 @@ impl<'a> TableEvalCtx<'a> {
                         cur_row: r,
                         cur_col: c,
                         ctx: self,
+                        depth: 0,
                     };
                     match parser.parse_compare() {
                         Ok(val) if parser.pos == toks.len() => Ok(val),
@@ -1563,6 +1624,7 @@ struct XlParser<'a, 'b> {
     cur_row: usize,
     cur_col: usize,
     ctx: &'a mut TableEvalCtx<'b>,
+    depth: usize,
 }
 
 impl<'a, 'b> XlParser<'a, 'b> {
@@ -1579,6 +1641,16 @@ impl<'a, 'b> XlParser<'a, 'b> {
     }
 
     fn parse_compare(&mut self) -> Result<CellVal, String> {
+        if self.depth >= MAX_CALC_DEPTH {
+            return Err("#DEPTH!".to_string());
+        }
+        self.depth += 1;
+        let res = self.parse_compare_inner();
+        self.depth -= 1;
+        res
+    }
+
+    fn parse_compare_inner(&mut self) -> Result<CellVal, String> {
         let lhs = self.parse_add_sub()?;
         let op = match self.peek() {
             Some(XlTok::Eq) => Some("eq"),
@@ -1667,14 +1739,23 @@ impl<'a, 'b> XlParser<'a, 'b> {
     }
 
     fn parse_unary(&mut self) -> Result<CellVal, String> {
+        if self.depth >= MAX_CALC_DEPTH {
+            return Err("#DEPTH!".to_string());
+        }
         match self.peek() {
             Some(XlTok::Plus) => {
                 self.next();
-                Ok(CellVal::Num(self.parse_unary()?.as_f64()?))
+                self.depth += 1;
+                let r = self.parse_unary();
+                self.depth -= 1;
+                Ok(CellVal::Num(r?.as_f64()?))
             }
             Some(XlTok::Minus) => {
                 self.next();
-                Ok(CellVal::Num(-self.parse_unary()?.as_f64()?))
+                self.depth += 1;
+                let r = self.parse_unary();
+                self.depth -= 1;
+                Ok(CellVal::Num(-r?.as_f64()?))
             }
             _ => self.parse_power(),
         }
@@ -1704,9 +1785,19 @@ impl<'a, 'b> XlParser<'a, 'b> {
                 let (r0, c0) = parse_cell_ref(a).ok_or_else(|| "#REF!".to_string())?;
                 let (r1, c1) = parse_cell_ref(b).ok_or_else(|| "#REF!".to_string())?;
                 self.pos += 3;
-                let mut vals = Vec::new();
-                for r in r0.min(r1)..=r0.max(r1) {
-                    for c in c0.min(c1)..=c0.max(c1) {
+                let r_lo = r0.min(r1);
+                let r_hi = r0.max(r1);
+                let c_lo = c0.min(c1);
+                let c_hi = c0.max(c1);
+                if r_hi >= self.ctx.rows.len()
+                    || (r_lo..=r_hi).any(|r| c_hi >= self.ctx.rows[r].len())
+                {
+                    return Err("#REF!".to_string());
+                }
+                let count = (r_hi - r_lo + 1).saturating_mul(c_hi - c_lo + 1);
+                let mut vals = Vec::with_capacity(count.min(4096));
+                for r in r_lo..=r_hi {
+                    for c in c_lo..=c_hi {
                         vals.push(self.ctx.eval_cell(r, c)?);
                     }
                 }
@@ -2138,5 +2229,20 @@ mod tests {
         let esc_eval = evaluate_table_grid(&escaped_rows);
         assert_eq!(esc_eval[0][2], "45");
         assert_eq!(esc_eval[0][3], "1");
+    }
+
+    #[test]
+    fn binom_and_nested_sum_guards_prevent_cpu_freeze_and_stack_overflow() {
+        let huge = binom_f64(1e9, 5e8).expect("huge binom must short-circuit cleanly");
+        assert!(huge.is_infinite());
+
+        let nested_res = eval_math_expression(r"\sum_{i=1}^{1000} \sum_{j=1}^{1000} 1");
+        assert!(
+            nested_res.is_err(),
+            "nested summation exceeding op budget must return error instead of hanging"
+        );
+
+        let deep_parens = format!("{}1{}", "(".repeat(400), ")".repeat(400));
+        assert!(eval_math_expression(&deep_parens).is_err());
     }
 }

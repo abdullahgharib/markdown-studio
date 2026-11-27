@@ -5,9 +5,9 @@ use std::sync::{Arc, Weak};
 use eframe::egui;
 use egui::epaint::text::{FontFamily, FontId, LayoutJob, TextFormat};
 use egui::{Color32, Id, Pos2, Rect, Response, Sense, Stroke, Vec2};
-use rustc_hash::{FxHashMap, FxHasher};
+use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 
-use crate::document::math::{make_font_id, offscreen_fonts_2x, RgbaCanvas};
+use crate::document::math::{make_font_id, offscreen_fonts_2x, MAX_CANVAS_PIXELS, RgbaCanvas};
 use crate::ui::theme::{ThemeMode, WordTheme};
 
 /// Built-in starter templates offered in the WYSIWYG Mermaid toolbar.
@@ -750,11 +750,12 @@ fn layout_layered_graph(graph: &mut GraphModel, max_label_w: f32) {
         return;
     }
 
-    // 1. Build adjacency and break cycles via DFS back-edge detection for clean layering
+    // 1. Build adjacency and break cycles via iterative DFS back-edge detection for clean layering
     let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
     let mut in_deg = vec![0usize; n];
+    let mut seen_edges = FxHashSet::default();
     for e in &graph.edges {
-        if e.from != e.to && !adj[e.from].contains(&e.to) {
+        if e.from != e.to && seen_edges.insert((e.from, e.to)) {
             adj[e.from].push(e.to);
             in_deg[e.to] += 1;
         }
@@ -763,34 +764,43 @@ fn layout_layered_graph(graph: &mut GraphModel, max_label_w: f32) {
     let mut state = vec![0u8; n]; // 0=unvisited, 1=visiting, 2=done
     let mut dag_adj: Vec<Vec<usize>> = vec![Vec::new(); n];
     let mut dag_in = vec![0usize; n];
-    fn dfs_dag(
-        u: usize,
-        adj: &[Vec<usize>],
-        state: &mut [u8],
-        dag_adj: &mut [Vec<usize>],
-        dag_in: &mut [usize],
-    ) {
-        state[u] = 1;
-        for &v in &adj[u] {
-            if state[v] == 0 {
-                dag_adj[u].push(v);
-                dag_in[v] += 1;
-                dfs_dag(v, adj, state, dag_adj, dag_in);
-            } else if state[v] == 2 {
-                dag_adj[u].push(v);
-                dag_in[v] += 1;
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+    let run_iter_dfs = |start: usize,
+                        adj: &[Vec<usize>],
+                        state: &mut [u8],
+                        dag_adj: &mut [Vec<usize>],
+                        dag_in: &mut [usize],
+                        stack: &mut Vec<(usize, usize)>| {
+        state[start] = 1;
+        stack.push((start, 0));
+        while let Some((u, idx)) = stack.last_mut() {
+            let u = *u;
+            if *idx < adj[u].len() {
+                let v = adj[u][*idx];
+                *idx += 1;
+                if state[v] == 0 {
+                    dag_adj[u].push(v);
+                    dag_in[v] += 1;
+                    state[v] = 1;
+                    stack.push((v, 0));
+                } else if state[v] == 2 {
+                    dag_adj[u].push(v);
+                    dag_in[v] += 1;
+                }
+            } else {
+                state[u] = 2;
+                stack.pop();
             }
         }
-        state[u] = 2;
-    }
+    };
     for i in 0..n {
         if in_deg[i] == 0 && state[i] == 0 {
-            dfs_dag(i, &adj, &mut state, &mut dag_adj, &mut dag_in);
+            run_iter_dfs(i, &adj, &mut state, &mut dag_adj, &mut dag_in, &mut stack);
         }
     }
     for i in 0..n {
         if state[i] == 0 {
-            dfs_dag(i, &adj, &mut state, &mut dag_adj, &mut dag_in);
+            run_iter_dfs(i, &adj, &mut state, &mut dag_adj, &mut dag_in, &mut stack);
         }
     }
 
@@ -1216,6 +1226,7 @@ fn marker_extent(kind: EdgeEndpointKind) -> f32 {
 
 fn compute_skip_curve_offset(
     graph: &GraphModel,
+    layer_nodes: &[Vec<usize>],
     edge: &GraphEdge,
     nx: f32,
     ny: f32,
@@ -1236,18 +1247,16 @@ fn compute_skip_curve_offset(
     };
 
     let lo_layer = n_from.layer.min(n_to.layer);
-    let hi_layer = n_from.layer.max(n_to.layer);
+    let hi_layer = n_from.layer.max(n_to.layer).min(layer_nodes.len().saturating_sub(1));
 
-    let eval_side = |sign: f32| -> f32 {
-        let mut req_mid_disp = 24.0_f32;
-        for (idx, node) in graph.nodes.iter().enumerate() {
+    let mut pos_disp = 24.0_f32;
+    let mut neg_disp = 24.0_f32;
+    for layer_list in &layer_nodes[lo_layer..=hi_layer] {
+        for &idx in layer_list {
             if idx == edge.from || idx == edge.to {
                 continue;
             }
-            let in_layer_band = node.layer >= lo_layer && node.layer <= hi_layer;
-            if !in_layer_band {
-                continue;
-            }
+            let node = &graph.nodes[idx];
             let rx = node.cx - n_from.cx;
             let ry = node.cy - n_from.cy;
             let proj = rx * ux + ry * uy;
@@ -1257,17 +1266,17 @@ fn compute_skip_curve_offset(
             }
             let perp = rx * nx + ry * ny;
             let half_perp = 0.5 * (node.w * nx.abs() + node.h * ny.abs());
-            let signed_perp = perp * sign;
-            // If node overlaps or lies on this side of the chord, push midpoint cleanly past it
-            if signed_perp + half_perp + pill_half > 0.0 {
-                req_mid_disp = req_mid_disp.max(signed_perp + half_perp + pill_half + 6.0);
+            let pos_clear = perp + half_perp + pill_half;
+            if pos_clear > 0.0 {
+                pos_disp = pos_disp.max(pos_clear + 6.0);
+            }
+            let neg_clear = -perp + half_perp + pill_half;
+            if neg_clear > 0.0 {
+                neg_disp = neg_disp.max(neg_clear + 6.0);
             }
         }
-        req_mid_disp
-    };
+    }
 
-    let pos_disp = eval_side(1.0);
-    let neg_disp = eval_side(-1.0);
     let prefer_pos = if horiz { ny >= 0.0 } else { nx >= 0.0 };
     let (chosen_sign, chosen_mid_disp) = if (pos_disp - neg_disp).abs() < 2.0 {
         if prefer_pos { (1.0, pos_disp) } else { (-1.0, neg_disp) }
@@ -1473,6 +1482,11 @@ fn build_graph_scene(
     }
 
     // 2. Edges & labels (spread parallel edges cleanly with normal offset)
+    let max_layer = graph.nodes.iter().map(|n| n.layer).max().unwrap_or(0);
+    let mut layer_nodes: Vec<Vec<usize>> = vec![Vec::new(); max_layer + 1];
+    for (idx, node) in graph.nodes.iter().enumerate() {
+        layer_nodes[node.layer].push(idx);
+    }
     let mut pair_counts: HashMap<(usize, usize), usize> = HashMap::new();
     for e in &graph.edges {
         let key = (e.from.min(e.to), e.from.max(e.to));
@@ -1566,7 +1580,7 @@ fn build_graph_scene(
         let curve_offset = if total_pair > 1 {
             (cur_slot as f32 - (total_pair - 1) as f32 * 0.5) * 32.0
         } else if (n_from.layer as isize - n_to.layer as isize).abs() > 1 {
-            compute_skip_curve_offset(&graph, edge, nx, ny, label_dims)
+            compute_skip_curve_offset(&graph, &layer_nodes, edge, nx, ny, label_dims)
         } else {
             0.0
         };
@@ -3858,7 +3872,10 @@ struct MermaidSceneCache {
 }
 
 impl MermaidSceneCache {
-    const MAX_ENTRIES: usize = 64;
+    fn max_entries() -> usize {
+        let ram_gb = (crate::document::system_total_memory_bytes() / (1024 * 1024 * 1024)).max(1);
+        (ram_gb.saturating_mul(32) as usize).clamp(64, 512)
+    }
 
     fn sync_atlas(&mut self, cur_atlas: &Arc<egui::epaint::mutex::Mutex<egui::epaint::TextureAtlas>>) {
         if self.atlas.as_ptr() != Arc::as_ptr(cur_atlas) {
@@ -3880,13 +3897,14 @@ impl MermaidSceneCache {
     }
 
     fn insert(&mut self, key: (u64, ThemeMode, u32), code: &str, scene: Arc<DiagramScene>) {
-        if self.entries.len() >= Self::MAX_ENTRIES && !self.entries.contains_key(&key) {
+        let cap = Self::max_entries();
+        if self.entries.len() >= cap && !self.entries.contains_key(&key) {
             let mut ticks: Vec<u64> = self.entries.values().map(|e| e.last_tick).collect();
             let mid = ticks.len() / 2;
             let (_, cutoff, _) = ticks.select_nth_unstable(mid);
             let cutoff_val = *cutoff;
             self.entries.retain(|_, v| v.last_tick > cutoff_val);
-            if self.entries.len() >= Self::MAX_ENTRIES {
+            if self.entries.len() >= cap {
                 self.entries.clear();
             }
         }
@@ -4339,8 +4357,14 @@ pub fn render_mermaid_to_png_bytes(code: &str, scale: f32) -> Option<(Vec<u8>, u
 
     if (req_scale - render_scale).abs() > 0.05 {
         let img = image::RgbaImage::from_raw(canvas.width, canvas.height, canvas.data)?;
-        let target_w = ((scene.width * req_scale).round() as u32).max(1);
-        let target_h = ((scene.height * req_scale).round() as u32).max(1);
+        let mut target_w = ((scene.width * req_scale).round() as u32).clamp(1, 8192);
+        let mut target_h = ((scene.height * req_scale).round() as u32).clamp(1, 8192);
+        let target_px = (target_w as u64).saturating_mul(target_h as u64);
+        if target_px > MAX_CANVAS_PIXELS {
+            let factor = (MAX_CANVAS_PIXELS as f64 / target_px as f64).sqrt() as f32;
+            target_w = ((target_w as f32 * factor).round() as u32).max(1);
+            target_h = ((target_h as f32 * factor).round() as u32).max(1);
+        }
         let resized =
             image::imageops::resize(&img, target_w, target_h, image::imageops::FilterType::CatmullRom);
         let mut out = std::io::Cursor::new(Vec::new());
@@ -4586,16 +4610,17 @@ mod tests {
     #[test]
     fn mermaid_scene_cache_hits_and_evicts_oldest_half_when_full() {
         let mut cache = MermaidSceneCache::default();
+        let cap = MermaidSceneCache::max_entries();
         let sample = Arc::new(compile_mermaid_scene(
             MERMAID_TEMPLATES[0].1,
             DiagramPalette::export_light(),
         ));
-        for i in 0..MermaidSceneCache::MAX_ENTRIES {
+        for i in 0..cap {
             let code = format!("flowchart LR\nA{i} --> B{i}");
             let key = (hash_mermaid_code(&code), ThemeMode::Light, 1.0_f32.to_bits());
             cache.insert(key, &code, Arc::clone(&sample));
         }
-        assert_eq!(cache.entries.len(), MermaidSceneCache::MAX_ENTRIES);
+        assert_eq!(cache.entries.len(), cap);
 
         // Touch entry 0 so it becomes newest and survives eviction
         let code0 = "flowchart LR\nA0 --> B0";
@@ -4606,8 +4631,8 @@ mod tests {
         let extra = "flowchart LR\nExtra --> End";
         let extra_key = (hash_mermaid_code(extra), ThemeMode::Light, 1.0_f32.to_bits());
         cache.insert(extra_key, extra, Arc::clone(&sample));
-        assert!(cache.entries.len() < MermaidSceneCache::MAX_ENTRIES);
-        assert!(cache.entries.len() >= MermaidSceneCache::MAX_ENTRIES / 2);
+        assert!(cache.entries.len() < cap);
+        assert!(cache.entries.len() >= cap / 2);
         assert!(cache.get(key0, code0).is_some());
         assert!(cache.get(extra_key, extra).is_some());
     }

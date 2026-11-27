@@ -112,8 +112,12 @@ impl BacktickFailCache {
 
 fn find_closing_math_pair(line: &str, start: usize, close: &str) -> Option<usize> {
     let bytes = line.as_bytes();
+    let close_bytes = close.as_bytes();
+    let first_byte = close_bytes[0];
     let mut i = start;
-    while i + close.len() <= bytes.len() {
+    while i + close_bytes.len() <= bytes.len() {
+        let rel = memchr::memchr2(b'\\', first_byte, &bytes[i..])?;
+        i += rel;
         if bytes[i] == b'\\' && close == "$$" {
             i += 1;
             if i < bytes.len() {
@@ -121,7 +125,7 @@ fn find_closing_math_pair(line: &str, start: usize, close: &str) -> Option<usize
             }
             continue;
         }
-        if line[i..].starts_with(close) && !is_escaped_at(bytes, i) {
+        if bytes[i..].starts_with(close_bytes) && !is_escaped_at(bytes, i) {
             return Some(i);
         }
         i += line[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
@@ -146,6 +150,10 @@ fn find_closing_inline_dollar(
     let len = bytes.len();
     let mut i = start;
     while i < len {
+        let Some(rel) = memchr::memchr3(b'\\', b'`', b'$', &bytes[i..]) else {
+            return (None, true);
+        };
+        i += rel;
         if bytes[i] == b'\\' {
             i += 1;
             if i < len {
@@ -180,7 +188,6 @@ fn find_closing_inline_dollar(
             }
             return (None, false);
         }
-        i += line[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
     }
     (None, true)
 }
@@ -384,16 +391,13 @@ fn find_exact_backtick_run(haystack: &str, ticks: usize) -> Option<usize> {
     let len = bytes.len();
     let mut i = 0usize;
     while i < len {
-        if bytes[i] == b'`' {
-            let run_len = bytes[i..].iter().take_while(|&&b| b == b'`').count();
-            if run_len == ticks {
-                return Some(i);
-            }
-            i += run_len;
-        } else {
-            let ch_len = haystack[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
-            i += ch_len;
+        let rel = memchr::memchr(b'`', &bytes[i..])?;
+        i += rel;
+        let run_len = bytes[i..].iter().take_while(|&&b| b == b'`').count();
+        if run_len == ticks {
+            return Some(i);
         }
+        i += run_len;
     }
     None
 }
@@ -609,6 +613,62 @@ fn needs_inline_or_heading_norm(line: &str) -> bool {
 struct PreprocessState {
     active_fence: Option<(u8, usize)>,
     active_math_block: Option<(usize, &'static str)>,
+    failed_dollar_until: usize,
+    failed_bracket_until: usize,
+}
+
+fn line_has_reference_or_footnote_def(trimmed: &str) -> bool {
+    if !trimmed.starts_with('[') {
+        return false;
+    }
+    trimmed.contains("]:")
+}
+
+fn update_html_block_tracker(trimmed: &str, open_end_token: &mut Option<&'static str>) {
+    if let Some(end_tok) = *open_end_token {
+        if trimmed.contains(end_tok) {
+            *open_end_token = None;
+        }
+        return;
+    }
+    if trimmed.starts_with("<!--") && !trimmed[4..].contains("-->") {
+        *open_end_token = Some("-->");
+    } else if trimmed.starts_with("<![CDATA[") && !trimmed[9..].contains("]]>") {
+        *open_end_token = Some("]]>");
+    } else if trimmed.starts_with("<?") && !trimmed[2..].contains("?>") {
+        *open_end_token = Some("?>");
+    } else if trimmed.starts_with('<') {
+        let lower = trimmed.get(..12).unwrap_or(trimmed).to_ascii_lowercase();
+        for (open_pat, close_pat) in [
+            ("<pre", "</pre>"),
+            ("<script", "</script>"),
+            ("<style", "</style>"),
+            ("<textarea", "</textarea>"),
+        ] {
+            if lower.starts_with(open_pat)
+                && !trimmed.to_ascii_lowercase().contains(close_pat)
+            {
+                *open_end_token = Some(close_pat);
+                return;
+            }
+        }
+    }
+}
+
+fn is_safe_top_level_heading_split(rest: &str, state: &PreprocessState, in_html: bool) -> bool {
+    if state.active_fence.is_some() || state.active_math_block.is_some() || in_html {
+        return false;
+    }
+    let trimmed = rest.trim_start_matches(' ');
+    if rest.len() - trimmed.len() > 3 {
+        return false;
+    }
+    let hashes = trimmed.bytes().take_while(|&b| b == b'#').count();
+    (1..=6).contains(&hashes)
+        && trimmed[hashes..]
+            .chars()
+            .next()
+            .is_none_or(|c| c == ' ' || c == '\t')
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -622,7 +682,7 @@ fn process_line_for_ir<'a, F>(
     out: &mut String,
     metas: &mut Vec<LineMeta>,
 ) where
-    F: FnMut(&str) -> Option<usize>,
+    F: FnMut(&str) -> (Option<usize>, usize),
 {
     let (alignment, base_indent, mut rest) = parse_line_block_meta(clean_cr);
     let mut extra_indent = 0u8;
@@ -686,13 +746,25 @@ fn process_line_for_ir<'a, F>(
                 state.active_fence = Some((f_char, f_len));
                 Cow::Borrowed(rest)
             } else if let Some((_, _)) = math_delim.filter(|&(_, close_d)| {
-                find_closing_math_pair(trimmed_both, 2, close_d).is_none()
-                    && find_math_close(close_d)
-                        .map(|end_j| {
-                            state.active_math_block = Some((end_j, close_d));
-                            true
-                        })
-                        .unwrap_or(false)
+                if find_closing_math_pair(trimmed_both, 2, close_d).is_some() {
+                    return false;
+                }
+                let failed_until = if close_d == "$$" {
+                    &mut state.failed_dollar_until
+                } else {
+                    &mut state.failed_bracket_until
+                };
+                if idx < *failed_until {
+                    return false;
+                }
+                let (found, scanned_until) = find_math_close(close_d);
+                if let Some(end_j) = found {
+                    state.active_math_block = Some((end_j, close_d));
+                    true
+                } else {
+                    *failed_until = (*failed_until).max(scanned_until);
+                    false
+                }
             }) {
                 let after_open = trimmed_both[2..].trim_start();
                 Cow::Owned(wrap_math_sentinel(MATH_SENTINEL_BLK_OPEN, after_open))
@@ -737,15 +809,17 @@ fn preprocess_markdown_for_ir(markdown: &str) -> (String, Vec<LineMeta>) {
             has_cr,
             has_trailing_nl,
             |close_delim| {
-                for (j, raw_j) in iter.clone().take(256) {
+                let mut last_seen = idx + 1;
+                for (j, raw_j) in iter.clone() {
+                    last_seen = j;
                     let clean_j = raw_j.strip_suffix('\r').unwrap_or(raw_j);
                     match classify_multiline_math_line(clean_j, close_delim) {
-                        MathLookahead::Close => return Some(j),
-                        MathLookahead::AbortFence => return None,
+                        MathLookahead::Close => return (Some(j), j),
+                        MathLookahead::AbortFence => return (None, j),
                         MathLookahead::Continue => {}
                     }
                 }
-                None
+                (None, last_seen.saturating_add(1))
             },
             &mut out,
             &mut metas,
@@ -755,21 +829,87 @@ fn preprocess_markdown_for_ir(markdown: &str) -> (String, Vec<LineMeta>) {
     (out, metas)
 }
 
-fn preprocess_rope_for_ir(rope: &ropey::Rope) -> (String, Vec<LineMeta>) {
+#[derive(Debug, Clone, Copy)]
+struct RopeChunkBoundary {
+    line_idx: usize,
+    stripped_byte_offset: usize,
+}
+
+fn offset_block_source_lines(block: &mut DocBlock, delta: usize) {
+    if delta == 0 {
+        return;
+    }
+    match block {
+        DocBlock::Heading { source_lines, .. }
+        | DocBlock::Paragraph { source_lines, .. }
+        | DocBlock::CodeBlock { source_lines, .. }
+        | DocBlock::Table { source_lines, .. }
+        | DocBlock::ThematicBreak { source_lines } => {
+            source_lines.start += delta;
+            source_lines.end += delta;
+        }
+        DocBlock::BlockQuote {
+            blocks,
+            source_lines,
+            ..
+        }
+        | DocBlock::FootnoteDefinition {
+            blocks,
+            source_lines,
+            ..
+        } => {
+            source_lines.start += delta;
+            source_lines.end += delta;
+            for inner in blocks {
+                offset_block_source_lines(inner, delta);
+            }
+        }
+        DocBlock::List {
+            items,
+            source_lines,
+            ..
+        } => {
+            source_lines.start += delta;
+            source_lines.end += delta;
+            for item in items {
+                for inner in &mut item.blocks {
+                    offset_block_source_lines(inner, delta);
+                }
+            }
+        }
+    }
+}
+
+fn preprocess_rope_for_ir_cancellable(
+    rope: &ropey::Rope,
+    cancel: Option<(&std::sync::atomic::AtomicU64, u64)>,
+) -> Option<(String, Vec<LineMeta>, Vec<RopeChunkBoundary>, bool)> {
     let total_lines = rope.len_lines();
     let mut metas = Vec::with_capacity(total_lines);
     let mut out = String::with_capacity(rope.len_bytes() + 16);
     let mut state = PreprocessState::default();
     let mut line_scratch = String::with_capacity(256);
     let mut lookahead_scratch = String::with_capacity(256);
+    let mut split_points: Vec<RopeChunkBoundary> = Vec::new();
+    let mut has_cross_chunk_refs = false;
+    let mut prev_was_blank = false;
+    let mut open_html_end: Option<&'static str> = None;
+    let collect_splits = rope.len_bytes() >= 256 * 1024;
 
     for (idx, line_slice) in rope.lines().enumerate() {
+        if idx & 0xFF == 0
+            && let Some((atom, expected)) = cancel
+            && atom.load(std::sync::atomic::Ordering::Relaxed) != expected
+        {
+            return None;
+        }
         let has_trailing_nl = idx + 1 < total_lines;
         if has_trailing_nl {
             let lc = line_slice.len_chars();
             if lc == 0 || line_slice.char(lc - 1) != '\n' {
                 // Non-`\n` line break (e.g. lone `\r` or U+2028) — match `split('\n')` verbatim.
-                return preprocess_markdown_for_ir(&rope.to_string());
+                let (s, m) = preprocess_markdown_for_ir(&rope.to_string());
+                return Some((s, m, Vec::new(), true));
             }
         }
         let raw_line: &str = if let Some(s) = line_slice.as_str() {
@@ -785,6 +925,27 @@ fn preprocess_rope_for_ir(rope: &ropey::Rope) -> (String, Vec<LineMeta>) {
         let clean_cr = clean_nl.strip_suffix('\r').unwrap_or(clean_nl);
         let has_cr = clean_nl.len() > clean_cr.len();
 
+        let line_byte_start = out.len();
+        let (_, _, post_meta) = parse_line_block_meta(clean_cr);
+        let post_trimmed = post_meta.trim_start_matches([' ', '\t']);
+        if state.active_fence.is_none() && state.active_math_block.is_none() {
+            if !has_cross_chunk_refs && line_has_reference_or_footnote_def(post_trimmed) {
+                has_cross_chunk_refs = true;
+            }
+            if collect_splits
+                && idx > 0
+                && prev_was_blank
+                && !has_cross_chunk_refs
+                && is_safe_top_level_heading_split(post_meta, &state, open_html_end.is_some())
+            {
+                split_points.push(RopeChunkBoundary {
+                    line_idx: idx,
+                    stripped_byte_offset: line_byte_start,
+                });
+            }
+            update_html_block_tracker(post_trimmed, &mut open_html_end);
+        }
+
         process_line_for_ir(
             &mut state,
             idx,
@@ -792,8 +953,13 @@ fn preprocess_rope_for_ir(rope: &ropey::Rope) -> (String, Vec<LineMeta>) {
             has_cr,
             has_trailing_nl,
             |close_delim| {
-                let limit = (idx + 257).min(total_lines);
-                for j in (idx + 1)..limit {
+                for j in (idx + 1)..total_lines {
+                    if (j - idx) & 0xFF == 0
+                        && let Some((atom, expected)) = cancel
+                        && atom.load(std::sync::atomic::Ordering::Relaxed) != expected
+                    {
+                        return (None, j);
+                    }
                     let ls = rope.line(j);
                     let raw_j: &str = if let Some(s) = ls.as_str() {
                         s
@@ -807,19 +973,21 @@ fn preprocess_rope_for_ir(rope: &ropey::Rope) -> (String, Vec<LineMeta>) {
                     let clean_nl_j = raw_j.strip_suffix('\n').unwrap_or(raw_j);
                     let clean_j = clean_nl_j.strip_suffix('\r').unwrap_or(clean_nl_j);
                     match classify_multiline_math_line(clean_j, close_delim) {
-                        MathLookahead::Close => return Some(j),
-                        MathLookahead::AbortFence => return None,
+                        MathLookahead::Close => return (Some(j), j),
+                        MathLookahead::AbortFence => return (None, j),
                         MathLookahead::Continue => {}
                     }
                 }
-                None
+                (None, total_lines)
             },
             &mut out,
             &mut metas,
         );
+
+        prev_was_blank = post_trimmed.is_empty();
     }
 
-    (out, metas)
+    Some((out, metas, split_points, has_cross_chunk_refs))
 }
 
 fn convert_preprocessed_to_ir(stripped: &str, line_metas: &[LineMeta]) -> Vec<DocBlock> {
@@ -840,10 +1008,86 @@ pub fn parse_to_ir(markdown: &str) -> Vec<DocBlock> {
 }
 
 /// Streams a `ropey::Rope` directly into the shared `DocBlock` intermediate representation
-/// without first copying the entire buffer into an intermediate `String`.
+/// without first copying the entire buffer into an intermediate `String`, parallelizing large
+/// safe multi-section documents across CPU cores.
 pub fn parse_rope_to_ir(rope: &ropey::Rope) -> Vec<DocBlock> {
-    let (stripped, line_metas) = preprocess_rope_for_ir(rope);
-    convert_preprocessed_to_ir(&stripped, &line_metas)
+    parse_rope_to_ir_cancellable(rope, None).unwrap_or_default()
+}
+
+/// Cancellable variant of `parse_rope_to_ir` that aborts early if `*cancel.0 != cancel.1`.
+pub fn parse_rope_to_ir_cancellable(
+    rope: &ropey::Rope,
+    cancel: Option<(&std::sync::atomic::AtomicU64, u64)>,
+) -> Option<Vec<DocBlock>> {
+    let (stripped, line_metas, split_points, has_cross_chunk_refs) =
+        preprocess_rope_for_ir_cancellable(rope, cancel)?;
+
+    if let Some((atom, expected)) = cancel
+        && atom.load(std::sync::atomic::Ordering::Relaxed) != expected
+    {
+        return None;
+    }
+
+    let workers = crate::document::adaptive_worker_count(8);
+    if has_cross_chunk_refs || workers < 2 || split_points.len() < 2 || stripped.len() < 256 * 1024 {
+        return Some(convert_preprocessed_to_ir(&stripped, &line_metas));
+    }
+
+    // Group heading split points into ~`workers` coarse contiguous chunks of >= 48 KB each.
+    let target_chunk_bytes = (stripped.len() / workers).max(48 * 1024);
+    let mut chunks: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(workers);
+    let mut cur_line = 0usize;
+    let mut cur_byte = 0usize;
+    for sp in &split_points {
+        if sp.stripped_byte_offset.saturating_sub(cur_byte) >= target_chunk_bytes
+            && sp.line_idx > cur_line
+        {
+            chunks.push((cur_line, sp.line_idx, cur_byte, sp.stripped_byte_offset));
+            cur_line = sp.line_idx;
+            cur_byte = sp.stripped_byte_offset;
+        }
+    }
+    if cur_byte < stripped.len() {
+        chunks.push((cur_line, line_metas.len(), cur_byte, stripped.len()));
+    }
+
+    if chunks.len() < 2 {
+        return Some(convert_preprocessed_to_ir(&stripped, &line_metas));
+    }
+
+    let mut parsed_chunks: Vec<Option<Vec<DocBlock>>> = vec![None; chunks.len()];
+    let stripped_ref = stripped.as_str();
+    let metas_ref = line_metas.as_slice();
+    std::thread::scope(|s| {
+        for (slot, &(start_line, end_line, start_byte, end_byte)) in
+            parsed_chunks.iter_mut().zip(chunks.iter())
+        {
+            s.spawn(move || {
+                if let Some((atom, expected)) = cancel
+                    && atom.load(std::sync::atomic::Ordering::Relaxed) != expected
+                {
+                    return;
+                }
+                let mut blocks = convert_preprocessed_to_ir(
+                    &stripped_ref[start_byte..end_byte],
+                    &metas_ref[start_line..end_line.min(metas_ref.len())],
+                );
+                if start_line > 0 {
+                    for b in &mut blocks {
+                        offset_block_source_lines(b, start_line);
+                    }
+                }
+                *slot = Some(blocks);
+            });
+        }
+    });
+
+    let mut all_blocks = Vec::new();
+    for slot in parsed_chunks {
+        let blocks = slot?;
+        all_blocks.extend(blocks);
+    }
+    Some(all_blocks)
 }
 
 /// Serializes a `comrak` AST back to canonical CommonMark + GFM Markdown.
@@ -965,12 +1209,27 @@ fn detect_runs_direction(runs: &[InlineRun]) -> Option<TextDirection> {
     None
 }
 
+const MAX_AST_DEPTH: usize = 128;
+
 fn convert_block_into<'a>(
     node: &'a AstNode<'a>,
     line_metas: &[LineMeta],
     parent_indent: u8,
     out: &mut Vec<DocBlock>,
 ) {
+    convert_block_into_depth(node, line_metas, parent_indent, out, 0);
+}
+
+fn convert_block_into_depth<'a>(
+    node: &'a AstNode<'a>,
+    line_metas: &[LineMeta],
+    parent_indent: u8,
+    out: &mut Vec<DocBlock>,
+    depth: usize,
+) {
+    if depth >= MAX_AST_DEPTH {
+        return;
+    }
     let source_lines = source_lines_from_node(node);
     let meta = meta_for_lines(line_metas, &source_lines);
     let value = std::mem::replace(&mut node.data.borrow_mut().value, NodeValue::Document);
@@ -1070,7 +1329,7 @@ fn convert_block_into<'a>(
             let child_parent_indent = parent_indent.saturating_add(own_indent);
             let mut blocks = Vec::new();
             for child in node.children() {
-                convert_block_into(child, line_metas, child_parent_indent, &mut blocks);
+                convert_block_into_depth(child, line_metas, child_parent_indent, &mut blocks, depth + 1);
             }
             out.push(DocBlock::BlockQuote {
                 blocks,
@@ -1096,7 +1355,7 @@ fn convert_block_into<'a>(
                     NodeValue::Item(_) => {
                         let mut blocks = Vec::new();
                         for sub in child.children() {
-                            convert_block_into(sub, line_metas, child_parent_indent, &mut blocks);
+                            convert_block_into_depth(sub, line_metas, child_parent_indent, &mut blocks, depth + 1);
                         }
                         if blocks.is_empty() {
                             let item_lines = source_lines_from_node(child);
@@ -1117,7 +1376,7 @@ fn convert_block_into<'a>(
                     NodeValue::TaskItem(mark) => {
                         let mut blocks = Vec::new();
                         for sub in child.children() {
-                            convert_block_into(sub, line_metas, child_parent_indent, &mut blocks);
+                            convert_block_into_depth(sub, line_metas, child_parent_indent, &mut blocks, depth + 1);
                         }
                         if blocks.is_empty() {
                             let item_lines = source_lines_from_node(child);
@@ -1196,7 +1455,7 @@ fn convert_block_into<'a>(
         NodeValue::FootnoteDefinition(fd) => {
             let mut blocks = Vec::new();
             for child in node.children() {
-                convert_block_into(child, line_metas, parent_indent, &mut blocks);
+                convert_block_into_depth(child, line_metas, parent_indent, &mut blocks, depth + 1);
             }
             out.push(DocBlock::FootnoteDefinition {
                 name: fd.name,
@@ -1326,6 +1585,18 @@ fn collect_inline_runs<'a>(
     cur_style: &mut InlineStyle,
     out: &mut Vec<InlineRun>,
 ) {
+    collect_inline_runs_depth(node, cur_style, out, 0);
+}
+
+fn collect_inline_runs_depth<'a>(
+    node: &'a AstNode<'a>,
+    cur_style: &mut InlineStyle,
+    out: &mut Vec<InlineRun>,
+    depth: usize,
+) {
+    if depth >= MAX_AST_DEPTH {
+        return;
+    }
     for child in node.children() {
         let val = std::mem::replace(&mut child.data.borrow_mut().value, NodeValue::Document);
         match val {
@@ -1355,31 +1626,31 @@ fn collect_inline_runs<'a>(
             NodeValue::Strong => {
                 let prev = cur_style.bold;
                 cur_style.bold = true;
-                collect_inline_runs(child, cur_style, out);
+                collect_inline_runs_depth(child, cur_style, out, depth + 1);
                 cur_style.bold = prev;
             }
             NodeValue::Emph => {
                 let prev = cur_style.italic;
                 cur_style.italic = true;
-                collect_inline_runs(child, cur_style, out);
+                collect_inline_runs_depth(child, cur_style, out, depth + 1);
                 cur_style.italic = prev;
             }
             NodeValue::Strikethrough => {
                 let prev = cur_style.strikethrough;
                 cur_style.strikethrough = true;
-                collect_inline_runs(child, cur_style, out);
+                collect_inline_runs_depth(child, cur_style, out, depth + 1);
                 cur_style.strikethrough = prev;
             }
             NodeValue::Link(link) => {
                 let prev = cur_style.link_url.take();
                 cur_style.link_url = Some(link.url);
-                collect_inline_runs(child, cur_style, out);
+                collect_inline_runs_depth(child, cur_style, out, depth + 1);
                 cur_style.link_url = prev;
             }
             NodeValue::Image(img) => {
                 let mut alt = Vec::new();
                 let mut alt_style = cur_style.clone();
-                collect_inline_runs(child, &mut alt_style, &mut alt);
+                collect_inline_runs_depth(child, &mut alt_style, &mut alt, depth + 1);
                 let alt_text: String = alt.into_iter().map(|r| r.text).collect();
                 let label = if alt_text.trim().is_empty() {
                     img.url.clone()
@@ -1427,7 +1698,7 @@ fn collect_inline_runs<'a>(
                     push_run(out, raw, cur_style, false);
                 }
             }
-            _ => collect_inline_runs(child, cur_style, out),
+            _ => collect_inline_runs_depth(child, cur_style, out, depth + 1),
         }
     }
 }
@@ -1437,6 +1708,18 @@ fn collect_inline_runs_lines<'a>(
     cur_style: &mut InlineStyle,
     lines: &mut Vec<LineBucket>,
 ) {
+    collect_inline_runs_lines_depth(node, cur_style, lines, 0);
+}
+
+fn collect_inline_runs_lines_depth<'a>(
+    node: &'a AstNode<'a>,
+    cur_style: &mut InlineStyle,
+    lines: &mut Vec<LineBucket>,
+    depth: usize,
+) {
+    if depth >= MAX_AST_DEPTH {
+        return;
+    }
     for child in node.children() {
         let val = std::mem::replace(&mut child.data.borrow_mut().value, NodeValue::Document);
         match val {
@@ -1490,31 +1773,31 @@ fn collect_inline_runs_lines<'a>(
             NodeValue::Strong => {
                 let prev = cur_style.bold;
                 cur_style.bold = true;
-                collect_inline_runs_lines(child, cur_style, lines);
+                collect_inline_runs_lines_depth(child, cur_style, lines, depth + 1);
                 cur_style.bold = prev;
             }
             NodeValue::Emph => {
                 let prev = cur_style.italic;
                 cur_style.italic = true;
-                collect_inline_runs_lines(child, cur_style, lines);
+                collect_inline_runs_lines_depth(child, cur_style, lines, depth + 1);
                 cur_style.italic = prev;
             }
             NodeValue::Strikethrough => {
                 let prev = cur_style.strikethrough;
                 cur_style.strikethrough = true;
-                collect_inline_runs_lines(child, cur_style, lines);
+                collect_inline_runs_lines_depth(child, cur_style, lines, depth + 1);
                 cur_style.strikethrough = prev;
             }
             NodeValue::Link(link) => {
                 let prev = cur_style.link_url.take();
                 cur_style.link_url = Some(link.url);
-                collect_inline_runs_lines(child, cur_style, lines);
+                collect_inline_runs_lines_depth(child, cur_style, lines, depth + 1);
                 cur_style.link_url = prev;
             }
             NodeValue::Image(img) => {
                 let mut alt = Vec::new();
                 let mut alt_style = cur_style.clone();
-                collect_inline_runs(child, &mut alt_style, &mut alt);
+                collect_inline_runs_depth(child, &mut alt_style, &mut alt, depth + 1);
                 let alt_text: String = alt.into_iter().map(|r| r.text).collect();
                 let label = if alt_text.trim().is_empty() {
                     img.url.clone()
@@ -1562,7 +1845,7 @@ fn collect_inline_runs_lines<'a>(
                     push_run(&mut lines.last_mut().unwrap().runs, raw, cur_style, false);
                 }
             }
-            _ => collect_inline_runs_lines(child, cur_style, lines),
+            _ => collect_inline_runs_lines_depth(child, cur_style, lines, depth + 1),
         }
     }
 }
@@ -1655,7 +1938,28 @@ pub fn extract_tables(markdown: &str) -> Vec<TableData> {
     tables
 }
 
+fn is_plain_table_text_fast(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(b, b' ' | b',' | b'.' | b'/' | b'%' | b'$' | b':')
+        })
+        && !s.contains("http:")
+        && !s.contains("https:")
+        && !s.contains("www.")
+        && !s.as_bytes().first().is_some_and(|b| b.is_ascii_digit())
+}
+
 fn format_cell_inlines<'a>(cell_node: &'a AstNode<'a>, opts: &Options<'_>) -> String {
+    let Some(first) = cell_node.first_child() else {
+        return String::new();
+    };
+    if first.next_sibling().is_none()
+        && let NodeValue::Text(ref t) = first.data.borrow().value
+        && is_plain_table_text_fast(t)
+    {
+        return t.clone();
+    }
     let arena = Arena::new();
     let doc = arena.alloc(Node::new(RefCell::new(Ast::new(
         NodeValue::Document,
@@ -1744,6 +2048,17 @@ pub fn build_table_markdown(
             ))));
             row_node.append(cell_node);
             let raw = cells.get(c).map(|s| s.as_str()).unwrap_or("");
+            if raw.is_empty() {
+                continue;
+            }
+            if !raw.contains(['\n', '|']) && is_plain_table_text_fast(raw) {
+                let txt = arena.alloc(Node::new(RefCell::new(Ast::new(
+                    NodeValue::Text(raw.to_string()),
+                    (1, 1).into(),
+                ))));
+                cell_node.append(txt);
+                continue;
+            }
             let sanitized = raw.replace('\n', " ").replace('|', "\\|");
             if !sanitized.is_empty() {
                 let cell_doc = parse_document(&arena, &sanitized, &opts);

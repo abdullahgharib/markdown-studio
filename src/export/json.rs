@@ -1,7 +1,8 @@
-use std::fmt::Write as _;
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::Path;
+
+use ropey::Rope;
 
 use crate::document::unicode::{BlockAlignment, TextDirection};
 use crate::export::ir::{
@@ -23,6 +24,55 @@ struct JsonLinkEntry {
     source_line: usize,
 }
 
+#[derive(Clone, Copy)]
+struct DocStats {
+    word_count: usize,
+    char_count: usize,
+    line_count: usize,
+}
+
+fn stats_from_str(s: &str) -> DocStats {
+    DocStats {
+        word_count: s.split_whitespace().count(),
+        char_count: s.chars().count(),
+        line_count: if s.is_empty() {
+            0
+        } else {
+            s.bytes().filter(|&b| b == b'\n').count() + 1
+        },
+    }
+}
+
+fn stats_from_rope(rope: &Rope) -> DocStats {
+    let mut word_count = 0usize;
+    let mut in_word = false;
+    let mut newline_count = 0usize;
+    for chunk in rope.chunks() {
+        for ch in chunk.chars() {
+            if ch == '\n' {
+                newline_count += 1;
+            }
+            if ch.is_whitespace() {
+                in_word = false;
+            } else if !in_word {
+                in_word = true;
+                word_count += 1;
+            }
+        }
+    }
+    let char_count = rope.len_chars();
+    let line_count = if char_count == 0 {
+        0
+    } else {
+        newline_count + 1
+    };
+    DocStats {
+        word_count,
+        char_count,
+        line_count,
+    }
+}
+
 /// Renders a Markdown document's AST, outline, links, and statistics into a deterministic,
 /// pretty-printed JSON string without external serialization dependencies.
 pub fn render_json_string(
@@ -31,10 +81,19 @@ pub fn render_json_string(
     source_path: Option<&Path>,
     raw_markdown: &str,
 ) -> String {
-    render_json_internal(blocks, title, source_path, raw_markdown, |_| {})
+    let mut buf = Vec::with_capacity(blocks.len() * 256 + 1024);
+    let _ = write_json_stream(
+        &mut buf,
+        blocks,
+        title,
+        source_path,
+        stats_from_str(raw_markdown),
+        |_| {},
+    );
+    String::from_utf8(buf).unwrap_or_default()
 }
 
-/// Exports a structured JSON representation of the document to `path`.
+/// Exports a structured JSON representation of the document by streaming directly to `path`.
 pub fn export_json_to_file(
     blocks: &[DocBlock],
     title: &str,
@@ -43,135 +102,139 @@ pub fn export_json_to_file(
     path: impl AsRef<Path>,
     on_progress: impl FnMut(f32),
 ) -> Result<(), String> {
-    let json = render_json_internal(blocks, title, source_path, raw_markdown, on_progress);
     let file = File::create(path.as_ref()).map_err(|e| e.to_string())?;
-    let mut writer = BufWriter::new(file);
-    writer
-        .write_all(json.as_bytes())
-        .map_err(|e| e.to_string())?;
-    writer.flush().map_err(|e| e.to_string())?;
-    Ok(())
+    let mut writer = BufWriter::with_capacity(64 * 1024, file);
+    write_json_stream(
+        &mut writer,
+        blocks,
+        title,
+        source_path,
+        stats_from_str(raw_markdown),
+        on_progress,
+    )
+    .map_err(|e| e.to_string())?;
+    writer.flush().map_err(|e| e.to_string())
 }
 
-fn render_json_internal(
+/// Exports structured JSON by streaming directly to `path` and computing stats straight from `rope`.
+pub fn export_json_to_file_from_rope(
     blocks: &[DocBlock],
     title: &str,
     source_path: Option<&Path>,
-    raw_markdown: &str,
+    rope: &Rope,
+    path: impl AsRef<Path>,
+    on_progress: impl FnMut(f32),
+) -> Result<(), String> {
+    let file = File::create(path.as_ref()).map_err(|e| e.to_string())?;
+    let mut writer = BufWriter::with_capacity(64 * 1024, file);
+    write_json_stream(
+        &mut writer,
+        blocks,
+        title,
+        source_path,
+        stats_from_rope(rope),
+        on_progress,
+    )
+    .map_err(|e| e.to_string())?;
+    writer.flush().map_err(|e| e.to_string())
+}
+
+fn write_json_stream<W: Write>(
+    w: &mut W,
+    blocks: &[DocBlock],
+    title: &str,
+    source_path: Option<&Path>,
+    stats: DocStats,
     mut on_progress: impl FnMut(f32),
-) -> String {
+) -> io::Result<()> {
     let mut outline_slugs = SlugTracker::new();
     let mut outline = Vec::new();
     let mut links = Vec::new();
     collect_metadata(blocks, &mut outline_slugs, &mut outline, &mut links);
 
-    let word_count = raw_markdown.split_whitespace().count();
-    let char_count = raw_markdown.chars().count();
-    let line_count = if raw_markdown.is_empty() {
-        0
-    } else {
-        raw_markdown.bytes().filter(|&b| b == b'\n').count() + 1
-    };
-
-    let mut out = String::with_capacity(blocks.len() * 256 + 1024);
-    out.push_str("{\n");
-    push_kv_str(&mut out, 1, "format", "markdown-studio-document", true);
-    push_kv_str(&mut out, 1, "version", crate::APP_VERSION, true);
-    push_kv_str(&mut out, 1, "title", title, true);
+    w.write_all(b"{\n")?;
+    write_kv_str(w, 1, "format", "markdown-studio-document", true)?;
+    write_kv_str(w, 1, "version", crate::APP_VERSION, true)?;
+    write_kv_str(w, 1, "title", title, true)?;
     match source_path {
-        Some(p) => push_kv_str(&mut out, 1, "source_path", &p.to_string_lossy(), true),
+        Some(p) => write_kv_str(w, 1, "source_path", &p.to_string_lossy(), true)?,
         None => {
-            push_indent(&mut out, 1);
-            out.push_str("\"source_path\": null,\n");
+            write_indent(w, 1)?;
+            w.write_all(b"\"source_path\": null,\n")?;
         }
     }
 
     // Stats object
-    push_indent(&mut out, 1);
-    out.push_str("\"stats\": {\n");
-    push_kv_usize(&mut out, 2, "word_count", word_count, true);
-    push_kv_usize(&mut out, 2, "line_count", line_count, true);
-    push_kv_usize(&mut out, 2, "char_count", char_count, true);
-    push_kv_usize(&mut out, 2, "heading_count", outline.len(), true);
-    push_kv_usize(&mut out, 2, "link_count", links.len(), true);
-    push_kv_usize(&mut out, 2, "block_count", blocks.len(), false);
-    push_indent(&mut out, 1);
-    out.push_str("},\n");
+    write_indent(w, 1)?;
+    w.write_all(b"\"stats\": {\n")?;
+    write_kv_usize(w, 2, "word_count", stats.word_count, true)?;
+    write_kv_usize(w, 2, "line_count", stats.line_count, true)?;
+    write_kv_usize(w, 2, "char_count", stats.char_count, true)?;
+    write_kv_usize(w, 2, "heading_count", outline.len(), true)?;
+    write_kv_usize(w, 2, "link_count", links.len(), true)?;
+    write_kv_usize(w, 2, "block_count", blocks.len(), false)?;
+    write_indent(w, 1)?;
+    w.write_all(b"},\n")?;
 
     // Outline array
-    push_indent(&mut out, 1);
+    write_indent(w, 1)?;
     if outline.is_empty() {
-        out.push_str("\"outline\": [],\n");
+        w.write_all(b"\"outline\": [],\n")?;
     } else {
-        out.push_str("\"outline\": [\n");
+        w.write_all(b"\"outline\": [\n")?;
         for (i, item) in outline.iter().enumerate() {
-            push_indent(&mut out, 2);
-            out.push_str("{\n");
-            push_kv_usize(&mut out, 3, "level", item.level as usize, true);
-            push_kv_str(&mut out, 3, "title", &item.title, true);
-            push_kv_str(&mut out, 3, "slug", &item.slug, true);
-            push_kv_usize(&mut out, 3, "source_line", item.source_line, false);
-            push_indent(&mut out, 2);
-            if i + 1 < outline.len() {
-                out.push_str("},\n");
-            } else {
-                out.push_str("}\n");
-            }
+            write_indent(w, 2)?;
+            w.write_all(b"{\n")?;
+            write_kv_usize(w, 3, "level", item.level as usize, true)?;
+            write_kv_str(w, 3, "title", &item.title, true)?;
+            write_kv_str(w, 3, "slug", &item.slug, true)?;
+            write_kv_usize(w, 3, "source_line", item.source_line, false)?;
+            write_indent(w, 2)?;
+            w.write_all(if i + 1 < outline.len() { b"},\n" } else { b"}\n" })?;
         }
-        push_indent(&mut out, 1);
-        out.push_str("],\n");
+        write_indent(w, 1)?;
+        w.write_all(b"],\n")?;
     }
 
     // Links array
-    push_indent(&mut out, 1);
+    write_indent(w, 1)?;
     if links.is_empty() {
-        out.push_str("\"links\": [],\n");
+        w.write_all(b"\"links\": [],\n")?;
     } else {
-        out.push_str("\"links\": [\n");
+        w.write_all(b"\"links\": [\n")?;
         for (i, link) in links.iter().enumerate() {
-            push_indent(&mut out, 2);
-            out.push_str("{\n");
-            push_kv_str(&mut out, 3, "text", &link.text, true);
-            push_kv_str(&mut out, 3, "url", &link.url, true);
-            push_kv_str(&mut out, 3, "kind", link.kind, true);
-            push_indent(&mut out, 3);
-            match &link.target_slug {
-                Some(slug) => {
-                    let _ = writeln!(out, "\"target_slug\": \"{}\",", escape_json_str(slug));
-                }
-                None => out.push_str("\"target_slug\": null,\n"),
-            }
-            push_kv_usize(&mut out, 3, "source_line", link.source_line, false);
-            push_indent(&mut out, 2);
-            if i + 1 < links.len() {
-                out.push_str("},\n");
-            } else {
-                out.push_str("}\n");
-            }
+            write_indent(w, 2)?;
+            w.write_all(b"{\n")?;
+            write_kv_str(w, 3, "text", &link.text, true)?;
+            write_kv_str(w, 3, "url", &link.url, true)?;
+            write_kv_str(w, 3, "kind", link.kind, true)?;
+            write_kv_opt_str(w, 3, "target_slug", link.target_slug.as_deref(), true)?;
+            write_kv_usize(w, 3, "source_line", link.source_line, false)?;
+            write_indent(w, 2)?;
+            w.write_all(if i + 1 < links.len() { b"},\n" } else { b"}\n" })?;
         }
-        push_indent(&mut out, 1);
-        out.push_str("],\n");
+        write_indent(w, 1)?;
+        w.write_all(b"],\n")?;
     }
 
     // Blocks array
     let mut render_slugs = SlugTracker::new();
-    push_indent(&mut out, 1);
+    write_indent(w, 1)?;
     if blocks.is_empty() {
         on_progress(1.0);
-        out.push_str("\"blocks\": []\n");
+        w.write_all(b"\"blocks\": []\n")?;
     } else {
-        out.push_str("\"blocks\": [\n");
+        w.write_all(b"\"blocks\": [\n")?;
         let total = blocks.len();
         for (i, block) in blocks.iter().enumerate() {
-            write_block_json(&mut out, 2, block, &mut render_slugs, i + 1 < total);
+            write_block_json(w, 2, block, &mut render_slugs, i + 1 < total)?;
             on_progress((i + 1) as f32 / total as f32);
         }
-        push_indent(&mut out, 1);
-        out.push_str("]\n");
+        write_indent(w, 1)?;
+        w.write_all(b"]\n")?;
     }
 
-    out.push_str("}\n");
-    out
+    w.write_all(b"}\n")
 }
 
 fn collect_metadata(
@@ -254,11 +317,7 @@ fn collect_links_from_runs(runs: &[InlineRun], source_line: usize, links: &mut V
                 let slug = heading_slug(&decoded);
                 (
                     "anchor",
-                    if slug.is_empty() {
-                        None
-                    } else {
-                        Some(slug)
-                    },
+                    if slug.is_empty() { None } else { Some(slug) },
                 )
             } else {
                 let lower = trimmed.to_ascii_lowercase();
@@ -286,15 +345,15 @@ fn collect_links_from_runs(runs: &[InlineRun], source_line: usize, links: &mut V
     }
 }
 
-fn write_block_json(
-    out: &mut String,
+fn write_block_json<W: Write>(
+    w: &mut W,
     indent: usize,
     block: &DocBlock,
     slug_tracker: &mut SlugTracker,
     trailing_comma: bool,
-) {
-    push_indent(out, indent);
-    out.push_str("{\n");
+) -> io::Result<()> {
+    write_indent(w, indent)?;
+    w.write_all(b"{\n")?;
     let c = indent + 1;
 
     match block {
@@ -312,15 +371,15 @@ fn write_block_json(
             } else {
                 String::new()
             };
-            push_kv_str(out, c, "type", "heading", true);
-            push_kv_usize(out, c, "level", *level as usize, true);
-            push_kv_str(out, c, "slug", &slug, true);
-            push_kv_str(out, c, "alignment", alignment_str(*alignment), true);
-            push_kv_usize(out, c, "indent_level", *indent_level as usize, true);
-            push_kv_str(out, c, "direction", direction_str(*direction), true);
-            push_source_lines(out, c, source_lines.start, source_lines.end, true);
-            push_kv_str(out, c, "text", &plain, true);
-            push_runs_field(out, c, "runs", runs, false);
+            write_kv_str(w, c, "type", "heading", true)?;
+            write_kv_usize(w, c, "level", *level as usize, true)?;
+            write_kv_str(w, c, "slug", &slug, true)?;
+            write_kv_str(w, c, "alignment", alignment_str(*alignment), true)?;
+            write_kv_usize(w, c, "indent_level", *indent_level as usize, true)?;
+            write_kv_str(w, c, "direction", direction_str(*direction), true)?;
+            write_source_lines(w, c, source_lines.start, source_lines.end, true)?;
+            write_kv_str(w, c, "text", &plain, true)?;
+            write_runs_field(w, c, "runs", runs, false)?;
         }
         DocBlock::Paragraph {
             runs,
@@ -330,13 +389,13 @@ fn write_block_json(
             source_lines,
         } => {
             let plain = runs_to_plain_text(runs);
-            push_kv_str(out, c, "type", "paragraph", true);
-            push_kv_str(out, c, "alignment", alignment_str(*alignment), true);
-            push_kv_usize(out, c, "indent_level", *indent_level as usize, true);
-            push_kv_str(out, c, "direction", direction_str(*direction), true);
-            push_source_lines(out, c, source_lines.start, source_lines.end, true);
-            push_kv_str(out, c, "text", &plain, true);
-            push_runs_field(out, c, "runs", runs, false);
+            write_kv_str(w, c, "type", "paragraph", true)?;
+            write_kv_str(w, c, "alignment", alignment_str(*alignment), true)?;
+            write_kv_usize(w, c, "indent_level", *indent_level as usize, true)?;
+            write_kv_str(w, c, "direction", direction_str(*direction), true)?;
+            write_source_lines(w, c, source_lines.start, source_lines.end, true)?;
+            write_kv_str(w, c, "text", &plain, true)?;
+            write_runs_field(w, c, "runs", runs, false)?;
         }
         DocBlock::BlockQuote {
             blocks,
@@ -344,21 +403,21 @@ fn write_block_json(
             direction,
             source_lines,
         } => {
-            push_kv_str(out, c, "type", "blockquote", true);
-            push_kv_usize(out, c, "indent_level", *indent_level as usize, true);
-            push_kv_str(out, c, "direction", direction_str(*direction), true);
-            push_source_lines(out, c, source_lines.start, source_lines.end, true);
-            push_blocks_field(out, c, "blocks", blocks, slug_tracker, false);
+            write_kv_str(w, c, "type", "blockquote", true)?;
+            write_kv_usize(w, c, "indent_level", *indent_level as usize, true)?;
+            write_kv_str(w, c, "direction", direction_str(*direction), true)?;
+            write_source_lines(w, c, source_lines.start, source_lines.end, true)?;
+            write_blocks_field(w, c, "blocks", blocks, slug_tracker, false)?;
         }
         DocBlock::CodeBlock {
             info,
             code,
             source_lines,
         } => {
-            push_kv_str(out, c, "type", "code_block", true);
-            push_kv_str(out, c, "info", info, true);
-            push_kv_str(out, c, "code", code, true);
-            push_source_lines(out, c, source_lines.start, source_lines.end, false);
+            write_kv_str(w, c, "type", "code_block", true)?;
+            write_kv_str(w, c, "info", info, true)?;
+            write_kv_str(w, c, "code", code, true)?;
+            write_source_lines(w, c, source_lines.start, source_lines.end, false)?;
         }
         DocBlock::List {
             ordered,
@@ -368,37 +427,31 @@ fn write_block_json(
             direction,
             source_lines,
         } => {
-            push_kv_str(out, c, "type", "list", true);
-            push_kv_bool(out, c, "ordered", *ordered, true);
-            push_kv_usize(out, c, "start", *start, true);
-            push_kv_usize(out, c, "indent_level", *indent_level as usize, true);
-            push_kv_str(out, c, "direction", direction_str(*direction), true);
-            push_source_lines(out, c, source_lines.start, source_lines.end, true);
-            push_indent(out, c);
+            write_kv_str(w, c, "type", "list", true)?;
+            write_kv_bool(w, c, "ordered", *ordered, true)?;
+            write_kv_usize(w, c, "start", *start, true)?;
+            write_kv_usize(w, c, "indent_level", *indent_level as usize, true)?;
+            write_kv_str(w, c, "direction", direction_str(*direction), true)?;
+            write_source_lines(w, c, source_lines.start, source_lines.end, true)?;
+            write_indent(w, c)?;
             if items.is_empty() {
-                out.push_str("\"items\": []\n");
+                w.write_all(b"\"items\": []\n")?;
             } else {
-                out.push_str("\"items\": [\n");
+                w.write_all(b"\"items\": [\n")?;
                 for (i, item) in items.iter().enumerate() {
-                    push_indent(out, c + 1);
-                    out.push_str("{\n");
-                    push_indent(out, c + 2);
+                    write_indent(w, c + 1)?;
+                    w.write_all(b"{\n")?;
+                    write_indent(w, c + 2)?;
                     match item.checked {
-                        Some(b) => {
-                            let _ = writeln!(out, "\"checked\": {b},");
-                        }
-                        None => out.push_str("\"checked\": null,\n"),
+                        Some(b) => writeln!(w, "\"checked\": {b},")?,
+                        None => w.write_all(b"\"checked\": null,\n")?,
                     }
-                    push_blocks_field(out, c + 2, "blocks", &item.blocks, slug_tracker, false);
-                    push_indent(out, c + 1);
-                    if i + 1 < items.len() {
-                        out.push_str("},\n");
-                    } else {
-                        out.push_str("}\n");
-                    }
+                    write_blocks_field(w, c + 2, "blocks", &item.blocks, slug_tracker, false)?;
+                    write_indent(w, c + 1)?;
+                    w.write_all(if i + 1 < items.len() { b"},\n" } else { b"}\n" })?;
                 }
-                push_indent(out, c);
-                out.push_str("]\n");
+                write_indent(w, c)?;
+                w.write_all(b"]\n")?;
             }
         }
         DocBlock::Table {
@@ -407,58 +460,54 @@ fn write_block_json(
             rows,
             source_lines,
         } => {
-            push_kv_str(out, c, "type", "table", true);
-            push_indent(out, c);
-            out.push_str("\"alignments\": [");
+            write_kv_str(w, c, "type", "table", true)?;
+            write_indent(w, c)?;
+            w.write_all(b"\"alignments\": [")?;
             for (i, a) in alignments.iter().enumerate() {
                 if i > 0 {
-                    out.push_str(", ");
+                    w.write_all(b", ")?;
                 }
-                let _ = write!(out, "\"{}\"", table_align_str(*a));
+                write!(w, "\"{}\"", table_align_str(*a))?;
             }
-            out.push_str("],\n");
-            push_source_lines(out, c, source_lines.start, source_lines.end, true);
-            push_indent(out, c);
+            w.write_all(b"],\n")?;
+            write_source_lines(w, c, source_lines.start, source_lines.end, true)?;
+            write_indent(w, c)?;
             if header.is_empty() {
-                out.push_str("\"header\": [],\n");
+                w.write_all(b"\"header\": [],\n")?;
             } else {
-                out.push_str("\"header\": [\n");
+                w.write_all(b"\"header\": [\n")?;
                 for (i, cell) in header.iter().enumerate() {
-                    write_runs_array_item(out, c + 1, cell, i + 1 < header.len());
+                    write_runs_array_item(w, c + 1, cell, i + 1 < header.len())?;
                 }
-                push_indent(out, c);
-                out.push_str("],\n");
+                write_indent(w, c)?;
+                w.write_all(b"],\n")?;
             }
-            push_indent(out, c);
+            write_indent(w, c)?;
             if rows.is_empty() {
-                out.push_str("\"rows\": []\n");
+                w.write_all(b"\"rows\": []\n")?;
             } else {
-                out.push_str("\"rows\": [\n");
+                w.write_all(b"\"rows\": [\n")?;
                 for (r_idx, row) in rows.iter().enumerate() {
-                    push_indent(out, c + 1);
+                    write_indent(w, c + 1)?;
                     if row.is_empty() {
-                        out.push_str("[]");
+                        w.write_all(b"[]")?;
                     } else {
-                        out.push_str("[\n");
+                        w.write_all(b"[\n")?;
                         for (c_idx, cell) in row.iter().enumerate() {
-                            write_runs_array_item(out, c + 2, cell, c_idx + 1 < row.len());
+                            write_runs_array_item(w, c + 2, cell, c_idx + 1 < row.len())?;
                         }
-                        push_indent(out, c + 1);
-                        out.push(']');
+                        write_indent(w, c + 1)?;
+                        w.write_all(b"]")?;
                     }
-                    if r_idx + 1 < rows.len() {
-                        out.push_str(",\n");
-                    } else {
-                        out.push('\n');
-                    }
+                    w.write_all(if r_idx + 1 < rows.len() { b",\n" } else { b"\n" })?;
                 }
-                push_indent(out, c);
-                out.push_str("]\n");
+                write_indent(w, c)?;
+                w.write_all(b"]\n")?;
             }
         }
         DocBlock::ThematicBreak { source_lines } => {
-            push_kv_str(out, c, "type", "thematic_break", true);
-            push_source_lines(out, c, source_lines.start, source_lines.end, false);
+            write_kv_str(w, c, "type", "thematic_break", true)?;
+            write_source_lines(w, c, source_lines.start, source_lines.end, false)?;
         }
         DocBlock::FootnoteDefinition {
             name,
@@ -471,105 +520,99 @@ fn write_block_json(
             } else {
                 format!("fn-{fn_slug}")
             };
-            push_kv_str(out, c, "type", "footnote_definition", true);
-            push_kv_str(out, c, "name", name, true);
-            push_kv_str(out, c, "slug", &slug, true);
-            push_source_lines(out, c, source_lines.start, source_lines.end, true);
-            push_blocks_field(out, c, "blocks", blocks, slug_tracker, false);
+            write_kv_str(w, c, "type", "footnote_definition", true)?;
+            write_kv_str(w, c, "name", name, true)?;
+            write_kv_str(w, c, "slug", &slug, true)?;
+            write_source_lines(w, c, source_lines.start, source_lines.end, true)?;
+            write_blocks_field(w, c, "blocks", blocks, slug_tracker, false)?;
         }
     }
 
-    push_indent(out, indent);
-    if trailing_comma {
-        out.push_str("},\n");
-    } else {
-        out.push_str("}\n");
-    }
+    write_indent(w, indent)?;
+    w.write_all(if trailing_comma { b"},\n" } else { b"}\n" })
 }
 
-fn push_blocks_field(
-    out: &mut String,
+fn write_blocks_field<W: Write>(
+    w: &mut W,
     indent: usize,
     key: &str,
     blocks: &[DocBlock],
     slug_tracker: &mut SlugTracker,
     trailing_comma: bool,
-) {
-    push_indent(out, indent);
+) -> io::Result<()> {
+    write_indent(w, indent)?;
     let comma = if trailing_comma { "," } else { "" };
     if blocks.is_empty() {
-        let _ = writeln!(out, "\"{key}\": []{comma}");
-        return;
+        return writeln!(w, "\"{key}\": []{comma}");
     }
-    let _ = writeln!(out, "\"{key}\": [");
+    writeln!(w, "\"{key}\": [")?;
     for (i, b) in blocks.iter().enumerate() {
-        write_block_json(out, indent + 1, b, slug_tracker, i + 1 < blocks.len());
+        write_block_json(w, indent + 1, b, slug_tracker, i + 1 < blocks.len())?;
     }
-    push_indent(out, indent);
-    let _ = writeln!(out, "]{comma}");
+    write_indent(w, indent)?;
+    writeln!(w, "]{comma}")
 }
 
-fn push_runs_field(
-    out: &mut String,
+fn write_runs_field<W: Write>(
+    w: &mut W,
     indent: usize,
     key: &str,
     runs: &[InlineRun],
     trailing_comma: bool,
-) {
-    push_indent(out, indent);
+) -> io::Result<()> {
+    write_indent(w, indent)?;
     let comma = if trailing_comma { "," } else { "" };
     if runs.is_empty() {
-        let _ = writeln!(out, "\"{key}\": []{comma}");
-        return;
+        return writeln!(w, "\"{key}\": []{comma}");
     }
-    let _ = writeln!(out, "\"{key}\": [");
+    writeln!(w, "\"{key}\": [")?;
     for (i, run) in runs.iter().enumerate() {
-        write_run_obj(out, indent + 1, run, i + 1 < runs.len());
+        write_run_obj(w, indent + 1, run, i + 1 < runs.len())?;
     }
-    push_indent(out, indent);
-    let _ = writeln!(out, "]{comma}");
+    write_indent(w, indent)?;
+    writeln!(w, "]{comma}")
 }
 
-fn write_runs_array_item(
-    out: &mut String,
+fn write_runs_array_item<W: Write>(
+    w: &mut W,
     indent: usize,
     runs: &[InlineRun],
     trailing_comma: bool,
-) {
-    push_indent(out, indent);
+) -> io::Result<()> {
+    write_indent(w, indent)?;
     let comma = if trailing_comma { "," } else { "" };
     if runs.is_empty() {
-        let _ = writeln!(out, "[]{comma}");
-        return;
+        return writeln!(w, "[]{comma}");
     }
-    out.push_str("[\n");
+    w.write_all(b"[\n")?;
     for (i, run) in runs.iter().enumerate() {
-        write_run_obj(out, indent + 1, run, i + 1 < runs.len());
+        write_run_obj(w, indent + 1, run, i + 1 < runs.len())?;
     }
-    push_indent(out, indent);
-    let _ = writeln!(out, "]{comma}");
+    write_indent(w, indent)?;
+    writeln!(w, "]{comma}")
 }
 
-fn write_run_obj(out: &mut String, indent: usize, run: &InlineRun, trailing_comma: bool) {
-    push_indent(out, indent);
-    out.push_str("{\n");
+fn write_run_obj<W: Write>(
+    w: &mut W,
+    indent: usize,
+    run: &InlineRun,
+    trailing_comma: bool,
+) -> io::Result<()> {
+    write_indent(w, indent)?;
+    w.write_all(b"{\n")?;
     let c = indent + 1;
-    push_kv_str(out, c, "text", &run.text, true);
-    push_kv_bool(out, c, "bold", run.bold, true);
-    push_kv_bool(out, c, "italic", run.italic, true);
-    push_kv_bool(out, c, "underline", run.underline, true);
-    push_kv_bool(out, c, "strikethrough", run.strikethrough, true);
-    push_kv_bool(out, c, "code", run.code, true);
-    push_kv_bool(out, c, "is_math", run.is_math, true);
-    push_kv_bool(out, c, "is_footnote_ref", run.is_footnote_ref, true);
-    push_kv_opt_str(out, c, "link_url", run.link_url.as_deref(), true);
-    push_kv_opt_str(out, c, "image_url", run.image_url.as_deref(), false);
-    push_indent(out, indent);
-    if trailing_comma {
-        out.push_str("},\n");
-    } else {
-        out.push_str("}\n");
-    }
+    write_kv_str(w, c, "text", &run.text, true)?;
+    write_kv_bool(w, c, "bold", run.bold, true)?;
+    write_kv_bool(w, c, "italic", run.italic, true)?;
+    write_kv_bool(w, c, "underline", run.underline, true)?;
+    write_kv_bool(w, c, "strikethrough", run.strikethrough, true)?;
+    write_kv_bool(w, c, "code", run.code, true)?;
+    write_kv_bool(w, c, "is_math", run.is_math, true)?;
+    write_kv_bool(w, c, "is_footnote_ref", run.is_footnote_ref, true)?;
+    write_kv_opt_str(w, c, "link_url", run.link_url.as_deref(), true)?;
+    write_kv_opt_str(w, c, "image_url", run.image_url.as_deref(), false)?;
+    write_indent(w, indent)?;
+    w.write_all(if trailing_comma { b"},\n" } else { b"}\n" })
 }
 
 fn alignment_str(a: BlockAlignment) -> &'static str {
@@ -599,71 +642,123 @@ fn table_align_str(a: TableAlign) -> &'static str {
     }
 }
 
-fn push_indent(out: &mut String, indent: usize) {
-    for _ in 0..indent {
-        out.push_str("  ");
+fn write_indent<W: Write>(w: &mut W, indent: usize) -> io::Result<()> {
+    const SPACES: &[u8] = b"                ";
+    let mut remaining = indent * 2;
+    while remaining > 0 {
+        let take = remaining.min(SPACES.len());
+        w.write_all(&SPACES[..take])?;
+        remaining -= take;
     }
+    Ok(())
 }
 
-fn push_kv_str(out: &mut String, indent: usize, key: &str, val: &str, comma: bool) {
-    push_indent(out, indent);
-    let c = if comma { "," } else { "" };
-    let _ = writeln!(out, "\"{key}\": \"{}\"{c}", escape_json_str(val));
+fn write_kv_str<W: Write>(
+    w: &mut W,
+    indent: usize,
+    key: &str,
+    val: &str,
+    comma: bool,
+) -> io::Result<()> {
+    write_indent(w, indent)?;
+    w.write_all(b"\"")?;
+    w.write_all(key.as_bytes())?;
+    w.write_all(b"\": \"")?;
+    write_escaped_json_str(w, val)?;
+    w.write_all(if comma { b"\",\n" } else { b"\"\n" })
 }
 
-fn push_kv_opt_str(out: &mut String, indent: usize, key: &str, val: Option<&str>, comma: bool) {
-    push_indent(out, indent);
-    let c = if comma { "," } else { "" };
+fn write_kv_opt_str<W: Write>(
+    w: &mut W,
+    indent: usize,
+    key: &str,
+    val: Option<&str>,
+    comma: bool,
+) -> io::Result<()> {
+    write_indent(w, indent)?;
     match val {
         Some(v) => {
-            let _ = writeln!(out, "\"{key}\": \"{}\"{c}", escape_json_str(v));
+            w.write_all(b"\"")?;
+            w.write_all(key.as_bytes())?;
+            w.write_all(b"\": \"")?;
+            write_escaped_json_str(w, v)?;
+            w.write_all(if comma { b"\",\n" } else { b"\"\n" })
         }
         None => {
-            let _ = writeln!(out, "\"{key}\": null{c}");
+            write!(w, "\"{key}\": null{}", if comma { ",\n" } else { "\n" })
         }
     }
 }
 
-fn push_kv_usize(out: &mut String, indent: usize, key: &str, val: usize, comma: bool) {
-    push_indent(out, indent);
-    let c = if comma { "," } else { "" };
-    let _ = writeln!(out, "\"{key}\": {val}{c}");
+fn write_kv_usize<W: Write>(
+    w: &mut W,
+    indent: usize,
+    key: &str,
+    val: usize,
+    comma: bool,
+) -> io::Result<()> {
+    write_indent(w, indent)?;
+    writeln!(w, "\"{key}\": {val}{}", if comma { "," } else { "" })
 }
 
-fn push_kv_bool(out: &mut String, indent: usize, key: &str, val: bool, comma: bool) {
-    push_indent(out, indent);
-    let c = if comma { "," } else { "" };
-    let _ = writeln!(out, "\"{key}\": {val}{c}");
+fn write_kv_bool<W: Write>(
+    w: &mut W,
+    indent: usize,
+    key: &str,
+    val: bool,
+    comma: bool,
+) -> io::Result<()> {
+    write_indent(w, indent)?;
+    writeln!(w, "\"{key}\": {val}{}", if comma { "," } else { "" })
 }
 
-fn push_source_lines(
-    out: &mut String,
+fn write_source_lines<W: Write>(
+    w: &mut W,
     indent: usize,
     start: usize,
     end: usize,
     comma: bool,
-) {
-    push_indent(out, indent);
-    let c = if comma { "," } else { "" };
-    let _ = writeln!(out, "\"source_lines\": [{start}, {end}]{c}");
+) -> io::Result<()> {
+    write_indent(w, indent)?;
+    writeln!(
+        w,
+        "\"source_lines\": [{start}, {end}]{}",
+        if comma { "," } else { "" }
+    )
 }
 
-fn escape_json_str(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{0008}' => out.push_str("\\b"),
-            '\u{000C}' => out.push_str("\\f"),
-            c if (c as u32) < 0x20 => {
-                let _ = write!(out, "\\u{:04x}", c as u32);
+fn write_escaped_json_str<W: Write>(w: &mut W, s: &str) -> io::Result<()> {
+    let bytes = s.as_bytes();
+    let mut last = 0usize;
+    for (i, &b) in bytes.iter().enumerate() {
+        let esc: Option<&[u8]> = match b {
+            b'"' => Some(b"\\\""),
+            b'\\' => Some(b"\\\\"),
+            b'\n' => Some(b"\\n"),
+            b'\r' => Some(b"\\r"),
+            b'\t' => Some(b"\\t"),
+            0x08 => Some(b"\\b"),
+            0x0C => Some(b"\\f"),
+            0x00..=0x1F => {
+                if i > last {
+                    w.write_all(&bytes[last..i])?;
+                }
+                write!(w, "\\u{:04x}", b as u32)?;
+                last = i + 1;
+                None
             }
-            c => out.push(c),
+            _ => None,
+        };
+        if let Some(seq) = esc {
+            if i > last {
+                w.write_all(&bytes[last..i])?;
+            }
+            w.write_all(seq)?;
+            last = i + 1;
         }
     }
-    out
+    if last < bytes.len() {
+        w.write_all(&bytes[last..])?;
+    }
+    Ok(())
 }

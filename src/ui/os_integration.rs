@@ -73,9 +73,66 @@ pub fn paths_match(a: &Path, b: &Path) -> bool {
 }
 
 #[cfg(target_os = "windows")]
+fn win_reg_exe_path() -> PathBuf {
+    if let Some(root) = std::env::var_os("SystemRoot").or_else(|| std::env::var_os("WINDIR")) {
+        let candidate = PathBuf::from(root).join("System32").join("reg.exe");
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    PathBuf::from("reg.exe")
+}
+
+/// Validates that `classes_root` strictly targets a per-user `HKCU\` hive (never `HKLM`).
+pub fn validate_classes_root(classes_root: &str) -> Result<(), String> {
+    let valid_prefix = classes_root
+        .get(..5)
+        .is_some_and(|p| p.eq_ignore_ascii_case(r"HKCU\"));
+    if !valid_prefix
+        || classes_root.chars().any(|c| c.is_control())
+        || classes_root.contains("..")
+    {
+        return Err(format!(
+            "Refusing registry operation outside HKCU\\: '{classes_root}'"
+        ));
+    }
+    Ok(())
+}
+
+/// Validates that `exe_path` is a safe, absolute, non-UNC `.exe` path without quote/control injection.
+pub fn validate_exe_path(exe_path: &Path) -> Result<(), String> {
+    let raw = exe_path.to_string_lossy();
+    if raw.trim().is_empty()
+        || raw.chars().any(|c| c.is_control() || c == '"')
+        || raw.ends_with('\\')
+        || raw.ends_with('/')
+    {
+        return Err("Executable path contains invalid characters or trailing slash.".to_string());
+    }
+    let is_non_verbatim_unc = raw.starts_with(r"\\") && !raw.starts_with(r"\\?\");
+    let is_verbatim_unc = raw
+        .get(..8)
+        .is_some_and(|p| p.eq_ignore_ascii_case(r"\\?\UNC\"));
+    if is_non_verbatim_unc || is_verbatim_unc || raw.starts_with("//") {
+        return Err("Network/UNC executable paths are not permitted.".to_string());
+    }
+    if !exe_path.is_absolute() {
+        return Err("Executable path must be absolute.".to_string());
+    }
+    let is_exe = exe_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("exe"));
+    if !is_exe {
+        return Err("Executable path must point to a .exe file.".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
 fn run_reg(args: &[&str]) -> Result<String, String> {
     use std::os::windows::process::CommandExt;
-    let out = std::process::Command::new("reg.exe")
+    let out = std::process::Command::new(win_reg_exe_path())
         .args(args)
         .creation_flags(CREATE_NO_WINDOW)
         .output()
@@ -231,6 +288,9 @@ fn cleanup_legacy_keys_under(classes_root: &str) {
 
 /// Queries Windows Explorer integration status under the given `classes_root` (e.g. `HKCU\Software\Classes`).
 pub fn query_integration_status_under(classes_root: &str) -> OsIntegrationStatus {
+    if validate_classes_root(classes_root).is_err() {
+        return OsIntegrationStatus::default();
+    }
     #[cfg(target_os = "windows")]
     {
         let shell_new_key = format!(r"{classes_root}\.md\ShellNew");
@@ -293,9 +353,11 @@ pub fn register_integration_under(
     enable_shell_new: bool,
     enable_open_with: bool,
 ) -> Result<String, String> {
+    validate_classes_root(classes_root)?;
     if !enable_shell_new && !enable_open_with {
         return unregister_integration_under(classes_root);
     }
+    validate_exe_path(exe_path)?;
 
     #[cfg(target_os = "windows")]
     {
@@ -391,8 +453,10 @@ pub fn register_integration(
 
 /// Removes Markdown Studio entries from Windows Explorer menus under `classes_root`.
 pub fn unregister_integration_under(classes_root: &str) -> Result<String, String> {
+    validate_classes_root(classes_root)?;
     #[cfg(target_os = "windows")]
     {
+        let current_status = query_integration_status_under(classes_root);
         let md_key = format!(r"{classes_root}\.md");
         reg_delete_tree(&format!(r"{classes_root}\.md\ShellNew"));
         if reg_query_value(&md_key, None).as_deref() == Some(PROG_ID) {
@@ -404,6 +468,18 @@ pub fn unregister_integration_under(classes_root: &str) -> Result<String, String
             r"{classes_root}\SystemFileAssociations\.md\shell\{SHELL_KEY_NAME}"
         ));
         reg_delete_tree(&format!(r"{classes_root}\Applications\Markdown Studio.exe"));
+        if let Some(reg_exe) = current_status.registered_exe_path {
+            let exe_name = exe_file_name(&reg_exe);
+            if !exe_name.is_empty() && !exe_name.eq_ignore_ascii_case("Markdown Studio.exe") {
+                reg_delete_tree(&format!(r"{classes_root}\Applications\{exe_name}"));
+            }
+        }
+        if let Ok(cur_exe) = std::env::current_exe() {
+            let exe_name = exe_file_name(&cur_exe);
+            if !exe_name.is_empty() && !exe_name.eq_ignore_ascii_case("Markdown Studio.exe") {
+                reg_delete_tree(&format!(r"{classes_root}\Applications\{exe_name}"));
+            }
+        }
         cleanup_legacy_keys_under(classes_root);
         if classes_root.eq_ignore_ascii_case(DEFAULT_CLASSES_ROOT) {
             notify_shell_assoc_changed();
@@ -634,10 +710,11 @@ impl OsIntegrationModal {
                     .stroke(Stroke::NONE);
                     if ui.add(apply_btn).clicked() {
                         let trimmed = self.exe_path_input.trim();
-                        if trimmed.is_empty() {
-                            self.feedback = Some((true, "Please specify a valid .exe path.".to_string()));
+                        let target = PathBuf::from(trimmed);
+                        if let Err(err) = validate_exe_path(&target) {
+                            self.feedback = Some((true, err.clone()));
+                            status_out = Some(err);
                         } else {
-                            let target = PathBuf::from(trimmed);
                             settings.custom_exe_path = Some(target.clone());
                             settings.auto_sync_exe_path = self.auto_sync_exe_path;
                             let _ = settings.save_to(settings_path);

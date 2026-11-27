@@ -1,10 +1,16 @@
 use std::ops::Range;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use memchr::memmem::Finder;
 use regex::RegexBuilder;
 use ropey::Rope;
 
-use crate::document::DocumentBuffer;
+use crate::document::{adaptive_worker_count, DocumentBuffer};
+
+#[inline]
+fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {
+    cancel.is_some_and(|c| c.load(Ordering::Relaxed))
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SearchOptions {
@@ -252,6 +258,7 @@ fn find_all_literal_bytes_streaming<F>(
     scope_end: usize,
     q_len: usize,
     whole_word: bool,
+    cancel: Option<&AtomicBool>,
     find_in: F,
 ) -> Vec<Range<usize>>
 where
@@ -271,7 +278,7 @@ where
     let mut chunk_base_byte = scope_start_byte;
     let mut next_allowed_byte = scope_start_byte;
 
-    let to_doc_char = |abs_byte: usize| -> usize {
+    let to_doc_char_abs = |abs_byte: usize| -> usize {
         if scope_is_ascii {
             scope_start + (abs_byte - scope_start_byte)
         } else {
@@ -279,7 +286,10 @@ where
         }
     };
 
-    for chunk in scope_slice.chunks() {
+    for (chunk_idx, chunk) in scope_slice.chunks().enumerate() {
+        if chunk_idx & 0xFF == 0 && is_cancelled(cancel) {
+            return Vec::new();
+        }
         let bytes = chunk.as_bytes();
         let chunk_len = bytes.len();
 
@@ -307,8 +317,8 @@ where
                 }
                 let abs_start = tail_start_byte + m_start;
                 let abs_end = abs_start + q_len;
-                let s_char = to_doc_char(abs_start);
-                let e_char = to_doc_char(abs_end);
+                let s_char = to_doc_char_abs(abs_start);
+                let e_char = to_doc_char_abs(abs_end);
                 if !whole_word || is_whole_word_in_rope(rope, s_char, e_char) {
                     matches.push(s_char..e_char);
                     next_allowed_byte = abs_end;
@@ -319,21 +329,31 @@ where
             }
         }
 
-        // 2) Matches starting inside the current `bytes` chunk
+        // 2) Matches starting inside the current `bytes` chunk (O(1) amortized byte->char inside chunk)
         let mut cur = next_allowed_byte.saturating_sub(chunk_base_byte);
+        let mut chunk_mapper: Option<LinearByteToChar<'_>> = None;
         while cur + q_len <= chunk_len {
             let Some(rel) = find_in(&bytes[cur..]) else {
                 break;
             };
             let m_start = cur + rel;
-            let abs_start = chunk_base_byte + m_start;
-            let abs_end = abs_start + q_len;
-            let s_char = to_doc_char(abs_start);
-            let e_char = to_doc_char(abs_end);
+            let m_end = m_start + q_len;
+            let (s_char, e_char) = if scope_is_ascii {
+                (
+                    scope_start + (chunk_base_byte - scope_start_byte) + m_start,
+                    scope_start + (chunk_base_byte - scope_start_byte) + m_end,
+                )
+            } else {
+                let m = chunk_mapper.get_or_insert_with(|| {
+                    let base_char = rope.byte_to_char(chunk_base_byte);
+                    LinearByteToChar::new(chunk, base_char, chunk.len() == chunk.chars().count())
+                });
+                (m.map_byte_to_char(m_start), m.map_byte_to_char(m_end))
+            };
             if !whole_word || is_whole_word_in_rope(rope, s_char, e_char) {
                 matches.push(s_char..e_char);
-                next_allowed_byte = abs_end;
-                cur = m_start + q_len;
+                next_allowed_byte = chunk_base_byte + m_end;
+                cur = m_end;
             } else {
                 cur = m_start + 1;
             }
@@ -358,22 +378,131 @@ where
     matches
 }
 
+const PARALLEL_SEARCH_BYTES_THRESHOLD: usize = 1024 * 1024;
+
+fn find_all_literal_parallel<F>(
+    rope: &Rope,
+    scope: Range<usize>,
+    q_bytes: usize,
+    q_chars: usize,
+    whole_word: bool,
+    cancel: Option<&AtomicBool>,
+    find_in: F,
+) -> Vec<Range<usize>>
+where
+    F: Fn(&[u8]) -> Option<usize> + Sync,
+{
+    let scope_start = scope.start;
+    let scope_end = scope.end;
+    let scope_bytes = rope.slice(scope_start..scope_end).len_bytes();
+    let workers = adaptive_worker_count(8);
+    let min_shard_bytes = (256 * 1024).max(q_bytes.saturating_mul(4));
+    if workers < 2 || scope_bytes < PARALLEL_SEARCH_BYTES_THRESHOLD || scope_bytes < min_shard_bytes * 2
+    {
+        return find_all_literal_bytes_streaming(
+            rope,
+            scope_start,
+            scope_end,
+            q_bytes,
+            whole_word,
+            cancel,
+            &find_in,
+        );
+    }
+
+    let shard_count = (scope_bytes / min_shard_bytes).min(workers).max(1);
+    if shard_count < 2 {
+        return find_all_literal_bytes_streaming(
+            rope,
+            scope_start,
+            scope_end,
+            q_bytes,
+            whole_word,
+            cancel,
+            &find_in,
+        );
+    }
+
+    let total_chars = scope_end - scope_start;
+    let mut shards: Vec<(usize, usize)> = Vec::with_capacity(shard_count);
+    for i in 0..shard_count {
+        let s = scope_start + (total_chars * i) / shard_count;
+        let e = if i + 1 == shard_count {
+            scope_end
+        } else {
+            scope_start + (total_chars * (i + 1)) / shard_count
+        };
+        if s < e {
+            shards.push((s, e));
+        }
+    }
+
+    let mut shard_results: Vec<Vec<Range<usize>>> = vec![Vec::new(); shards.len()];
+    let find_ref = &find_in;
+    std::thread::scope(|scope| {
+        for (slot, &(s_char, e_char)) in shard_results.iter_mut().zip(shards.iter()) {
+            scope.spawn(move || {
+                if is_cancelled(cancel) {
+                    return;
+                }
+                let scan_end = (e_char + q_chars.saturating_sub(1)).min(scope_end);
+                let mut found = find_all_literal_bytes_streaming(
+                    rope, s_char, scan_end, q_bytes, whole_word, cancel, find_ref,
+                );
+                found.retain(|m| m.start < e_char);
+                *slot = found;
+            });
+        }
+    });
+
+    if is_cancelled(cancel) {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    let mut prev_end = scope_start;
+    for (i, shard_matches) in shard_results.into_iter().enumerate() {
+        let (s_char, e_char) = shards[i];
+        if i == 0 || prev_end <= s_char {
+            if let Some(last) = shard_matches.last() {
+                prev_end = prev_end.max(last.end);
+            }
+            out.extend(shard_matches);
+        } else if prev_end < e_char {
+            // Previous shard's trailing match crossed past `s_char`; re-scan cleanly from `prev_end`.
+            let scan_end = (e_char + q_chars.saturating_sub(1)).min(scope_end);
+            let mut tail = find_all_literal_bytes_streaming(
+                rope, prev_end, scan_end, q_bytes, whole_word, cancel, &find_in,
+            );
+            tail.retain(|m| m.start < e_char);
+            if let Some(last) = tail.last() {
+                prev_end = last.end;
+            }
+            out.extend(tail);
+        }
+    }
+    out
+}
+
 fn find_all_literal_cs_streaming(
     rope: &Rope,
     scope_start: usize,
     scope_end: usize,
     query: &str,
     whole_word: bool,
+    cancel: Option<&AtomicBool>,
 ) -> Vec<Range<usize>> {
     let needle = query.as_bytes();
     let finder = Finder::new(needle);
-    find_all_literal_bytes_streaming(
+    let q_chars = query.chars().count();
+    find_all_literal_parallel(
         rope,
-        scope_start,
-        scope_end,
+        scope_start..scope_end,
         needle.len(),
+        q_chars,
         whole_word,
-        |hay| finder.find(hay),
+        cancel,
+        move |hay| finder.find(hay),
     )
 }
 
@@ -383,16 +512,18 @@ fn find_all_literal_ci_ascii_streaming(
     scope_end: usize,
     query: &str,
     whole_word: bool,
+    cancel: Option<&AtomicBool>,
 ) -> Vec<Range<usize>> {
     debug_assert!(query.is_ascii());
     let needle_lower: Vec<u8> = query.bytes().map(|b| b.to_ascii_lowercase()).collect();
-    find_all_literal_bytes_streaming(
+    find_all_literal_parallel(
         rope,
-        scope_start,
-        scope_end,
+        scope_start..scope_end,
         needle_lower.len(),
+        query.len(),
         whole_word,
-        |hay| find_ci_ascii_in_slice(hay, &needle_lower),
+        cancel,
+        move |hay| find_ci_ascii_in_slice(hay, &needle_lower),
     )
 }
 
@@ -425,6 +556,7 @@ fn can_stream_regex_by_line(pattern: &str) -> bool {
     true
 }
 
+#[allow(clippy::too_many_arguments)]
 fn find_all_regex_streaming_lines(
     rope: &Rope,
     scope_start: usize,
@@ -433,6 +565,7 @@ fn find_all_regex_streaming_lines(
     whole_word: bool,
     left_bound: Option<char>,
     right_bound: Option<char>,
+    cancel: Option<&AtomicBool>,
 ) -> Option<Vec<Range<usize>>> {
     let scope_slice = rope.slice(scope_start..scope_end);
     let mut matches = Vec::new();
@@ -440,7 +573,10 @@ fn find_all_regex_streaming_lines(
     let mut line_start_char = scope_start;
     let mut prev_line_tail_char = left_bound;
 
-    for line_slice in scope_slice.lines() {
+    for (line_idx, line_slice) in scope_slice.lines().enumerate() {
+        if line_idx & 0xFF == 0 && is_cancelled(cancel) {
+            return Some(Vec::new());
+        }
         let line_chars = line_slice.len_chars();
         if line_chars == 0 {
             continue;
@@ -490,6 +626,116 @@ fn find_all_regex_streaming_lines(
     Some(matches)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn find_all_regex_streaming_parallel(
+    rope: &Rope,
+    scope_start: usize,
+    scope_end: usize,
+    re: &regex::Regex,
+    whole_word: bool,
+    left_bound: Option<char>,
+    right_bound: Option<char>,
+    cancel: Option<&AtomicBool>,
+) -> Option<Vec<Range<usize>>> {
+    let scope_bytes = rope.slice(scope_start..scope_end).len_bytes();
+    let workers = adaptive_worker_count(8);
+    if workers < 2 || scope_bytes < PARALLEL_SEARCH_BYTES_THRESHOLD {
+        return find_all_regex_streaming_lines(
+            rope,
+            scope_start,
+            scope_end,
+            re,
+            whole_word,
+            left_bound,
+            right_bound,
+            cancel,
+        );
+    }
+
+    let first_line = rope.char_to_line(scope_start);
+    let last_line = rope.char_to_line(scope_end.saturating_sub(1));
+    let total_lines = last_line.saturating_sub(first_line) + 1;
+    let shard_count = workers.min(total_lines / 8);
+    if shard_count < 2 {
+        return find_all_regex_streaming_lines(
+            rope,
+            scope_start,
+            scope_end,
+            re,
+            whole_word,
+            left_bound,
+            right_bound,
+            cancel,
+        );
+    }
+
+    let mut shard_ranges: Vec<(usize, usize)> = Vec::with_capacity(shard_count);
+    let mut cur_start = scope_start;
+    for i in 1..=shard_count {
+        let end_char = if i == shard_count {
+            scope_end
+        } else {
+            let split_line = first_line + (total_lines * i) / shard_count;
+            rope.line_to_char(split_line).min(scope_end).max(cur_start)
+        };
+        if end_char > cur_start {
+            shard_ranges.push((cur_start, end_char));
+            cur_start = end_char;
+        }
+    }
+    if shard_ranges.len() < 2 {
+        return find_all_regex_streaming_lines(
+            rope,
+            scope_start,
+            scope_end,
+            re,
+            whole_word,
+            left_bound,
+            right_bound,
+            cancel,
+        );
+    }
+
+    let total_chars = rope.len_chars();
+    let shard_len = shard_ranges.len();
+    let mut shard_results: Vec<Option<Vec<Range<usize>>>> = vec![None; shard_len];
+    std::thread::scope(|scope| {
+        for (idx, (slot, &(s, e))) in shard_results
+            .iter_mut()
+            .zip(shard_ranges.iter())
+            .enumerate()
+        {
+            scope.spawn(move || {
+                if is_cancelled(cancel) {
+                    *slot = Some(Vec::new());
+                    return;
+                }
+                let lb = if idx == 0 {
+                    left_bound
+                } else {
+                    (s > 0).then(|| rope.char(s - 1))
+                };
+                let rb = if idx + 1 == shard_len {
+                    right_bound
+                } else {
+                    (e < total_chars).then(|| rope.char(e))
+                };
+                *slot = find_all_regex_streaming_lines(rope, s, e, re, whole_word, lb, rb, cancel);
+            });
+        }
+    });
+
+    if is_cancelled(cancel) {
+        return Some(Vec::new());
+    }
+
+    let mut out = Vec::new();
+    for res in shard_results {
+        out.extend(res?);
+    }
+    Some(out)
+}
+
 const STREAMING_REGEX_BYTES_THRESHOLD: usize = 256 * 1024;
 
 fn find_all_matches_internal_rope(
@@ -497,8 +743,9 @@ fn find_all_matches_internal_rope(
     query: &str,
     opts: &SearchOptions,
     collect_captures: bool,
+    cancel: Option<&AtomicBool>,
 ) -> MatchSearchData {
-    if query.is_empty() {
+    if query.is_empty() || is_cancelled(cancel) {
         return MatchSearchData {
             matches: Vec::new(),
             captures: Vec::new(),
@@ -524,10 +771,16 @@ fn find_all_matches_internal_rope(
         };
     }
 
-    // Fast Path 1: Case-sensitive literal substring search via zero-copy SIMD memmem
+    // Fast Path 1: Case-sensitive literal substring search via zero-copy parallel SIMD memmem
     if !opts.use_regex && opts.case_sensitive {
-        let matches =
-            find_all_literal_cs_streaming(rope, scope_start, scope_end, query, opts.whole_word);
+        let matches = find_all_literal_cs_streaming(
+            rope,
+            scope_start,
+            scope_end,
+            query,
+            opts.whole_word,
+            cancel,
+        );
         return MatchSearchData {
             matches,
             captures: Vec::new(),
@@ -535,7 +788,7 @@ fn find_all_matches_internal_rope(
         };
     }
 
-    // Fast Path 2: Case-insensitive ASCII literal search via zero-copy streaming SIMD memchr2
+    // Fast Path 2: Case-insensitive ASCII literal search via zero-copy parallel SIMD memchr2
     if !opts.use_regex && !opts.case_sensitive && query.is_ascii() {
         let matches = find_all_literal_ci_ascii_streaming(
             rope,
@@ -543,6 +796,7 @@ fn find_all_matches_internal_rope(
             scope_end,
             query,
             opts.whole_word,
+            cancel,
         );
         return MatchSearchData {
             matches,
@@ -581,14 +835,13 @@ fn find_all_matches_internal_rope(
     let right_bound = (scope_end < total_chars).then(|| rope.char(scope_end));
     let scope_slice = rope.slice(scope_start..scope_end);
 
-    // Stream large scopes line-by-line for single-line regexes / non-ASCII CI literals to avoid
-    // cloning huge documents into a contiguous heap `String`.
+    // Stream large scopes line-by-line (in parallel when >= 1 MiB) for single-line regexes / non-ASCII CI literals
     let can_stream_lines = !collect_captures
         && scope_slice.len_bytes() >= STREAMING_REGEX_BYTES_THRESHOLD
         && ((!opts.use_regex && !query.contains('\n') && !query.contains('\r'))
             || (opts.use_regex && can_stream_regex_by_line(query)));
     if can_stream_lines
-        && let Some(matches) = find_all_regex_streaming_lines(
+        && let Some(matches) = find_all_regex_streaming_parallel(
             rope,
             scope_start,
             scope_end,
@@ -596,13 +849,23 @@ fn find_all_matches_internal_rope(
             opts.whole_word,
             left_bound,
             right_bound,
-        ) {
-            return MatchSearchData {
-                matches,
-                captures: Vec::new(),
-                error: None,
-            };
-        }
+            cancel,
+        )
+    {
+        return MatchSearchData {
+            matches,
+            captures: Vec::new(),
+            error: None,
+        };
+    }
+
+    if is_cancelled(cancel) {
+        return MatchSearchData {
+            matches: Vec::new(),
+            captures: Vec::new(),
+            error: None,
+        };
+    }
 
     let scope_is_ascii = scope_slice.len_bytes() == scope_slice.len_chars();
     let scope_str = scope_slice.to_string();
@@ -612,7 +875,14 @@ fn find_all_matches_internal_rope(
     let mut captures = Vec::new();
 
     if collect_captures {
-        for caps in re.captures_iter(&scope_str) {
+        for (idx, caps) in re.captures_iter(&scope_str).enumerate() {
+            if idx & 0xFF == 0 && is_cancelled(cancel) {
+                return MatchSearchData {
+                    matches: Vec::new(),
+                    captures: Vec::new(),
+                    error: None,
+                };
+            }
             let Some(m) = caps.get(0) else {
                 continue;
             };
@@ -638,7 +908,14 @@ fn find_all_matches_internal_rope(
             captures.push(group_ranges);
         }
     } else {
-        for m in re.find_iter(&scope_str) {
+        for (idx, m) in re.find_iter(&scope_str).enumerate() {
+            if idx & 0xFF == 0 && is_cancelled(cancel) {
+                return MatchSearchData {
+                    matches: Vec::new(),
+                    captures: Vec::new(),
+                    error: None,
+                };
+            }
             if m.start() >= m.end() {
                 continue;
             }
@@ -661,17 +938,29 @@ fn find_all_matches_internal_rope(
 }
 
 /// Finds all matches in `rope` using the requested search options without borrowing `DocumentBuffer`.
+/// Polls optional `cancel` atomically during long searches to abort superseded work early.
+/// Returned ranges are in document `char` coordinates.
+pub fn find_all_matches_in_rope_cancellable(
+    rope: &Rope,
+    query: &str,
+    opts: &SearchOptions,
+    cancel: Option<&AtomicBool>,
+) -> SearchResult {
+    let data = find_all_matches_internal_rope(rope, query, opts, false, cancel);
+    SearchResult {
+        matches: data.matches,
+        error: data.error,
+    }
+}
+
+/// Finds all matches in `rope` using the requested search options without borrowing `DocumentBuffer`.
 /// Returned ranges are in document `char` coordinates.
 pub fn find_all_matches_in_rope(
     rope: &Rope,
     query: &str,
     opts: &SearchOptions,
 ) -> SearchResult {
-    let data = find_all_matches_internal_rope(rope, query, opts, false);
-    SearchResult {
-        matches: data.matches,
-        error: data.error,
-    }
+    find_all_matches_in_rope_cancellable(rope, query, opts, None)
 }
 
 /// Finds all matches in `buf` using the requested search options.
@@ -732,7 +1021,7 @@ pub fn replace_all_matches(
     opts: &SearchOptions,
 ) -> Result<(usize, Vec<Range<usize>>), String> {
     let want_caps = opts.use_regex && replacement.contains('$');
-    let res = find_all_matches_internal_rope(buf.rope(), query, opts, want_caps);
+    let res = find_all_matches_internal_rope(buf.rope(), query, opts, want_caps, None);
     if let Some(err) = res.error {
         return Err(err);
     }
@@ -743,6 +1032,49 @@ pub fn replace_all_matches(
     let first_start = res.matches[0].start;
     let last_end = res.matches[res.matches.len() - 1].end;
     let count = res.matches.len();
+
+    if count == 1 {
+        let m = res.matches[0].clone();
+        let new_r = replace_single_match_with_opts(buf, query, m, replacement, opts)?;
+        return Ok((1, vec![new_r]));
+    }
+
+    let span_chars = last_end.saturating_sub(first_start);
+    if count <= 4096 && span_chars > 256 * 1024 && span_chars > count.saturating_mul(256) {
+        let mut atomic_edits = Vec::with_capacity(count);
+        let mut new_ranges = Vec::with_capacity(count);
+        let mut running_delta = 0isize;
+
+        for (idx, m) in res.matches.iter().enumerate() {
+            let actual_rep = if want_caps {
+                let full_match = buf.rope().slice(m.clone()).to_string();
+                let groups: Vec<Option<String>> = res
+                    .captures
+                    .get(idx)
+                    .map(|caps| {
+                        caps.iter()
+                            .map(|opt| {
+                                opt.as_ref()
+                                    .map(|r| buf.rope().slice(r.clone()).to_string())
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                expand_regex_replacement(replacement, &full_match, &groups)
+            } else {
+                replacement.to_string()
+            };
+            let old_len = m.end - m.start;
+            let rep_chars = actual_rep.chars().count();
+            let shifted_start = m.start.saturating_add_signed(running_delta);
+            new_ranges.push(shifted_start..(shifted_start + rep_chars));
+            running_delta += rep_chars as isize - old_len as isize;
+            atomic_edits.push((m.clone(), actual_rep));
+        }
+
+        buf.replace_ranges_atomic(atomic_edits);
+        return Ok((count, new_ranges));
+    }
 
     let span_slice_rope = buf.rope().slice(first_start..last_end);
     let span_is_ascii = span_slice_rope.len_bytes() == span_slice_rope.len_chars();

@@ -282,6 +282,82 @@ fn bench_bidi_shape_arabic_line(c: &mut criterion::Criterion) {
     });
 }
 
+fn bench_exports_tables_and_long_line(c: &mut criterion::Criterion) {
+    use markdown_studio::document::ast::{build_table_markdown, extract_tables, parse_rope_to_ir};
+    use markdown_studio::export::html::render_html_string_with_base_dir;
+    use markdown_studio::export::json::export_json_to_file_from_rope;
+
+    let mut md_256kb = String::with_capacity(260 * 1024);
+    for i in 0..2_500 {
+        md_256kb.push_str(&format!(
+            "## Heading {i}\n\nParagraph {i} with **bold**, *italic*, `code`, and https://example.org/{i}.\n\n"
+        ));
+    }
+    let buf_256kb = DocumentBuffer::from_str(&md_256kb);
+    let blocks_256kb = parse_rope_to_ir(buf_256kb.rope());
+    let temp_dir = tempfile::tempdir().unwrap();
+    let json_path = temp_dir.path().join("bench_out.json");
+
+    let mut export_group = c.benchmark_group("export_256kb");
+    export_group.bench_function("render_html_256kb", |b| {
+        b.iter(|| {
+            std::hint::black_box(render_html_string_with_base_dir(
+                std::hint::black_box(&blocks_256kb),
+                "Bench Doc",
+                None,
+            ))
+        });
+    });
+    export_group.bench_function("stream_json_file_256kb", |b| {
+        b.iter(|| {
+            export_json_to_file_from_rope(
+                std::hint::black_box(&blocks_256kb),
+                "Bench Doc",
+                None,
+                buf_256kb.rope(),
+                &json_path,
+                |_| {},
+            )
+            .unwrap();
+        });
+    });
+    export_group.finish();
+
+    let mut table_md = String::from("| ColA | ColB | ColC |\n| --- | :---: | ---: |\n");
+    for i in 0..1_000 {
+        table_md.push_str(&format!("| Item {i} | {} | =C{} + 1 |\n", i * 3, i + 1));
+    }
+    let parsed_tables = extract_tables(&table_md);
+    let sample_table = &parsed_tables[0];
+
+    let mut table_group = c.benchmark_group("table_1000_rows");
+    table_group.bench_function("extract_tables_1000_rows", |b| {
+        b.iter(|| std::hint::black_box(extract_tables(std::hint::black_box(&table_md))));
+    });
+    table_group.bench_function("build_table_markdown_1000_rows", |b| {
+        b.iter(|| {
+            std::hint::black_box(build_table_markdown(
+                std::hint::black_box(&sample_table.alignments),
+                std::hint::black_box(&sample_table.header),
+                std::hint::black_box(&sample_table.rows),
+            ))
+        });
+    });
+    table_group.finish();
+
+    let long_line = "abcdefghijklmnopqrstuvwxyz0123456789 ".repeat(2_800);
+    let mut long_buf = DocumentBuffer::from_str(&long_line);
+    c.bench_function("long_line_100kb_move_right_grapheme_500", |b| {
+        b.iter(|| {
+            long_buf.cursor_char = long_line.len() / 2;
+            for _ in 0..500 {
+                long_buf.move_right_grapheme(false);
+            }
+            std::hint::black_box(long_buf.cursor_char);
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_rope_edits_10mb,
@@ -291,6 +367,7 @@ criterion_group!(
     bench_parse_to_ir_1mb,
     bench_fenwick_viewport_50k_updates,
     bench_math_and_mermaid_layout,
-    bench_bidi_shape_arabic_line
+    bench_bidi_shape_arabic_line,
+    bench_exports_tables_and_long_line
 );
 criterion_main!(benches);

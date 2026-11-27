@@ -50,35 +50,21 @@ pub fn recovery_dir(settings_path: &Path) -> PathBuf {
 }
 
 fn atomic_replace_from_temp(tmp_path: &Path, target_path: &Path) -> io::Result<()> {
-    match fs::rename(tmp_path, target_path) {
-        Ok(()) => Ok(()),
-        Err(first_err) if target_path.exists() => {
-            let parent = target_path
-                .parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .unwrap_or_else(|| Path::new("."));
-            let name = target_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("session");
-            let seq = SESSION_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-            let bak = parent.join(format!(".{name}.{}.{seq}.bak", std::process::id()));
-            if fs::rename(target_path, &bak).is_ok() {
-                match fs::rename(tmp_path, target_path) {
-                    Ok(()) => {
-                        let _ = fs::remove_file(&bak);
-                        Ok(())
-                    }
-                    Err(e) => {
-                        let _ = fs::rename(&bak, target_path);
-                        Err(e)
-                    }
-                }
-            } else {
-                Err(first_err)
-            }
-        }
-        Err(err) => Err(err),
+    crate::document::atomic_replace_file(tmp_path, target_path)
+}
+
+fn create_private_dir_all(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(dir)
     }
 }
 
@@ -87,18 +73,31 @@ fn create_atomic_temp_path(target_path: &Path) -> io::Result<(PathBuf, fs::File)
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)?;
+    create_private_dir_all(parent)?;
     let name = target_path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("data");
-    let seq = SESSION_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = parent.join(format!(".{name}.{}.{seq}.tmp", std::process::id()));
-    let file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)?;
-    Ok((tmp, file))
+    for _ in 0..16 {
+        let seq = SESSION_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = parent.join(format!(".{name}.{}.{seq}.tmp", std::process::id()));
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        match opts.open(&tmp) {
+            Ok(file) => return Ok((tmp, file)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "Unable to allocate unique temp session file",
+    ))
 }
 
 /// Atomically writes `bytes` to `target_path` via temp-file + flush + rename.
@@ -156,10 +155,10 @@ pub fn cleanup_unused_recovery_files(rec_dir: &Path, keep_paths: &[PathBuf]) {
         return;
     };
     for entry in entries.flatten() {
-        let p = entry.path();
-        if !p.is_file() {
+        if !entry.file_type().is_ok_and(|t| t.is_file()) {
             continue;
         }
+        let p = entry.path();
         let keep = keep_paths.iter().any(|kp| {
             #[cfg(windows)]
             {

@@ -1,12 +1,12 @@
 # Architecture & Internals
 
-**Markdown Studio** (`markdown_studio` v`0.7.15`) is a native desktop Markdown reader and studio editor written in Rust with `eframe`/`egui`, `ropey`, `comrak`, `memchr`, and `regex`.
+**Markdown Studio** (`markdown_studio` v`0.8.0`) is a native desktop Markdown reader and studio editor written in Rust with `eframe`/`egui`, `ropey`, `comrak`, `memchr`, and `regex`.
 
 ---
 
 ## Architecture & Data Flow
 
-`Markdown Studio` separates storage, parsing/layout, UI presentation, and heavy exports into non-blocking layers so UI frames stay responsive on multi-megabyte Markdown files:
+`Markdown Studio` separates storage, parsing/layout, UI presentation, and heavy exports into non-blocking layers so UI frames stay responsive on massive Markdown files:
 
 ```text
                         +----------------------------------+
@@ -14,16 +14,16 @@
                         |  - O(log n) edits & line lookup  |
                         |  - O(1) incremental word count & |
                         |    line-ending detection         |
-                        |  - VecDeque<EditOp> (coalesced, 32MB)|
+                        |  - RAM-scaled Undo/Redo (Rope)   |
                         +--------+----------------+--------+
                                  |                |
           (O(1) Arc Rope clone)  |                | (O(1) Arc Rope clone)
                                  v                v
                  +--------------------+      +-------------------------+
                  | BackgroundAstParser|      |   BackgroundExporter    |
-                 |  - >=32KB off-UI   |      |  - parse_to_ir ->       |
-                 |  - comrak + IR     |      |    PDF / DOCX / Print   |
-                 |  - eguiCtx wakeup  |      |  - eguiCtx wakeup       |
+                 |  - >=32KB parallel |      |  - parse_rope_to_ir ->  |
+                 |  - cancellable     |      |    PDF/DOCX/HTML/JSON   |
+                 |  - eguiCtx wakeup  |      |  - streaming & cancel   |
                  +---------+----------+      +------------+------------+
                            |                              |
                            v                              |
@@ -37,16 +37,17 @@
          +----------------------------------------------------+
          |                MarkdownApp (egui)                  |
          | Toolbar (cached ActiveFormatState) · AutoScroll    |
-         | LineLayoutCache & ReaderGalleyCache (atlas-tracked)|
-         | VirtualEditor · VirtualReader · Lazy Font Loader   |
+         | Byte/RAM-Adaptive Caches (atlas-tracked LRU)       |
+         | VirtualEditor · VirtualReader · Async Font/Images  |
          +----------------------------------------------------+
 ```
 
 ### Key Architectural Principles
-1. **Immutable Structural Sharing via `ropey::Rope`**: Document opens stream through a 64 KB `BufReader`, `word_count()` / `line_ending()` update incrementally in $O(\text{edit})$, and cloning the document snapshot to background threads (`BackgroundAstParser` using streaming `parse_rope_to_ir` for $\ge 32\text{ KB}$, `BackgroundExporter`, `BackgroundSessionSaver`, and `BackgroundSearcher` for $\ge 256\text{ KB}$) is $O(1)$.
-2. **Double Virtualization & Atlas-Tracked Caching**: Source mode virtualizes rows via `ScrollArea::vertical().show_rows(...)` backed by a 512-entry `LineLayoutCache`; Reader/WYSIWYG/Split virtualizes above **48 blocks** (`FenwickTree`-backed `ViewportBlockIndex::visible_range` in $O(\log B)$) and tables above **80 rows**, backed by a 1024-entry LRU half-evicted `ReaderGalleyCache`, bounded `MermaidSceneCache` (64), `MathLayoutCache` (256), `TableEvalCache` (LRU half-eviction at 256), `math_preview_cache` (128), and a persistent 2-thread bounded `ImageDecodePool` — all automatically invalidated via `Weak<Mutex<TextureAtlas>>` whenever egui rebuilds the font atlas.
-3. **Document Session Isolation (`doc_id`) & Event-Driven Wakeups**: Monotonically incremented `doc_id` prevents in-flight background AST parses from stale documents from overwriting new buffers, and worker threads notify `egui::Context` directly instead of spinning the UI loop.
-4. **AST Round-Trip Verification**: Markdown edits preserve canonical CommonMark + GFM structure (`parse(serialize(ast)) == ast`), leaving unrelated paragraphs, alignment/indent metadata comments, escaped markers, and multi-backtick code spans intact.
+1. **Immutable Structural Sharing via `ropey::Rope`**: Document opens stream through a 64 KB `BufReader` (including streaming UTF-16 LE/BE and lossy UTF-8 decoders), `word_count()` / `line_ending()` update incrementally in $O(\text{edit})$, dirty-check hashes run asynchronously above `512 KiB`, and cloning snapshots to background threads (`BackgroundAstParser` using parallel chunked `parse_rope_to_ir_cancellable` for $\ge 32\text{ KB}$, `BackgroundExporter`, `BackgroundSessionSaver`, and parallel `BackgroundSearcher` for $\ge 256\text{ KB}$) is $O(1)$.
+2. **Double Virtualization & RAM-Adaptive Atlas-Tracked Caching**: Source mode virtualizes rows via `ScrollArea::vertical().show_rows(...)` backed by a byte-weighted LRU `LineLayoutCache`; Reader/WYSIWYG/Split virtualizes above **48 blocks** (`FenwickTree`-backed `ViewportBlockIndex::visible_range` in $O(\log B)$) and tables above **80 rows**, File Explorer and `ExternalDiffModal`/`TableEditorModal` virtualize long lists/tables, and `ReaderGalleyCache`, `MermaidSceneCache`, `MathLayoutCache`, `TableEvalCache`, `math_preview_cache`, and `ImageTextureCache` scale budgets with host RAM and VRAM while auto-invalidating via `Weak<Mutex<TextureAtlas>>`.
+3. **Document Session Isolation (`doc_id`) & Latest-Wins Cancellation**: Monotonically incremented `doc_id` and atomic generation counters discard stale in-flight AST parses, searches, dirty hashes, and exports, while worker threads wake `egui::Context` directly.
+4. **Security-First File, Network & Export Boundaries**: Canonical non-UNC workspace confinement blocks `..` traversal; `SafePublicResolver` blocks SSRF against private/loopback/metadata IPs across redirects; SVGZ/GIF/PNG decoders enforce uncompressed byte and frame bounds; HTML/DOCX/PDF exports sanitize links and add strict CSP; IPC handoffs and temp files use OS CSPRNG nonces; and Windows writes use `MoveFileExW` atomic replacement.
+5. **AST Round-Trip Verification**: Markdown edits preserve canonical CommonMark + GFM structure (`parse(serialize(ast)) == ast`), leaving unrelated paragraphs, alignment/indent metadata comments, escaped markers, and multi-backtick code spans intact.
 
 ---
 
@@ -92,7 +93,8 @@
 | [tests/export_tests.rs](tests/export_tests.rs) | Integration tests validating multi-page PDF structure, configurable PDF headers/footers, hierarchical UTF-16BE Document Outline bookmarks & clickable `/Subtype /Link` URI/`#section`/footnote annotations (`lopdf`), standalone HTML5 export with clickable `<nav class="outline">` & anchors, structured JSON export, `.docx` OpenXML/ZIP integrity (`zip` + `quick-xml`) including clickable internal/external/footnote links, `outlineLvl`, and clean formatting, Math & Mermaid PNG/Cambria Math/HR export, `<...>`/`%20` image path resolution, Unicode/Arabic/footnotes parity, print ranges, and async exporter. |
 | [tests/roundtrip_tests.rs](tests/roundtrip_tests.rs) | Integration tests validating GFM round-trip invariants, table editing, footnotes/`<br>`/marker escaping, code block fence language changes + CRLF cursor/undo preservation, link classification & extraction, Persian/Urdu shaping, atomic saves/`VecDeque` undo/EOL/word count, regex capture replacement, and editing guards. |
 | [tests/ui_integration_tests.rs](tests/ui_integration_tests.rs) | Headless `egui` frame integration tests covering multi-tab opening/switching/closing/shortcuts, drag-to-reorder tabs, inline click-to-rename filename + undo/redo & guards, single-instance IPC forwarding, Chrome-style tab drag-out & cross-window drag-and-drop, tab `×`/`+` hover glyph visibility, File Explorer search/filtering/tab opening & `Export ▾` menu, view mode order, 3-way Theme cycle, tabbed Ribbon (`✎ Text`, `∫ Math`, `⊞ Tables`), block `Delete` buttons & Reader hiding, live Math & Excel table formula calculation/recalculation, Light/Sepia/Dark themes, Reader Comfort Bar, Focus Mode (`F11`), smooth keyboard scroll & `↑ Top` pill, `#anchor`/footnote jumps & Outline scroll-spy + search/collapse tree, external file change auto-reload, dirty banner & `ExternalDiffModal`, clipboard image paste, session restore & crash-safe recovery, status bar reading time & writing goals, links across all views/tables, all 6 Mermaid diagram renders, BiDi/RTL, Find & Replace, zoom shortcuts & `Ctrl+Scroll`/Pinch, middle-click auto-scroll, `>100 KB` perf, startup UI glyphs, `Galley` cache invalidation, Print dialog, and unsaved prompts. |
-| [benches/editor_bench.rs](benches/editor_bench.rs) | Criterion benchmarks across 10 MB rope edits & line slicing, 10 MB viewport block layout & 45-row source slicing, 10 MB cached `word_count` & `Ctrl+A` `query_active_format`, 10 MB literal/case-insensitive/regex search, 1 MB `parse_to_ir`, and Arabic `shape_bidi_for_display`. |
+| [tests/security_and_scalability_tests.rs](tests/security_and_scalability_tests.rs) | Security and hardware-scale integration tests verifying HTML CSP/XSS & local-file confinement, DOCX/PDF traversal & link sanitization, `.handoff` path confinement, `HKCU` registry/exe validation, deep recursion & dense graph safety, uncapped `>4,096`-line tables & `>256`-line math blocks, streaming UTF-16/lossy-UTF-8 file opens, RAM-adaptive undo budgets & `Rope` undo payloads, parallel AST & search parity/cancellation, uncapped diffing (`>2,000` lines), and streaming HTML/JSON exports. |
+| [benches/editor_bench.rs](benches/editor_bench.rs) | Criterion benchmarks across 10 MB rope edits & line slicing, 10 MB viewport block layout & 45-row source slicing, 10 MB cached `word_count` & `Ctrl+A` `query_active_format`, 10 MB literal/case-insensitive/regex search, 1 MB `parse_to_ir` & `parse_rope_to_ir`, 50k-block Fenwick updates, math/Mermaid layout, Arabic `shape_bidi_for_display`, 256 KB HTML/JSON streaming exports, 1,000-row table extract/build, and 100 KB single-line grapheme stepping. |
 
 ---
 
@@ -127,14 +129,20 @@ Automatically loaded at startup and saved on workspace changes (`dark_mode`, `th
 
 | Benchmark | Workload | Mean Time |
 | :--- | :--- | ---: |
-| `doc_ops_10mb/word_count_10mb_cached` | Cached word count on 10 MB Markdown | **520.88 ps** |
-| `rope_10mb/line_jump_and_slice_10mb` | Random line jump & slice on 10 MB Rope | **331.37 ns** |
-| `doc_ops_10mb/query_active_format_10mb_ctrl_a` | Toolbar format query with full 10 MB `Ctrl+A` selection | **327.84 ns** |
-| `viewport_10mb/visible_blocks_lookup_and_layout` | O(log B) viewport query + layout on 10 MB doc | **2.3682 µs** |
-| `rope_10mb/insert_and_delete_middle_char` | Mid-document insert + delete + incremental word count (10 MB) | **2.9549 µs** |
-| `bidi_shape_arabic_line` | Mixed Arabic/English/number BiDi contextual shaping | **5.8962 µs** |
-| `viewport_10mb/visible_source_rows_45_lines` | 45 visible Source rows slice on 10 MB Rope | **14.113 µs** |
-| `search_10mb/literal_case_sensitive` | SIMD `memchr::memmem` search across 10 MB | **3.3637 ms** |
-| `search_10mb/regex` | Linear-time regex (`ID-\d+`) across 10 MB | **12.312 ms** |
-| `search_10mb/case_insensitive` | Unicode case-insensitive search across 10 MB | **15.539 ms** |
-| `ast_parse_1mb/parse_to_ir_1mb` | Full `comrak` AST -> IR parse of 1 MB GFM (runs off-thread >= 32 KB) | **136.74 ms** |
+| `doc_ops_10mb/word_count_10mb_cached` | Cached word count on 10 MB Markdown | **498.51 ps** |
+| `doc_ops_10mb/query_active_format_10mb_ctrl_a` | Toolbar format query with full 10 MB `Ctrl+A` selection | **317.14 ns** |
+| `rope_10mb/line_jump_and_slice_10mb` | Random line jump & slice on 10 MB Rope | **354.03 ns** |
+| `viewport_10mb/visible_blocks_lookup_and_layout` | O(log B) viewport query + layout on 10 MB doc | **2.0651 µs** |
+| `rope_10mb/insert_and_delete_middle_char` | Mid-document insert + delete + incremental word count (10 MB) | **3.0408 µs** |
+| `bidi_shape_arabic_line` | Mixed Arabic/English/number BiDi contextual shaping | **5.5665 µs** |
+| `viewport_10mb/visible_source_rows_45_lines` | 45 visible Source rows slice on 10 MB Rope | **14.855 µs** |
+| `long_line_100kb_move_right_grapheme_500` | 500 windowed grapheme steps in a 100 KB line | **689.08 µs** |
+| `search_10mb/literal_case_sensitive` | Parallel SIMD `memchr::memmem` search across 10 MB | **1.7415 ms** |
+| `search_10mb/case_insensitive` | Parallel ASCII case-insensitive search across 10 MB | **2.1518 ms** |
+| `table_1000_rows/build_table_markdown_1000_rows` | Serialize 1,000-row table to CommonMark Markdown | **3.3040 ms** |
+| `table_1000_rows/extract_tables_1000_rows` | Parse & extract 1,000-row Markdown table | **3.4237 ms** |
+| `export_256kb/render_html_256kb` | Render 256 KB document to standalone CSP HTML5 | **3.7189 ms** |
+| `search_10mb/regex` | Parallel line-stream regex (`ID-\d+`) across 10 MB | **10.786 ms** |
+| `export_256kb/stream_json_file_256kb` | Stream 256 KB AST/stats/outline JSON to disk | **21.119 ms** |
+| `ast_parse_1mb/parse_rope_to_ir_1mb` | Parallel chunked Rope -> IR parse of 1 MB GFM | **54.297 ms** |
+| `ast_parse_1mb/parse_to_ir_1mb` | Full `comrak` AST -> IR parse of 1 MB GFM (runs off-thread >= 32 KB) | **135.71 ms** |

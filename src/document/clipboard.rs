@@ -11,6 +11,9 @@ use crate::document::ast::build_table_markdown;
 use crate::export::ir::TableAlign;
 
 const MAX_CLIPBOARD_IMAGE_PIXELS: u64 = 64_000_000;
+const MAX_CLIPBOARD_HTML_BYTES: usize = 16 * 1024 * 1024;
+const MAX_CLIPBOARD_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_HTML_TAG_STACK: usize = 128;
 static IMAGE_PASTE_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// Extracts the HTML fragment from a Windows `CF_HTML` clipboard payload, honoring
@@ -114,11 +117,11 @@ fn extract_plain_preview_from_html(html: &str) -> String {
                 }
                 break;
             }
-            let lower_peek = html[i..html.len().min(i + 12)].to_ascii_lowercase();
+            let peek = &bytes[i..bytes.len().min(i + 12)];
             for raw_tag in ["<script", "<style", "<head", "<title", "<xml"] {
-                if lower_peek.starts_with(raw_tag)
-                    && lower_peek
-                        .as_bytes()
+                if peek.len() >= raw_tag.len()
+                    && peek[..raw_tag.len()].eq_ignore_ascii_case(raw_tag.as_bytes())
+                    && peek
                         .get(raw_tag.len())
                         .is_none_or(|b| *b == b'>' || b.is_ascii_whitespace())
                 {
@@ -225,7 +228,7 @@ mod win_clip {
         }
         // SAFETY: Handle came from `GetClipboardData` while clipboard is open.
         let size = unsafe { GlobalSize(handle) };
-        if size == 0 {
+        if size == 0 || size > super::MAX_CLIPBOARD_HTML_BYTES {
             return None;
         }
         // SAFETY: Locking non-zero global clipboard handle.
@@ -285,7 +288,7 @@ mod win_clip {
         }
     }
 
-    fn read_global_clipboard_bytes(format: u32) -> Option<Vec<u8>> {
+    fn read_global_clipboard_bytes(format: u32, max_bytes: usize) -> Option<Vec<u8>> {
         // SAFETY: Caller holds an open `ClipboardGuard`.
         let handle = unsafe { GetClipboardData(format) };
         if handle.is_null() {
@@ -293,7 +296,7 @@ mod win_clip {
         }
         // SAFETY: Handle came from `GetClipboardData` while clipboard is open.
         let size = unsafe { GlobalSize(handle) };
-        if size == 0 {
+        if size == 0 || size > max_bytes {
             return None;
         }
         // SAFETY: Locking non-zero global clipboard handle.
@@ -313,11 +316,19 @@ mod win_clip {
         // SAFETY: `png_name` is a NUL-terminated UTF-16 string.
         let cf_png = unsafe { RegisterClipboardFormatW(png_name.as_ptr()) };
         if cf_png != 0
-            && let Some(bytes) = read_global_clipboard_bytes(cf_png)
-                && bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-                    return Some(bytes);
-                }
-        let dib = read_global_clipboard_bytes(CF_DIB)?;
+            && let Some(bytes) =
+                read_global_clipboard_bytes(cf_png, super::MAX_CLIPBOARD_IMAGE_BYTES)
+            && bytes.starts_with(b"\x89PNG\r\n\x1a\n")
+            && let Ok((w, h)) = image::ImageReader::with_format(
+                std::io::Cursor::new(&bytes),
+                image::ImageFormat::Png,
+            )
+            .into_dimensions()
+            && (w as u64).saturating_mul(h as u64) <= super::MAX_CLIPBOARD_IMAGE_PIXELS
+        {
+            return Some(bytes);
+        }
+        let dib = read_global_clipboard_bytes(CF_DIB, super::MAX_CLIPBOARD_IMAGE_BYTES)?;
         dib_to_png_bytes(&dib)
     }
 }
@@ -407,7 +418,9 @@ pub fn dib_to_png_bytes(dib: &[u8]) -> Option<Vec<u8>> {
         pixel_offset = pixel_offset.checked_add(clr_used.checked_mul(4)?)?;
     }
 
-    let row_stride = ((width as usize).checked_mul(bpp as usize)?).div_ceil(32) * 4;
+    let row_stride = ((width as usize).checked_mul(bpp as usize)?)
+        .div_ceil(32)
+        .checked_mul(4)?;
     let total_pixel_bytes = row_stride.checked_mul(height as usize)?;
     if pixel_offset.checked_add(total_pixel_bytes)? > dib.len() {
         return None;
@@ -511,8 +524,32 @@ pub fn read_os_clipboard_image_png() -> Option<Vec<u8>> {
     }
 }
 
-/// Saves pasted clipboard PNG bytes to `<doc_dir>/assets/pasted-image-<ts>.png` (or temp dir for
-/// untitled buffers) and returns `(saved_file_path, markdown_image_url)`.
+fn private_pasted_assets_dir() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(appdata) = std::env::var_os("APPDATA")
+            && !appdata.is_empty()
+        {
+            return PathBuf::from(appdata)
+                .join("MarkdownStudio")
+                .join("pasted_assets");
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        if let Some(home) = std::env::var_os("HOME")
+            && !home.is_empty()
+        {
+            return PathBuf::from(home)
+                .join(".markdown_studio")
+                .join("pasted_assets");
+        }
+    }
+    std::env::temp_dir().join("markdown_studio_assets")
+}
+
+/// Saves pasted clipboard PNG bytes to `<doc_dir>/assets/pasted-image-<ts>.png` (or private
+/// per-user assets dir for untitled buffers) and returns `(saved_file_path, markdown_image_url)`.
 pub fn save_pasted_image_png(
     png_bytes: &[u8],
     doc_path: Option<&Path>,
@@ -527,14 +564,27 @@ pub fn save_pasted_image_png(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    let (target_dir, relative_prefix) = match doc_path.and_then(Path::parent) {
-        Some(parent) if !parent.as_os_str().is_empty() => (parent.join("assets"), Some("assets")),
-        _ => (
-            std::env::temp_dir().join("markdown_studio_assets"),
-            None,
-        ),
+    let (target_dir, relative_prefix, private_perms) = match doc_path.and_then(Path::parent) {
+        Some(parent) if !parent.as_os_str().is_empty() => {
+            (parent.join("assets"), Some("assets"), false)
+        }
+        _ => (private_pasted_assets_dir(), None, true),
     };
-    std::fs::create_dir_all(&target_dir)?;
+    #[cfg(unix)]
+    if private_perms {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&target_dir)?;
+    } else {
+        std::fs::create_dir_all(&target_dir)?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = private_perms;
+        std::fs::create_dir_all(&target_dir)?;
+    }
 
     for attempt in 0..32 {
         let filename = if attempt == 0 {
@@ -544,11 +594,14 @@ pub fn save_pasted_image_png(
             format!("pasted-image-{ts_ms}-{seq}.png")
         };
         let full_path = target_dir.join(&filename);
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&full_path)
-        {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        if private_perms {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        match opts.open(&full_path) {
             Ok(mut file) => {
                 file.write_all(png_bytes)?;
                 file.flush()?;
@@ -624,13 +677,10 @@ pub fn smart_paste_markdown(plain_text: &str, html: Option<&str>) -> String {
 /// and converts them into a GFM Markdown table.
 pub fn tsv_to_markdown_table(text: &str) -> Option<String> {
     let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-    let mut lines: Vec<&str> = normalized.split('\n').collect();
-    while lines.last().is_some_and(|l| l.trim().is_empty()) {
-        lines.pop();
-    }
-    while lines.first().is_some_and(|l| l.trim().is_empty()) {
-        lines.remove(0);
-    }
+    let raw_lines: Vec<&str> = normalized.split('\n').collect();
+    let start = raw_lines.iter().position(|l| !l.trim().is_empty())?;
+    let end = raw_lines.iter().rposition(|l| !l.trim().is_empty())? + 1;
+    let lines = &raw_lines[start..end];
     if lines.len() < 2 {
         return None;
     }
@@ -645,7 +695,7 @@ pub fn tsv_to_markdown_table(text: &str) -> Option<String> {
     let mut any_non_empty_cell = false;
     let mut all_first_col_empty = true;
 
-    for line in &lines {
+    for line in lines {
         if !line.contains('\t') {
             return None;
         }
@@ -1042,20 +1092,53 @@ fn parse_inline_css_flags(style: &str) -> InlineCssFlags {
     flags
 }
 
+fn strip_ascii_control_and_ws(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
+}
+
+fn sanitize_md_url(url: &str) -> String {
+    let mut out = String::with_capacity(url.len());
+    for ch in url.trim().chars() {
+        if ch.is_control() {
+            continue;
+        }
+        match ch {
+            '(' => out.push_str("%28"),
+            ')' => out.push_str("%29"),
+            ' ' => out.push_str("%20"),
+            '<' => out.push_str("%3C"),
+            '>' => out.push_str("%3E"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn has_safe_paste_scheme(raw: &str, allow_mailto: bool) -> bool {
+    let clean = strip_ascii_control_and_ws(raw.trim());
+    let lower = clean.to_ascii_lowercase();
+    if lower.is_empty() || lower.starts_with(r"\\") || lower.starts_with("//") {
+        return false;
+    }
+    if lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with('#')
+        || (allow_mailto && lower.starts_with("mailto:"))
+    {
+        return true;
+    }
+    // Disallow explicit schemes (`javascript:`, `vbscript:`, `data:`, `file:`, `ms-msdt:`, etc.)
+    // while allowing safe relative paths (`docs/foo.md`, `assets/pic.png`).
+    let before_delim = lower.split(['/', '?', '#']).next().unwrap_or("");
+    !before_delim.contains(':')
+}
+
 fn is_unsafe_paste_url(url: &str) -> bool {
-    let lower = url.trim().to_ascii_lowercase();
-    lower.is_empty()
-        || lower.starts_with("javascript:")
-        || lower.starts_with("vbscript:")
-        || lower.starts_with("data:text/html")
+    !has_safe_paste_scheme(url, true)
 }
 
 fn is_unsafe_or_blob_image_src(src: &str) -> bool {
-    let lower = src.trim().to_ascii_lowercase();
-    lower.is_empty()
-        || lower.starts_with("data:")
-        || lower.starts_with("javascript:")
-        || lower.starts_with("vbscript:")
+    !has_safe_paste_scheme(src, false)
 }
 
 fn extract_code_lang_from_attrs(attrs: &[HtmlAttr]) -> Option<String> {
@@ -1559,11 +1642,14 @@ impl HtmlMdConverter {
                         } else {
                             self.out.len()
                         };
-                        self.link_depth += 1;
-                        effects.push(TagEffect::Link {
-                            href: href_trim.to_string(),
-                            start_len,
-                        });
+                        let safe_href = sanitize_md_url(href_trim);
+                        if !safe_href.is_empty() {
+                            self.link_depth += 1;
+                            effects.push(TagEffect::Link {
+                                href: safe_href,
+                                start_len,
+                            });
+                        }
                     }
                 }
             }
@@ -1571,11 +1657,14 @@ impl HtmlMdConverter {
                 if let Some(src) = attr_value(&attrs, "src") {
                     let src_trim = src.trim();
                     if !is_unsafe_or_blob_image_src(src_trim) {
-                        self.has_rich_structure = true;
-                        let alt = attr_value(&attrs, "alt")
-                            .map(|a| a.trim().replace(['[', ']'], ""))
-                            .unwrap_or_default();
-                        self.push_inline_str(&format!("![{alt}]({src_trim})"));
+                        let safe_src = sanitize_md_url(src_trim);
+                        if !safe_src.is_empty() {
+                            self.has_rich_structure = true;
+                            let alt = attr_value(&attrs, "alt")
+                                .map(|a| a.trim().replace(['[', ']'], ""))
+                                .unwrap_or_default();
+                            self.push_inline_str(&format!("![{alt}]({safe_src})"));
+                        }
                     }
                 }
             }
@@ -1654,7 +1743,7 @@ impl HtmlMdConverter {
             }
         }
 
-        if !self_closing {
+        if !self_closing && self.tag_stack.len() < MAX_HTML_TAG_STACK {
             if effects.is_empty() {
                 effects.push(TagEffect::None);
             }
@@ -2172,5 +2261,20 @@ mod tests {
         assert!(saved_temp.exists());
         assert!(url_temp.contains("pasted-image-"));
         let _ = std::fs::remove_file(&saved_temp);
+    }
+
+    #[test]
+    fn html_to_markdown_handles_multibyte_utf8_and_strips_dangerous_schemes() {
+        let malicious_utf8 = "<p>مرحبا — café <a href=\"javascript:alert(1)\">bad</a> and \
+             <a href=\"data:text/html,<script>1</script>\">data</a> and \
+             <a href=\"https://example.org/ok\">ok</a></p>";
+        let md = html_to_markdown(malicious_utf8).expect("valid sanitized markdown");
+        assert!(md.contains("مرحبا — café"));
+        assert!(!md.to_ascii_lowercase().contains("javascript:"));
+        assert!(!md.to_ascii_lowercase().contains("data:text/html"));
+        assert!(md.contains("[ok](https://example.org/ok)"));
+
+        let preview = extract_plain_preview_from_html("<p><b>عربي 🚀</b> test</p>");
+        assert!(preview.contains("عربي 🚀"));
     }
 }

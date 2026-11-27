@@ -14,6 +14,7 @@ use crate::ui::theme::WordTheme;
 pub(crate) struct OutlineItem {
     pub level: u8,
     pub title: String,
+    pub title_lower: String,
     pub source_line: usize,
     pub y_start: f32,
 }

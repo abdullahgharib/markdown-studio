@@ -12,23 +12,297 @@ use std::hash::{Hash, Hasher};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::time::{Duration, Instant};
 
-use ropey::Rope;
+use ropey::{Rope, RopeBuilder};
 use rustc_hash::FxHasher;
 
 use crate::document::unicode::{
-    next_grapheme_char_idx, prev_grapheme_char_idx, snap_to_grapheme_start,
+    next_grapheme_in_rope_line, prev_grapheme_in_rope_line, snap_grapheme_start_in_rope_line,
 };
 
-const MAX_UNDO_OPS: usize = 500;
+const MAX_UNDO_OPS: usize = 10_000;
 const MIN_UNDO_KEEP: usize = 16;
-const MAX_UNDO_BYTES: usize = 32 * 1024 * 1024;
+const LARGE_UNDO_ROPE_THRESHOLD: usize = 64 * 1024;
 const UNDO_COALESCE_WINDOW: Duration = Duration::from_millis(1500);
 const MAX_COALESCED_CHARS: usize = 128;
-const DIRTY_HASH_MAX_BYTES: usize = 2_000_000;
+const DIRTY_HASH_SYNC_MAX_BYTES: usize = 512 * 1024;
+
+static TOTAL_SYSTEM_RAM_BYTES: OnceLock<u64> = OnceLock::new();
+
+/// Queries physical RAM size from the OS (cached once per process; falls back to 8 GiB).
+pub fn system_total_memory_bytes() -> u64 {
+    *TOTAL_SYSTEM_RAM_BYTES.get_or_init(|| {
+        #[cfg(target_os = "windows")]
+        {
+            #[repr(C)]
+            struct MemoryStatusEx {
+                dw_length: u32,
+                dw_memory_load: u32,
+                ull_total_phys: u64,
+                ull_avail_phys: u64,
+                ull_total_page_file: u64,
+                ull_avail_page_file: u64,
+                ull_total_virtual: u64,
+                ull_avail_virtual: u64,
+                ull_avail_extended_virtual: u64,
+            }
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn GlobalMemoryStatusEx(lp_buffer: *mut MemoryStatusEx) -> i32;
+            }
+            let mut status = MemoryStatusEx {
+                dw_length: std::mem::size_of::<MemoryStatusEx>() as u32,
+                dw_memory_load: 0,
+                ull_total_phys: 0,
+                ull_avail_phys: 0,
+                ull_total_page_file: 0,
+                ull_avail_page_file: 0,
+                ull_total_virtual: 0,
+                ull_avail_virtual: 0,
+                ull_avail_extended_virtual: 0,
+            };
+            // SAFETY: `status` is properly aligned and `dw_length` equals its exact struct size.
+            if unsafe { GlobalMemoryStatusEx(&mut status) } != 0 && status.ull_total_phys > 0 {
+                return status.ull_total_phys;
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(info) = std::fs::read_to_string("/proc/meminfo") {
+                for line in info.lines() {
+                    if let Some(rest) = line.strip_prefix("MemTotal:") {
+                        if let Some(kb) = rest
+                            .split_whitespace()
+                            .next()
+                            .and_then(|n| n.parse::<u64>().ok())
+                        {
+                            return kb.saturating_mul(1024);
+                        }
+                    }
+                }
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use core::ffi::c_void;
+            const CTL_HW: i32 = 6;
+            const HW_MEMSIZE: i32 = 24;
+            unsafe extern "C" {
+                fn sysctl(
+                    name: *const i32,
+                    namelen: u32,
+                    oldp: *mut c_void,
+                    oldlenp: *mut usize,
+                    newp: *const c_void,
+                    newlen: usize,
+                ) -> i32;
+            }
+            let mut mib = [CTL_HW, HW_MEMSIZE];
+            let mut mem_bytes: u64 = 0;
+            let mut size = std::mem::size_of::<u64>();
+            // SAFETY: `mib` has 2 i32s, `mem_bytes` is valid for `size` bytes.
+            let rc = unsafe {
+                sysctl(
+                    mib.as_mut_ptr(),
+                    2,
+                    (&mut mem_bytes as *mut u64).cast::<c_void>(),
+                    &mut size,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            if rc == 0 && mem_bytes > 0 {
+                return mem_bytes;
+            }
+        }
+        8 * 1024 * 1024 * 1024
+    })
+}
+
+/// Computes an adaptive worker thread count based on logical CPU cores while leaving headroom for the UI thread.
+pub fn adaptive_worker_count(max_workers: usize) -> usize {
+    let cap = max_workers.max(1);
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let desired = if cores <= 2 {
+        cores.max(1)
+    } else {
+        cores.saturating_sub(1)
+    };
+    desired.clamp(1, cap)
+}
+
+/// Scales the combined undo+redo memory budget (`total_ram / 32`, clamped to `64 MiB ..= 1 GiB`).
+pub fn adaptive_undo_budget_bytes() -> usize {
+    let raw = (system_total_memory_bytes() / 32)
+        .clamp(64 * 1024 * 1024, 1024 * 1024 * 1024);
+    raw.min(usize::MAX as u64) as usize
+}
 
 static NEXT_BUFFER_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static CSPRNG_FALLBACK_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Fills `buf` with cryptographically strong random bytes from the OS CSPRNG
+/// (`BCryptGenRandom` on Windows, `/dev/urandom` on Unix).
+pub(crate) fn fill_os_random_bytes(buf: &mut [u8]) -> bool {
+    if buf.is_empty() {
+        return true;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use core::ffi::c_void;
+        const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
+        #[link(name = "bcrypt")]
+        unsafe extern "system" {
+            fn BCryptGenRandom(
+                h_algorithm: *mut c_void,
+                pb_buffer: *mut u8,
+                cb_buffer: u32,
+                dw_flags: u32,
+            ) -> i32;
+        }
+        // SAFETY: Passing null algorithm with `BCRYPT_USE_SYSTEM_PREFERRED_RNG` fills `buf`.
+        let status = unsafe {
+            BCryptGenRandom(
+                std::ptr::null_mut(),
+                buf.as_mut_ptr(),
+                buf.len().min(u32::MAX as usize) as u32,
+                BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+            )
+        };
+        status >= 0
+    }
+    #[cfg(unix)]
+    {
+        if let Ok(mut f) = std::fs::File::open("/dev/urandom")
+            && std::io::Read::read_exact(&mut f, buf).is_ok()
+        {
+            return true;
+        }
+        false
+    }
+    #[cfg(not(any(target_os = "windows", unix)))]
+    {
+        let _ = buf;
+        false
+    }
+}
+
+/// Returns 16 random bytes encoded as 32 lowercase hex characters using the OS CSPRNG.
+pub(crate) fn os_random_hex_16() -> String {
+    let mut raw = [0u8; 16];
+    if !fill_os_random_bytes(&mut raw) {
+        let now_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let seq = CSPRNG_FALLBACK_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let pid = std::process::id();
+        let mut fx = FxHasher::default();
+        now_nanos.hash(&mut fx);
+        pid.hash(&mut fx);
+        seq.hash(&mut fx);
+        let a = fx.finish().to_le_bytes();
+        seq.wrapping_mul(0x9E37_79B9_7F4A_7C15).hash(&mut fx);
+        let b = fx.finish().to_le_bytes();
+        raw[..8].copy_from_slice(&a);
+        raw[8..].copy_from_slice(&b);
+    }
+    let mut out = String::with_capacity(32);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for b in raw {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// Constant-time byte-slice equality check for IPC token verification.
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Atomically replaces `target_path` with `tmp_path` (`MoveFileExW` on Windows, `fs::rename` on Unix).
+pub(crate) fn atomic_replace_file(tmp_path: &Path, target_path: &Path) -> io::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::ffi::OsStr;
+        use std::iter::once;
+        use std::os::windows::ffi::OsStrExt;
+        const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+        const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn MoveFileExW(
+                lp_existing_file_name: *const u16,
+                lp_new_file_name: *const u16,
+                dw_flags: u32,
+            ) -> i32;
+        }
+        let src_w: Vec<u16> = OsStr::new(tmp_path).encode_wide().chain(once(0)).collect();
+        let dst_w: Vec<u16> = OsStr::new(target_path)
+            .encode_wide()
+            .chain(once(0))
+            .collect();
+        // SAFETY: Both paths are NUL-terminated UTF-16 buffers.
+        let ok = unsafe {
+            MoveFileExW(
+                src_w.as_ptr(),
+                dst_w.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if ok != 0 {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        if !target_path.exists() {
+            return Err(err);
+        }
+    }
+
+    match std::fs::rename(tmp_path, target_path) {
+        Ok(()) => Ok(()),
+        Err(first_err) if target_path.exists() => {
+            let parent = target_path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let name = target_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("file");
+            let seq = CSPRNG_FALLBACK_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let bak = parent.join(format!(".{name}.{}.{seq}.mdstudio_bak", std::process::id()));
+            if std::fs::rename(target_path, &bak).is_ok() {
+                match std::fs::rename(tmp_path, target_path) {
+                    Ok(()) => {
+                        let _ = std::fs::remove_file(&bak);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        let _ = std::fs::rename(&bak, target_path);
+                        Err(e)
+                    }
+                }
+            } else {
+                Err(first_err)
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
 
 #[inline]
 fn next_buffer_id() -> u64 {
@@ -41,19 +315,99 @@ fn is_single_non_newline_char(s: &str) -> bool {
     matches!(chars.next(), Some(c) if c != '\n' && c != '\r') && chars.next().is_none()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UndoText {
+    Inline(String),
+    Large(Rope),
+}
+
+impl UndoText {
+    fn empty() -> Self {
+        Self::Inline(String::new())
+    }
+
+    fn from_str(s: &str) -> Self {
+        if s.len() >= LARGE_UNDO_ROPE_THRESHOLD {
+            Self::Large(Rope::from_str(s))
+        } else {
+            Self::Inline(s.to_string())
+        }
+    }
+
+    fn from_rope_slice(slice: ropey::RopeSlice<'_>) -> Self {
+        let byte_len = slice.len_bytes();
+        if byte_len == 0 {
+            Self::empty()
+        } else if byte_len >= LARGE_UNDO_ROPE_THRESHOLD {
+            let mut builder = RopeBuilder::new();
+            for chunk in slice.chunks() {
+                builder.append(chunk);
+            }
+            Self::Large(builder.finish())
+        } else {
+            Self::Inline(slice.to_string())
+        }
+    }
+
+    fn byte_len(&self) -> usize {
+        match self {
+            Self::Inline(s) => s.len(),
+            Self::Large(r) => r.len_bytes(),
+        }
+    }
+
+    fn char_len(&self) -> usize {
+        match self {
+            Self::Inline(s) => s.chars().count(),
+            Self::Large(r) => r.len_chars(),
+        }
+    }
+
+    fn line_breaks(&self) -> usize {
+        match self {
+            Self::Inline(s) => s.matches('\n').count(),
+            Self::Large(r) => r.len_lines().saturating_sub(1),
+        }
+    }
+
+    fn snippet(&self, max_chars: usize) -> String {
+        match self {
+            Self::Inline(s) => format_history_snippet(s, max_chars),
+            Self::Large(r) => {
+                let take = r.len_chars().min(max_chars + 1);
+                let s = r.slice(0..take).to_string();
+                format_history_snippet(&s, max_chars)
+            }
+        }
+    }
+
+    fn as_insert_content(&self) -> InsertContent<'_> {
+        match self {
+            Self::Inline(s) => InsertContent::Str(s.as_str()),
+            Self::Large(r) => InsertContent::Rope(r),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum InsertContent<'a> {
+    Str(&'a str),
+    Rope(&'a Rope),
+}
+
 /// A reversible, surgical edit or file-rename operation for O(log n) undo/redo.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum EditOp {
     Text {
         char_idx: usize,
-        deleted: String,
-        inserted: String,
+        deleted: UndoText,
+        inserted: UndoText,
         cursor_before: usize,
         cursor_after: usize,
     },
     Batch {
         /// Tuples of `(char_idx, deleted, inserted)` stored in reverse-offset execution order.
-        edits: Vec<(usize, String, String)>,
+        edits: Vec<(usize, UndoText, UndoText)>,
         cursor_before: usize,
         cursor_after: usize,
     },
@@ -135,9 +489,9 @@ impl EditOp {
         match self {
             EditOp::Text {
                 deleted, inserted, ..
-            } => deleted.len() + inserted.len(),
+            } => deleted.byte_len() + inserted.byte_len(),
             EditOp::Batch { edits, .. } => {
-                edits.iter().map(|(_, d, i)| d.len() + i.len()).sum()
+                edits.iter().map(|(_, d, i)| d.byte_len() + i.byte_len()).sum()
             }
             EditOp::Rename { old_path, new_path } => {
                 old_path.as_os_str().len() + new_path.as_os_str().len()
@@ -159,27 +513,27 @@ impl EditOp {
             EditOp::Text {
                 deleted, inserted, ..
             } => {
-                let ins_chars = inserted.chars().count();
-                let del_chars = deleted.chars().count();
+                let ins_chars = inserted.char_len();
+                let del_chars = deleted.char_len();
                 match (del_chars > 0, ins_chars > 0) {
                     (false, true) => {
-                        let lines = inserted.matches('\n').count();
+                        let lines = inserted.line_breaks();
                         if ins_chars > 28 && lines > 0 {
                             format!("Inserted {ins_chars} chars ({} lines)", lines + 1)
                         } else {
-                            format!("Typed \"{}\"", format_history_snippet(inserted, 24))
+                            format!("Typed \"{}\"", inserted.snippet(24))
                         }
                     }
                     (true, false) => {
                         if del_chars > 28 {
                             format!("Deleted {del_chars} chars")
                         } else {
-                            format!("Deleted \"{}\"", format_history_snippet(deleted, 24))
+                            format!("Deleted \"{}\"", deleted.snippet(24))
                         }
                     }
                     (true, true) => {
-                        let d_snip = format_history_snippet(deleted, 12);
-                        let i_snip = format_history_snippet(inserted, 12);
+                        let d_snip = deleted.snippet(12);
+                        let i_snip = inserted.snippet(12);
                         format!("Replaced \"{d_snip}\" → \"{i_snip}\"")
                     }
                     (false, false) => "No-op edit".to_string(),
@@ -187,6 +541,15 @@ impl EditOp {
             }
         }
     }
+}
+
+#[derive(Debug, Default)]
+struct AsyncDirtyState {
+    saved_hash_ready: AtomicBool,
+    saved_hash: AtomicU64,
+    in_flight_check: AtomicBool,
+    checked_version: AtomicU64,
+    checked_matches: AtomicBool,
 }
 
 /// High-speed UTF-8 B-tree rope document buffer with O(log n) edits and surgical undo/redo.
@@ -197,6 +560,8 @@ pub struct DocumentBuffer {
     undo_stack: std::collections::VecDeque<EditOp>,
     redo_stack: Vec<EditOp>,
     undo_bytes: usize,
+    redo_bytes: usize,
+    undo_budget_bytes: usize,
     last_undo_time: Option<Instant>,
     pub cursor_char: usize,
     pub selection_anchor: Option<usize>,
@@ -208,6 +573,7 @@ pub struct DocumentBuffer {
     clean_undo_depth: Option<usize>,
     saved_len_bytes: usize,
     saved_hash: u64,
+    async_dirty: Arc<AsyncDirtyState>,
     cached_word_count: usize,
     cached_line_ending: &'static str,
 }
@@ -446,6 +812,266 @@ fn compute_rope_hash(rope: &Rope) -> u64 {
     hasher.finish()
 }
 
+fn schedule_async_saved_hash(rope: Rope, slot: Arc<AsyncDirtyState>) {
+    slot.saved_hash_ready
+        .store(false, std::sync::atomic::Ordering::Release);
+    let _ = std::thread::Builder::new()
+        .name("md-dirty-hash".to_string())
+        .spawn(move || {
+            let h = compute_rope_hash(&rope);
+            slot.saved_hash
+                .store(h, std::sync::atomic::Ordering::Relaxed);
+            slot.saved_hash_ready
+                .store(true, std::sync::atomic::Ordering::Release);
+        });
+}
+
+fn schedule_async_dirty_compare(
+    rope: Rope,
+    expected_hash: u64,
+    version: u64,
+    slot: Arc<AsyncDirtyState>,
+) {
+    if slot
+        .in_flight_check
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("md-dirty-cmp".to_string())
+        .spawn(move || {
+            let h = compute_rope_hash(&rope);
+            slot.checked_matches
+                .store(h == expected_hash, std::sync::atomic::Ordering::Relaxed);
+            slot.checked_version
+                .store(version, std::sync::atomic::Ordering::Release);
+            slot.in_flight_check
+                .store(false, std::sync::atomic::Ordering::Release);
+        });
+}
+
+struct StreamingUtf16Reader<R: Read> {
+    inner: R,
+    little_endian: bool,
+    raw_buf: Vec<u8>,
+    raw_len: usize,
+    pending_high: Option<u16>,
+    out_buf: Vec<u8>,
+    out_pos: usize,
+    eof: bool,
+}
+
+impl<R: Read> StreamingUtf16Reader<R> {
+    fn new(inner: R, little_endian: bool) -> Self {
+        Self {
+            inner,
+            little_endian,
+            raw_buf: vec![0u8; 64 * 1024],
+            raw_len: 0,
+            pending_high: None,
+            out_buf: Vec::with_capacity(64 * 1024),
+            out_pos: 0,
+            eof: false,
+        }
+    }
+
+    fn push_char(&mut self, ch: char) {
+        let mut tmp = [0u8; 4];
+        self.out_buf
+            .extend_from_slice(ch.encode_utf8(&mut tmp).as_bytes());
+    }
+
+    fn push_code_unit(&mut self, u: u16) {
+        if (0xD800..=0xDBFF).contains(&u) {
+            if self.pending_high.replace(u).is_some() {
+                self.push_char(char::REPLACEMENT_CHARACTER);
+            }
+        } else if (0xDC00..=0xDFFF).contains(&u) {
+            if let Some(hi) = self.pending_high.take() {
+                let cp = 0x10000 + (((u32::from(hi) - 0xD800) << 10) | (u32::from(u) - 0xDC00));
+                self.push_char(char::from_u32(cp).unwrap_or(char::REPLACEMENT_CHARACTER));
+            } else {
+                self.push_char(char::REPLACEMENT_CHARACTER);
+            }
+        } else {
+            if self.pending_high.take().is_some() {
+                self.push_char(char::REPLACEMENT_CHARACTER);
+            }
+            self.push_char(char::from_u32(u32::from(u)).unwrap_or(char::REPLACEMENT_CHARACTER));
+        }
+    }
+}
+
+impl<R: Read> Read for StreamingUtf16Reader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        while self.out_pos >= self.out_buf.len() {
+            if self.eof {
+                return Ok(0);
+            }
+            self.out_buf.clear();
+            self.out_pos = 0;
+
+            while self.raw_len < 2 && !self.eof {
+                let n = self.inner.read(&mut self.raw_buf[self.raw_len..])?;
+                if n == 0 {
+                    self.eof = true;
+                } else {
+                    self.raw_len += n;
+                }
+            }
+
+            let pair_bytes = (self.raw_len / 2) * 2;
+            let mut idx = 0usize;
+            while idx < pair_bytes {
+                let unit = if self.little_endian {
+                    u16::from_le_bytes([self.raw_buf[idx], self.raw_buf[idx + 1]])
+                } else {
+                    u16::from_be_bytes([self.raw_buf[idx], self.raw_buf[idx + 1]])
+                };
+                self.push_code_unit(unit);
+                idx += 2;
+            }
+            if self.raw_len > pair_bytes {
+                self.raw_buf[0] = self.raw_buf[pair_bytes];
+                self.raw_len = 1;
+            } else {
+                self.raw_len = 0;
+            }
+
+            if self.eof {
+                if self.pending_high.take().is_some() {
+                    self.push_char(char::REPLACEMENT_CHARACTER);
+                }
+                if self.raw_len > 0 {
+                    self.raw_len = 0;
+                    self.push_char(char::REPLACEMENT_CHARACTER);
+                }
+            }
+        }
+
+        let avail = self.out_buf.len() - self.out_pos;
+        let take = avail.min(buf.len());
+        buf[..take].copy_from_slice(&self.out_buf[self.out_pos..self.out_pos + take]);
+        self.out_pos += take;
+        Ok(take)
+    }
+}
+
+struct StreamingLossyUtf8Reader<R: Read> {
+    inner: R,
+    raw_buf: Vec<u8>,
+    raw_len: usize,
+    out_buf: Vec<u8>,
+    out_pos: usize,
+    checked_prefix: bool,
+    eof: bool,
+}
+
+impl<R: Read> StreamingLossyUtf8Reader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            raw_buf: vec![0u8; 64 * 1024],
+            raw_len: 0,
+            out_buf: Vec::with_capacity(64 * 1024),
+            out_pos: 0,
+            checked_prefix: false,
+            eof: false,
+        }
+    }
+}
+
+impl<R: Read> Read for StreamingLossyUtf8Reader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        while self.out_pos >= self.out_buf.len() {
+            if self.eof {
+                return Ok(0);
+            }
+            self.out_buf.clear();
+            self.out_pos = 0;
+
+            while self.out_buf.is_empty() && !self.eof {
+                let n = self.inner.read(&mut self.raw_buf[self.raw_len..])?;
+                if n == 0 {
+                    self.eof = true;
+                } else {
+                    if self.raw_buf[self.raw_len..self.raw_len + n].contains(&0) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "File contains binary data and cannot be opened as text",
+                        ));
+                    }
+                    self.raw_len += n;
+                }
+
+                if !self.checked_prefix && (self.raw_len >= 16 || self.eof) {
+                    self.checked_prefix = true;
+                    if has_binary_magic_prefix(&self.raw_buf[..self.raw_len]) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "File contains binary data and cannot be opened as text",
+                        ));
+                    }
+                }
+
+                let mut pos = 0usize;
+                while pos < self.raw_len {
+                    match std::str::from_utf8(&self.raw_buf[pos..self.raw_len]) {
+                        Ok(valid) => {
+                            self.out_buf.extend_from_slice(valid.as_bytes());
+                            pos = self.raw_len;
+                            break;
+                        }
+                        Err(err) => {
+                            let valid_len = err.valid_up_to();
+                            if valid_len > 0 {
+                                self.out_buf
+                                    .extend_from_slice(&self.raw_buf[pos..pos + valid_len]);
+                                pos += valid_len;
+                            }
+                            if let Some(bad_len) = err.error_len() {
+                                self.out_buf.extend_from_slice("\u{FFFD}".as_bytes());
+                                pos += bad_len;
+                            } else if self.eof {
+                                self.out_buf.extend_from_slice("\u{FFFD}".as_bytes());
+                                pos = self.raw_len;
+                                break;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
+                if pos < self.raw_len {
+                    self.raw_buf.copy_within(pos..self.raw_len, 0);
+                    self.raw_len -= pos;
+                } else {
+                    self.raw_len = 0;
+                }
+            }
+        }
+
+        let avail = self.out_buf.len() - self.out_pos;
+        let take = avail.min(buf.len());
+        buf[..take].copy_from_slice(&self.out_buf[self.out_pos..self.out_pos + take]);
+        self.out_pos += take;
+        Ok(take)
+    }
+}
+
 impl Default for DocumentBuffer {
     fn default() -> Self {
         Self::new()
@@ -462,6 +1088,8 @@ impl DocumentBuffer {
             undo_stack: std::collections::VecDeque::new(),
             redo_stack: Vec::new(),
             undo_bytes: 0,
+            redo_bytes: 0,
+            undo_budget_bytes: adaptive_undo_budget_bytes(),
             last_undo_time: None,
             cursor_char: 0,
             selection_anchor: None,
@@ -473,6 +1101,7 @@ impl DocumentBuffer {
             clean_undo_depth: Some(0),
             saved_len_bytes: 0,
             saved_hash,
+            async_dirty: Arc::new(AsyncDirtyState::default()),
             cached_word_count: 0,
             cached_line_ending: "\n",
         }
@@ -482,9 +1111,11 @@ impl DocumentBuffer {
     pub fn from_str(text: &str) -> Self {
         let rope = Rope::from_str(text);
         let saved_len_bytes = rope.len_bytes();
-        let saved_hash = if saved_len_bytes <= DIRTY_HASH_MAX_BYTES {
+        let async_dirty = Arc::new(AsyncDirtyState::default());
+        let saved_hash = if saved_len_bytes <= DIRTY_HASH_SYNC_MAX_BYTES {
             compute_rope_hash(&rope)
         } else {
+            schedule_async_saved_hash(rope.clone(), Arc::clone(&async_dirty));
             0
         };
         let cached_word_count = count_words_full(&rope);
@@ -495,6 +1126,8 @@ impl DocumentBuffer {
             undo_stack: std::collections::VecDeque::new(),
             redo_stack: Vec::new(),
             undo_bytes: 0,
+            redo_bytes: 0,
+            undo_budget_bytes: adaptive_undo_budget_bytes(),
             last_undo_time: None,
             cursor_char: 0,
             selection_anchor: None,
@@ -506,6 +1139,7 @@ impl DocumentBuffer {
             clean_undo_depth: Some(0),
             saved_len_bytes,
             saved_hash,
+            async_dirty,
             cached_word_count,
             cached_line_ending,
         }
@@ -560,48 +1194,51 @@ impl DocumentBuffer {
     /// Reads a UTF-8, UTF-16 (LE/BE BOM), or compatible plain-text file (stripping any optional BOM) into the B-tree rope.
     pub fn open_file(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let mut head = [0u8; 8];
+        let mut head = [0u8; 512];
         let mut file = std::fs::File::open(&path)?;
         let head_len = file.read(&mut head)?;
         let utf16_bom = detect_utf16_bom(&head[..head_len]);
 
-        let mut streamed_words: Option<usize> = None;
-        let mut rope = if utf16_bom.is_none() {
+        let (mut rope, streamed_words) = if let Some(little_endian) = utf16_bom {
+            let bom_skip = head_len.min(2);
+            let chained = io::Cursor::new(&head[bom_skip..head_len]).chain(file);
+            let buf_reader = BufReader::with_capacity(64 * 1024, chained);
+            let utf16_reader = StreamingUtf16Reader::new(buf_reader, little_endian);
+            let mut counting_reader = StreamingWordCountReader::new(utf16_reader);
+            let r = Rope::from_reader(&mut counting_reader)?;
+            (r, counting_reader.counter.finish_word_count())
+        } else {
+            if has_binary_magic_prefix(&head[..head_len]) || head[..head_len].contains(&0) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "File contains binary data and cannot be opened as text",
+                ));
+            }
             let chained = io::Cursor::new(&head[..head_len]).chain(file);
             let buf_reader = BufReader::with_capacity(64 * 1024, chained);
             let mut counting_reader = StreamingWordCountReader::new(buf_reader);
             match Rope::from_reader(&mut counting_reader) {
-                Ok(r) => {
-                    streamed_words = counting_reader.counter.finish_word_count();
-                    r
-                }
+                Ok(r) => (r, counting_reader.counter.finish_word_count()),
                 Err(err) if err.kind() == io::ErrorKind::InvalidData => {
-                    let bytes = std::fs::read(&path)?;
-                    if has_binary_magic_prefix(&bytes) || bytes.contains(&0) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "File contains binary data and cannot be opened as text",
-                        ));
-                    }
-                    let decoded = String::from_utf8_lossy(&bytes);
-                    Rope::from_str(&decoded)
+                    let reopen = BufReader::with_capacity(64 * 1024, std::fs::File::open(&path)?);
+                    let lossy_reader = StreamingLossyUtf8Reader::new(reopen);
+                    let mut lossy_counter = StreamingWordCountReader::new(lossy_reader);
+                    let r = Rope::from_reader(&mut lossy_counter)?;
+                    (r, lossy_counter.counter.finish_word_count())
                 }
                 Err(err) => return Err(err),
             }
-        } else {
-            drop(file);
-            let bytes = std::fs::read(&path)?;
-            let decoded = decode_utf16_bytes(&bytes, utf16_bom.unwrap_or(true));
-            Rope::from_str(&decoded)
         };
 
         if rope.len_chars() > 0 && rope.char(0) == '\u{FEFF}' {
             rope.remove(0..1);
         }
         let saved_len_bytes = rope.len_bytes();
-        let saved_hash = if saved_len_bytes <= DIRTY_HASH_MAX_BYTES {
+        let async_dirty = Arc::new(AsyncDirtyState::default());
+        let saved_hash = if saved_len_bytes <= DIRTY_HASH_SYNC_MAX_BYTES {
             compute_rope_hash(&rope)
         } else {
+            schedule_async_saved_hash(rope.clone(), Arc::clone(&async_dirty));
             0
         };
         let cached_word_count = streamed_words.unwrap_or_else(|| count_words_full(&rope));
@@ -612,6 +1249,8 @@ impl DocumentBuffer {
             undo_stack: std::collections::VecDeque::new(),
             redo_stack: Vec::new(),
             undo_bytes: 0,
+            redo_bytes: 0,
+            undo_budget_bytes: adaptive_undo_budget_bytes(),
             last_undo_time: None,
             cursor_char: 0,
             selection_anchor: None,
@@ -623,6 +1262,7 @@ impl DocumentBuffer {
             clean_undo_depth: Some(0),
             saved_len_bytes,
             saved_hash,
+            async_dirty,
             cached_word_count,
             cached_line_ending,
         })
@@ -645,9 +1285,13 @@ impl DocumentBuffer {
         let saved_len_bytes = rope.len_bytes();
         let cached_word_count = streamed_words.unwrap_or_else(|| count_words_full(&rope));
         let cached_line_ending = detect_first_line_ending(&rope);
-        let saved_hash = if !dirty && saved_len_bytes <= DIRTY_HASH_MAX_BYTES {
+        let async_dirty = Arc::new(AsyncDirtyState::default());
+        let saved_hash = if dirty {
+            0
+        } else if saved_len_bytes <= DIRTY_HASH_SYNC_MAX_BYTES {
             compute_rope_hash(&rope)
         } else {
+            schedule_async_saved_hash(rope.clone(), Arc::clone(&async_dirty));
             0
         };
         Ok(Self {
@@ -656,6 +1300,8 @@ impl DocumentBuffer {
             undo_stack: std::collections::VecDeque::new(),
             redo_stack: Vec::new(),
             undo_bytes: 0,
+            redo_bytes: 0,
+            undo_budget_bytes: adaptive_undo_budget_bytes(),
             last_undo_time: None,
             cursor_char: 0,
             selection_anchor: None,
@@ -667,6 +1313,7 @@ impl DocumentBuffer {
             clean_undo_depth: if dirty { None } else { Some(0) },
             saved_len_bytes: if dirty { usize::MAX } else { saved_len_bytes },
             saved_hash,
+            async_dirty,
             cached_word_count,
             cached_line_ending,
         })
@@ -676,13 +1323,57 @@ impl DocumentBuffer {
     pub fn mark_clean(&mut self) {
         self.clean_undo_depth = Some(self.undo_stack.len());
         self.saved_len_bytes = self.rope.len_bytes();
-        self.saved_hash = if self.saved_len_bytes <= DIRTY_HASH_MAX_BYTES {
-            compute_rope_hash(&self.rope)
+        if self.saved_len_bytes <= DIRTY_HASH_SYNC_MAX_BYTES {
+            self.saved_hash = compute_rope_hash(&self.rope);
         } else {
-            0
-        };
+            self.saved_hash = 0;
+            schedule_async_saved_hash(self.rope.clone(), Arc::clone(&self.async_dirty));
+        }
         self.dirty = false;
         self.last_undo_time = None;
+    }
+
+    /// Polls (and initiates if needed) asynchronous dirty-hash verification for files > 512 KiB.
+    pub fn poll_dirty_check(&mut self) -> bool {
+        let len_bytes = self.rope.len_bytes();
+        if !self.dirty
+            || len_bytes != self.saved_len_bytes
+            || len_bytes <= DIRTY_HASH_SYNC_MAX_BYTES
+        {
+            return false;
+        }
+        let checked_ver = self
+            .async_dirty
+            .checked_version
+            .load(std::sync::atomic::Ordering::Acquire);
+        if checked_ver == self.version {
+            if self
+                .async_dirty
+                .checked_matches
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                self.dirty = false;
+                return true;
+            }
+            return false;
+        }
+        if self
+            .async_dirty
+            .saved_hash_ready
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            let expected = self
+                .async_dirty
+                .saved_hash
+                .load(std::sync::atomic::Ordering::Relaxed);
+            schedule_async_dirty_compare(
+                self.rope.clone(),
+                expected,
+                self.version,
+                Arc::clone(&self.async_dirty),
+            );
+        }
+        false
     }
 
     fn update_dirty_flag(&mut self) {
@@ -690,8 +1381,9 @@ impl DocumentBuffer {
             self.dirty = false;
             return;
         }
-        if self.rope.len_bytes() == self.saved_len_bytes
-            && self.rope.len_bytes() <= DIRTY_HASH_MAX_BYTES
+        let len_bytes = self.rope.len_bytes();
+        if len_bytes == self.saved_len_bytes
+            && len_bytes <= DIRTY_HASH_SYNC_MAX_BYTES
             && compute_rope_hash(&self.rope) == self.saved_hash
         {
             self.dirty = false;
@@ -736,29 +1428,8 @@ impl DocumentBuffer {
             return Err(err);
         }
 
-        let rename_res = match std::fs::rename(&tmp_path, &path) {
-            Ok(()) => Ok(()),
-            Err(first_err) if path.exists() => {
-                let bak_path = parent.join(format!(".{file_name}.{pid}.{seq}.mdstudio_bak"));
-                if std::fs::rename(&path, &bak_path).is_ok() {
-                    match std::fs::rename(&tmp_path, &path) {
-                        Ok(()) => {
-                            let _ = std::fs::remove_file(&bak_path);
-                            Ok(())
-                        }
-                        Err(err) => {
-                            let _ = std::fs::rename(&bak_path, &path);
-                            Err(err)
-                        }
-                    }
-                } else {
-                    Err(first_err)
-                }
-            }
-            Err(first_err) => Err(first_err),
-        };
-
-        if let Err(err) = rename_res {
+        let _ = (pid, seq, file_name);
+        if let Err(err) = atomic_replace_file(&tmp_path, &path) {
             let _ = std::fs::remove_file(&tmp_path);
             return Err(err);
         }
@@ -868,8 +1539,8 @@ impl DocumentBuffer {
     /// Snaps the current cursor position backward to a valid grapheme-cluster start on its line.
     pub fn snap_cursor_to_grapheme(&mut self) {
         let (line_idx, col) = self.char_to_line_col(self.cursor_char);
-        let line_str = self.line_text(line_idx);
-        let snapped = snap_to_grapheme_start(&line_str, col);
+        let line_len = self.line_len_without_newline(line_idx);
+        let snapped = snap_grapheme_start_in_rope_line(self.rope.line(line_idx), col, line_len);
         self.cursor_char = self.line_col_to_char(line_idx, snapped);
     }
 
@@ -877,8 +1548,7 @@ impl DocumentBuffer {
     pub fn move_left_grapheme(&mut self, extend_selection: bool) {
         let (line_idx, col) = self.char_to_line_col(self.cursor_char);
         if col > 0 {
-            let line_str = self.line_text(line_idx);
-            let prev_col = prev_grapheme_char_idx(&line_str, col);
+            let prev_col = prev_grapheme_in_rope_line(self.rope.line(line_idx), col);
             let target = self.line_col_to_char(line_idx, prev_col);
             self.set_cursor(target, extend_selection);
         } else if line_idx > 0 {
@@ -892,10 +1562,10 @@ impl DocumentBuffer {
     /// Moves the cursor right by one full Unicode grapheme cluster (or start of next line).
     pub fn move_right_grapheme(&mut self, extend_selection: bool) {
         let (line_idx, col) = self.char_to_line_col(self.cursor_char);
-        let line_str = self.line_text(line_idx);
-        let line_len = line_str.chars().count();
+        let line_len = self.line_len_without_newline(line_idx);
         if col < line_len {
-            let next_col = next_grapheme_char_idx(&line_str, col);
+            let next_col =
+                next_grapheme_in_rope_line(self.rope.line(line_idx), col, line_len);
             let target = self.line_col_to_char(line_idx, next_col);
             self.set_cursor(target, extend_selection);
         } else if line_idx + 1 < self.len_lines() {
@@ -918,8 +1588,7 @@ impl DocumentBuffer {
         }
         let (line_idx, col) = self.char_to_line_col(c);
         if col > 0 {
-            let line_str = self.line_text(line_idx);
-            let prev_col = prev_grapheme_char_idx(&line_str, col);
+            let prev_col = prev_grapheme_in_rope_line(self.rope.line(line_idx), col);
             let start = self.line_col_to_char(line_idx, prev_col);
             self.remove(start..c);
         } else if c >= 2 && self.rope.char(c - 1) == '\n' && self.rope.char(c - 2) == '\r' {
@@ -941,10 +1610,10 @@ impl DocumentBuffer {
             return;
         }
         let (line_idx, col) = self.char_to_line_col(c);
-        let line_str = self.line_text(line_idx);
-        let line_len = line_str.chars().count();
+        let line_len = self.line_len_without_newline(line_idx);
         if col < line_len {
-            let next_col = next_grapheme_char_idx(&line_str, col);
+            let next_col =
+                next_grapheme_in_rope_line(self.rope.line(line_idx), col, line_len);
             let end = self.line_col_to_char(line_idx, next_col);
             self.remove(c..end);
         } else if c + 1 < len && self.rope.char(c) == '\r' && self.rope.char(c + 1) == '\n' {
@@ -962,9 +1631,14 @@ impl DocumentBuffer {
     }
 
     fn apply_rope_edit(&mut self, start: usize, end: usize, insert_text: &str) {
+        self.apply_rope_edit_content(start, end, InsertContent::Str(insert_text));
+    }
+
+    fn apply_rope_edit_content(&mut self, start: usize, end: usize, content: InsertContent<'_>) {
         let total = self.rope.len_chars();
         let s = start.min(total);
         let e = end.min(total).max(s);
+        let touches_line0 = self.rope.char_to_line(s) == 0;
 
         let prev_ws = if s == 0 {
             true
@@ -977,20 +1651,36 @@ impl DocumentBuffer {
             None
         };
         let old_delta = count_word_starts(prev_ws, self.rope.slice(s..e).chars().chain(after_ch));
-        let new_delta = count_word_starts(prev_ws, insert_text.chars().chain(after_ch));
+        let new_delta = match content {
+            InsertContent::Str(txt) => count_word_starts(prev_ws, txt.chars().chain(after_ch)),
+            InsertContent::Rope(r) => count_word_starts(prev_ws, r.chars().chain(after_ch)),
+        };
 
         if s < e {
             self.rope.remove(s..e);
         }
-        if !insert_text.is_empty() {
-            self.rope.insert(s, insert_text);
+        match content {
+            InsertContent::Str(txt) => {
+                if !txt.is_empty() {
+                    self.rope.insert(s, txt);
+                }
+            }
+            InsertContent::Rope(r) => {
+                let mut pos = s;
+                for chunk in r.chunks() {
+                    self.rope.insert(pos, chunk);
+                    pos += chunk.chars().count();
+                }
+            }
         }
 
         self.cached_word_count = self
             .cached_word_count
             .saturating_add(new_delta)
             .saturating_sub(old_delta);
-        self.cached_line_ending = detect_first_line_ending(&self.rope);
+        if touches_line0 {
+            self.cached_line_ending = detect_first_line_ending(&self.rope);
+        }
     }
 
     /// Inserts text at `char_idx` in O(log n) time and pushes an undo entry.
@@ -1007,8 +1697,8 @@ impl DocumentBuffer {
         self.selection_anchor = None;
         self.push_undo(EditOp::Text {
             char_idx: idx,
-            deleted: String::new(),
-            inserted: text.to_string(),
+            deleted: UndoText::empty(),
+            inserted: UndoText::from_str(text),
             cursor_before,
             cursor_after,
         });
@@ -1023,14 +1713,14 @@ impl DocumentBuffer {
             return;
         }
         let cursor_before = self.cursor_char;
-        let deleted = self.rope.slice(start..end).to_string();
+        let deleted = UndoText::from_rope_slice(self.rope.slice(start..end));
         self.apply_rope_edit(start, end, "");
         self.cursor_char = start;
         self.selection_anchor = None;
         self.push_undo(EditOp::Text {
             char_idx: start,
             deleted,
-            inserted: String::new(),
+            inserted: UndoText::empty(),
             cursor_before,
             cursor_after: start,
         });
@@ -1045,11 +1735,7 @@ impl DocumentBuffer {
             return;
         }
         let cursor_before = self.cursor_char;
-        let deleted = if start < end {
-            self.rope.slice(start..end).to_string()
-        } else {
-            String::new()
-        };
+        let deleted = UndoText::from_rope_slice(self.rope.slice(start..end));
         self.apply_rope_edit(start, end, text);
         let cursor_after = start + text.chars().count();
         self.cursor_char = cursor_after;
@@ -1057,7 +1743,7 @@ impl DocumentBuffer {
         self.push_undo(EditOp::Text {
             char_idx: start,
             deleted,
-            inserted: text.to_string(),
+            inserted: UndoText::from_str(text),
             cursor_before,
             cursor_after,
         });
@@ -1100,13 +1786,9 @@ impl DocumentBuffer {
         let first_start = disjoint[0].0.start;
         let mut applied = Vec::with_capacity(disjoint.len());
         for (r, text) in disjoint.into_iter().rev() {
-            let deleted = if r.start < r.end {
-                self.rope.slice(r.start..r.end).to_string()
-            } else {
-                String::new()
-            };
+            let deleted = UndoText::from_rope_slice(self.rope.slice(r.start..r.end));
             self.apply_rope_edit(r.start, r.end, &text);
-            applied.push((r.start, deleted, text));
+            applied.push((r.start, deleted, UndoText::from_str(&text)));
         }
         self.cursor_char = first_start.min(self.len_chars());
         self.selection_anchor = None;
@@ -1155,11 +1837,12 @@ impl DocumentBuffer {
                 cursor_after,
             } => {
                 self.undo_bytes = self.undo_bytes.saturating_sub(op_bytes);
-                let end = (char_idx + inserted.chars().count()).min(self.len_chars());
-                self.apply_rope_edit(char_idx, end, &deleted);
+                let end = (char_idx + inserted.char_len()).min(self.len_chars());
+                self.apply_rope_edit_content(char_idx, end, deleted.as_insert_content());
                 self.cursor_char = cursor_before.min(self.len_chars());
                 self.selection_anchor = None;
                 self.cached_selection = None;
+                self.redo_bytes = self.redo_bytes.saturating_add(op_bytes);
                 self.redo_stack.push(EditOp::Text {
                     char_idx,
                     deleted,
@@ -1178,12 +1861,13 @@ impl DocumentBuffer {
             } => {
                 self.undo_bytes = self.undo_bytes.saturating_sub(op_bytes);
                 for (char_idx, deleted, inserted) in edits.iter().rev() {
-                    let end = (*char_idx + inserted.chars().count()).min(self.len_chars());
-                    self.apply_rope_edit(*char_idx, end, deleted);
+                    let end = (*char_idx + inserted.char_len()).min(self.len_chars());
+                    self.apply_rope_edit_content(*char_idx, end, deleted.as_insert_content());
                 }
                 self.cursor_char = cursor_before.min(self.len_chars());
                 self.selection_anchor = None;
                 self.cached_selection = None;
+                self.redo_bytes = self.redo_bytes.saturating_add(op_bytes);
                 self.redo_stack.push(EditOp::Batch {
                     edits,
                     cursor_before,
@@ -1210,6 +1894,7 @@ impl DocumentBuffer {
                     return UndoRedoOutcome::RenameFailed(msg);
                 }
                 self.undo_bytes = self.undo_bytes.saturating_sub(op_bytes);
+                self.redo_bytes = self.redo_bytes.saturating_add(op_bytes);
                 self.file_path = Some(old_path.clone());
                 if was_clean_at_top {
                     self.clean_undo_depth = Some(self.undo_stack.len());
@@ -1245,8 +1930,9 @@ impl DocumentBuffer {
                 cursor_before,
                 cursor_after,
             } => {
-                let end = (char_idx + deleted.chars().count()).min(self.len_chars());
-                self.apply_rope_edit(char_idx, end, &inserted);
+                self.redo_bytes = self.redo_bytes.saturating_sub(op_bytes);
+                let end = (char_idx + deleted.char_len()).min(self.len_chars());
+                self.apply_rope_edit_content(char_idx, end, inserted.as_insert_content());
                 self.cursor_char = cursor_after.min(self.len_chars());
                 self.selection_anchor = None;
                 self.cached_selection = None;
@@ -1267,9 +1953,10 @@ impl DocumentBuffer {
                 cursor_before,
                 cursor_after,
             } => {
+                self.redo_bytes = self.redo_bytes.saturating_sub(op_bytes);
                 for (char_idx, deleted, inserted) in &edits {
-                    let end = (*char_idx + deleted.chars().count()).min(self.len_chars());
-                    self.apply_rope_edit(*char_idx, end, inserted);
+                    let end = (*char_idx + deleted.char_len()).min(self.len_chars());
+                    self.apply_rope_edit_content(*char_idx, end, inserted.as_insert_content());
                 }
                 self.cursor_char = cursor_after.min(self.len_chars());
                 self.selection_anchor = None;
@@ -1300,6 +1987,7 @@ impl DocumentBuffer {
                     self.redo_stack.push(EditOp::Rename { old_path, new_path });
                     return UndoRedoOutcome::RenameFailed(msg);
                 }
+                self.redo_bytes = self.redo_bytes.saturating_sub(op_bytes);
                 self.undo_bytes = self.undo_bytes.saturating_add(op_bytes);
                 self.file_path = Some(new_path.clone());
                 self.undo_stack.push_back(EditOp::Rename {
@@ -1390,6 +2078,7 @@ impl DocumentBuffer {
     fn finish_edit(&mut self, undo_time: Option<Instant>) {
         self.last_undo_time = undo_time;
         self.redo_stack.clear();
+        self.redo_bytes = 0;
         self.cached_selection = None;
         self.update_dirty_flag();
         self.version = self.version.wrapping_add(1);
@@ -1406,15 +2095,15 @@ impl DocumentBuffer {
         let (
             Some(EditOp::Text {
                 char_idx: prev_idx,
-                deleted: prev_del,
-                inserted: prev_ins,
+                deleted: UndoText::Inline(prev_del),
+                inserted: UndoText::Inline(prev_ins),
                 cursor_after: prev_after,
                 ..
             }),
             EditOp::Text {
                 char_idx: new_idx,
-                deleted: new_del,
-                inserted: new_ins,
+                deleted: UndoText::Inline(new_del),
+                inserted: UndoText::Inline(new_ins),
                 cursor_after: new_after,
                 ..
             },
@@ -1481,8 +2170,14 @@ impl DocumentBuffer {
 
         self.undo_bytes = self.undo_bytes.saturating_add(op.byte_size());
         self.undo_stack.push_back(op);
+        self.redo_bytes = 0;
+        let budget = self.undo_budget_bytes;
+        let hard_cap = budget.saturating_mul(2);
         while self.undo_stack.len() > MAX_UNDO_OPS
-            || (self.undo_stack.len() > MIN_UNDO_KEEP && self.undo_bytes > MAX_UNDO_BYTES)
+            || (self.undo_stack.len() > MIN_UNDO_KEEP
+                && self.undo_bytes.saturating_add(self.redo_bytes) > budget)
+            || (self.undo_stack.len() > 1
+                && self.undo_bytes.saturating_add(self.redo_bytes) > hard_cap)
         {
             if let Some(evicted) = self.undo_stack.pop_front() {
                 self.undo_bytes = self.undo_bytes.saturating_sub(evicted.byte_size());
@@ -1613,29 +2308,6 @@ fn detect_utf16_bom(bytes: &[u8]) -> Option<bool> {
     } else {
         None
     }
-}
-
-fn decode_utf16_bytes(bytes: &[u8], little_endian: bool) -> String {
-    let start = if bytes.len() >= 2 && (bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF])) {
-        2
-    } else {
-        0
-    };
-    let (chunks, rem) = bytes[start..].as_chunks::<2>();
-    let units = chunks.iter().map(|c| {
-        if little_endian {
-            u16::from_le_bytes(*c)
-        } else {
-            u16::from_be_bytes(*c)
-        }
-    });
-    let mut out = char::decode_utf16(units)
-        .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
-        .collect::<String>();
-    if !rem.is_empty() {
-        out.push(char::REPLACEMENT_CHARACTER);
-    }
-    out
 }
 
 fn is_known_text_extension(path: &Path) -> bool {
@@ -2018,17 +2690,21 @@ mod tests {
     #[test]
     fn undo_stack_respects_byte_budget_keeping_minimum_ops() {
         let mut buf = DocumentBuffer::new();
-        let big = "x".repeat(2 * 1024 * 1024); // 2 MiB per edit
+        let test_budget = 32 * 1024 * 1024;
+        buf.undo_budget_bytes = test_budget;
+        assert!(adaptive_undo_budget_bytes() >= 64 * 1024 * 1024);
+        let big = "x".repeat(2 * 1024 * 1024); // 2 MiB per edit (stored as Rope chunked UndoText::Large)
         for _ in 0..24 {
             buf.insert(0, &big);
         }
         // Budget is 32 MiB (~16 ops of 2 MiB), and MIN_UNDO_KEEP is 16
         assert!(buf.undo_depth() >= MIN_UNDO_KEEP);
         assert!(buf.undo_depth() < 24);
-        assert!(buf.undo_bytes <= MAX_UNDO_BYTES);
+        assert!(buf.undo_bytes <= test_budget);
 
         while buf.undo() {}
         assert_eq!(buf.undo_bytes, 0);
+        assert!(buf.redo_bytes > 0);
     }
 
     #[test]
