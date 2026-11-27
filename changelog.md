@@ -5,6 +5,22 @@ For architecture, features, shortcuts, and build instructions, see [README.md](R
 
 ---
 
+### `v0.8.5` (2026-11-27) — Full Configurable Security Toggles & Unlimited OS System Font Support
+- **Full Granular Security Settings (`src/ui/settings.rs`, `src/ui/mod.rs`, `src/ui/settings_modal.rs`)**:
+  - Made every previously hard-blocked link/URI category individually toggleable in **Settings -> Security** while keeping all high-risk categories **disabled (`false`) by default** with live safety warnings and `Restore Safe Defaults`:
+    - External links (`allow_external_links`) & Local file links (`allow_local_file_links`)
+    - Remote image loading (`allow_remote_images`)
+    - Executable & script files (`allow_executable_links`)
+    - UNC network shares (`allow_unc_network_links` — `\\server\share`, `//server/share`, `\\?\UNC\...`)
+    - NTFS Alternate Data Streams (`allow_ntfs_ads_links` — `file.txt:stream`)
+    - `javascript:`, `vbscript:`, and `data:` URIs (`allow_javascript_uri`, `allow_vbscript_uri`, `allow_data_uri` via `classify_unsafe_uri_scheme`)
+  - Split `is_always_blocked_local_link_path` cleanly into `is_unc_local_link_path`, `is_ntfs_ads_local_link_path`, and `is_malformed_local_link_path` while preserving compound checks (e.g., `\\server\share\payload.exe` requires both UNC and executable opt-ins).
+- **Unlimited OS System Font Discovery & Searchable Font Pickers (`src/ui/fonts.rs`, `src/ui/mod.rs`, `src/ui/editor.rs`, `src/ui/reader/`, `src/ui/settings_modal.rs`)**:
+  - Added cross-platform system font enumeration (`installed_system_fonts()` backed by `resvg::usvg::fontdb::Database`) and bounded lazy font loading (`load_system_font_pair()`, preserving `.ttc` face indices) across Windows, macOS, and Linux.
+  - Added searchable font pickers in **Settings -> Appearance & Fonts** for **Menu / UI Font** (`ui_font_name`), **Source Editor Font** (`editor_font_name`), and **Reader / WYSIWYG Font** (`reader_font_name`), wiring `custom_editor`, `custom_reader`, and `custom_reader_bold` from Frame 0 alongside built-in multilingual/symbol fallback chains and `Reset Appearance Defaults`.
+- **Tests (`src/ui/fonts.rs`, `src/ui/settings.rs`, `tests/ui_integration_tests.rs`)**:
+  - Added `installed_system_fonts_enumerates_and_loads_real_font`, updated `font_and_security_settings_defaults_roundtrip_and_clamp` and `test_security_settings_gate_external_local_executable_links_and_remote_images`, and added `test_system_font_discovery_and_custom_font_selection_in_settings`.
+
 ### `v0.8.4` (2026-11-27) — Unified Tabbed Settings, Security Controls, Cross-Platform Chrome Icons & Font Preferences
 - **Unified Settings & Preferences Dialog (`src/ui/settings_modal.rs`, `src/ui/settings.rs`, `src/ui/os_integration.rs`, `src/ui/mod.rs`)**:
   - Added a centralized tabbed `SettingsModal` (`Ctrl+,` or toolbar `Settings` button) unifying **Appearance & Fonts**, **Security**, and **OS Integration** (embedding `OsIntegrationModal::show_contents` cleanly and routing `ToolbarAction::OpenOsIntegrationModal` directly to the OS Integration tab).

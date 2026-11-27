@@ -101,6 +101,22 @@ impl FontPreference {
             FontPreference::Monospace => egui::FontFamily::Monospace,
         }
     }
+
+    pub fn resolved_font_family(self, use_custom: bool) -> egui::FontFamily {
+        if use_custom {
+            egui::FontFamily::Name("custom_reader".into())
+        } else {
+            self.to_font_family()
+        }
+    }
+
+    pub fn resolved_bold_font_family(self, use_custom: bool) -> egui::FontFamily {
+        if use_custom {
+            egui::FontFamily::Name("custom_reader_bold".into())
+        } else {
+            self.to_bold_font_family()
+        }
+    }
 }
 
 /// Persisted user preferences stored locally in JSON format.
@@ -117,13 +133,21 @@ pub struct AppSettings {
     pub sync_scroll: bool,
     pub zoom_factor: f32,
     pub ui_font_size: f32,
+    pub ui_font_name: Option<String>,
     pub editor_font_family: FontPreference,
     pub editor_font_size: f32,
+    pub editor_font_name: Option<String>,
     pub reader_font_family: FontPreference,
     pub reader_font_size: f32,
+    pub reader_font_name: Option<String>,
     pub allow_external_links: bool,
     pub allow_local_file_links: bool,
     pub allow_executable_links: bool,
+    pub allow_unc_network_links: bool,
+    pub allow_ntfs_ads_links: bool,
+    pub allow_javascript_uri: bool,
+    pub allow_vbscript_uri: bool,
+    pub allow_data_uri: bool,
     pub allow_remote_images: bool,
     pub recent_files: Vec<PathBuf>,
     pub explorer_root: Option<PathBuf>,
@@ -149,13 +173,21 @@ impl Default for AppSettings {
             sync_scroll: true,
             zoom_factor: 1.0,
             ui_font_size: 12.5,
+            ui_font_name: None,
             editor_font_family: FontPreference::Monospace,
             editor_font_size: 14.0,
+            editor_font_name: None,
             reader_font_family: FontPreference::SystemSans,
             reader_font_size: 15.5,
+            reader_font_name: None,
             allow_external_links: true,
             allow_local_file_links: true,
             allow_executable_links: false,
+            allow_unc_network_links: false,
+            allow_ntfs_ads_links: false,
+            allow_javascript_uri: false,
+            allow_vbscript_uri: false,
+            allow_data_uri: false,
             allow_remote_images: true,
             recent_files: Vec::new(),
             explorer_root: None,
@@ -299,8 +331,18 @@ impl AppSettings {
             _ => "null".to_string(),
         };
 
+        let opt_str_json = |opt: &Option<String>| -> String {
+            match opt {
+                Some(v) if !v.trim().is_empty() => format!("\"{}\"", escape_json_str(v.trim())),
+                _ => "null".to_string(),
+            }
+        };
+        let ui_font_json = opt_str_json(&self.ui_font_name);
+        let editor_font_json = opt_str_json(&self.editor_font_name);
+        let reader_font_json = opt_str_json(&self.reader_font_name);
+
         format!(
-            "{{\n  \"dark_mode\": {},\n  \"theme_mode\": \"{}\",\n  \"page_width\": \"{}\",\n  \"line_spacing\": \"{}\",\n  \"view_mode\": \"{}\",\n  \"show_markup\": {},\n  \"outline_open\": {},\n  \"split_ratio\": {:.3},\n  \"sync_scroll\": {},\n  \"zoom_factor\": {:.2},\n  \"ui_font_size\": {:.1},\n  \"editor_font_family\": \"{}\",\n  \"editor_font_size\": {:.1},\n  \"reader_font_family\": \"{}\",\n  \"reader_font_size\": {:.1},\n  \"allow_external_links\": {},\n  \"allow_local_file_links\": {},\n  \"allow_executable_links\": {},\n  \"allow_remote_images\": {},\n  \"recent_files\": {},\n  \"explorer_root\": {},\n  \"custom_exe_path\": {},\n  \"auto_sync_exe_path\": {},\n  \"auto_calc_math\": {},\n  \"auto_calc_tables\": {},\n  \"word_goal\": {},\n  \"char_goal\": {}\n}}\n",
+            "{{\n  \"dark_mode\": {},\n  \"theme_mode\": \"{}\",\n  \"page_width\": \"{}\",\n  \"line_spacing\": \"{}\",\n  \"view_mode\": \"{}\",\n  \"show_markup\": {},\n  \"outline_open\": {},\n  \"split_ratio\": {:.3},\n  \"sync_scroll\": {},\n  \"zoom_factor\": {:.2},\n  \"ui_font_size\": {:.1},\n  \"ui_font_name\": {},\n  \"editor_font_family\": \"{}\",\n  \"editor_font_size\": {:.1},\n  \"editor_font_name\": {},\n  \"reader_font_family\": \"{}\",\n  \"reader_font_size\": {:.1},\n  \"reader_font_name\": {},\n  \"allow_external_links\": {},\n  \"allow_local_file_links\": {},\n  \"allow_executable_links\": {},\n  \"allow_unc_network_links\": {},\n  \"allow_ntfs_ads_links\": {},\n  \"allow_javascript_uri\": {},\n  \"allow_vbscript_uri\": {},\n  \"allow_data_uri\": {},\n  \"allow_remote_images\": {},\n  \"recent_files\": {},\n  \"explorer_root\": {},\n  \"custom_exe_path\": {},\n  \"auto_sync_exe_path\": {},\n  \"auto_calc_math\": {},\n  \"auto_calc_tables\": {},\n  \"word_goal\": {},\n  \"char_goal\": {}\n}}\n",
             self.dark_mode || self.theme_mode == ThemeMode::Dark,
             tm,
             pw,
@@ -312,13 +354,21 @@ impl AppSettings {
             self.sync_scroll,
             self.zoom_factor.clamp(0.6, 2.0),
             self.ui_font_size.clamp(11.0, 16.0),
+            ui_font_json,
             self.editor_font_family.as_str(),
             self.editor_font_size.clamp(11.0, 28.0),
+            editor_font_json,
             self.reader_font_family.as_str(),
             self.reader_font_size.clamp(12.0, 28.0),
+            reader_font_json,
             self.allow_external_links,
             self.allow_local_file_links,
             self.allow_executable_links,
+            self.allow_unc_network_links,
+            self.allow_ntfs_ads_links,
+            self.allow_javascript_uri,
+            self.allow_vbscript_uri,
+            self.allow_data_uri,
             self.allow_remote_images,
             recent_json,
             explorer_json,
@@ -394,6 +444,12 @@ impl AppSettings {
         if let Some(sz) = extract_f32_field(raw, "ui_font_size") {
             s.ui_font_size = sz.clamp(11.0, 16.0);
         }
+        if let Some(name) = extract_str_field(raw, "ui_font_name") {
+            let trimmed = name.trim();
+            if !trimmed.is_empty() {
+                s.ui_font_name = Some(trimmed.to_string());
+            }
+        }
         if let Some(fam) = extract_str_field(raw, "editor_font_family")
             && let Some(parsed) = FontPreference::parse(&fam)
         {
@@ -401,6 +457,12 @@ impl AppSettings {
         }
         if let Some(sz) = extract_f32_field(raw, "editor_font_size") {
             s.editor_font_size = sz.clamp(11.0, 28.0);
+        }
+        if let Some(name) = extract_str_field(raw, "editor_font_name") {
+            let trimmed = name.trim();
+            if !trimmed.is_empty() {
+                s.editor_font_name = Some(trimmed.to_string());
+            }
         }
         if let Some(fam) = extract_str_field(raw, "reader_font_family")
             && let Some(parsed) = FontPreference::parse(&fam)
@@ -410,6 +472,12 @@ impl AppSettings {
         if let Some(sz) = extract_f32_field(raw, "reader_font_size") {
             s.reader_font_size = sz.clamp(12.0, 28.0);
         }
+        if let Some(name) = extract_str_field(raw, "reader_font_name") {
+            let trimmed = name.trim();
+            if !trimmed.is_empty() {
+                s.reader_font_name = Some(trimmed.to_string());
+            }
+        }
         if let Some(v) = extract_bool_field(raw, "allow_external_links") {
             s.allow_external_links = v;
         }
@@ -418,6 +486,21 @@ impl AppSettings {
         }
         if let Some(v) = extract_bool_field(raw, "allow_executable_links") {
             s.allow_executable_links = v;
+        }
+        if let Some(v) = extract_bool_field(raw, "allow_unc_network_links") {
+            s.allow_unc_network_links = v;
+        }
+        if let Some(v) = extract_bool_field(raw, "allow_ntfs_ads_links") {
+            s.allow_ntfs_ads_links = v;
+        }
+        if let Some(v) = extract_bool_field(raw, "allow_javascript_uri") {
+            s.allow_javascript_uri = v;
+        }
+        if let Some(v) = extract_bool_field(raw, "allow_vbscript_uri") {
+            s.allow_vbscript_uri = v;
+        }
+        if let Some(v) = extract_bool_field(raw, "allow_data_uri") {
+            s.allow_data_uri = v;
         }
         if let Some(v) = extract_bool_field(raw, "allow_remote_images") {
             s.allow_remote_images = v;
@@ -690,36 +773,60 @@ mod tests {
     fn font_and_security_settings_defaults_roundtrip_and_clamp() {
         let def = AppSettings::default();
         assert!((def.ui_font_size - 12.5).abs() < 0.01);
+        assert_eq!(def.ui_font_name, None);
         assert_eq!(def.editor_font_family, FontPreference::Monospace);
         assert!((def.editor_font_size - 14.0).abs() < 0.01);
+        assert_eq!(def.editor_font_name, None);
         assert_eq!(def.reader_font_family, FontPreference::SystemSans);
         assert!((def.reader_font_size - 15.5).abs() < 0.01);
+        assert_eq!(def.reader_font_name, None);
         assert!(def.allow_external_links);
         assert!(def.allow_local_file_links);
         assert!(!def.allow_executable_links);
+        assert!(!def.allow_unc_network_links);
+        assert!(!def.allow_ntfs_ads_links);
+        assert!(!def.allow_javascript_uri);
+        assert!(!def.allow_vbscript_uri);
+        assert!(!def.allow_data_uri);
         assert!(def.allow_remote_images);
 
         let custom = AppSettings {
             ui_font_size: 14.0,
+            ui_font_name: Some("Segoe UI".to_string()),
             editor_font_family: FontPreference::Serif,
             editor_font_size: 16.5,
+            editor_font_name: Some("Consolas".to_string()),
             reader_font_family: FontPreference::Monospace,
             reader_font_size: 18.0,
+            reader_font_name: Some("Georgia".to_string()),
             allow_external_links: false,
             allow_local_file_links: false,
             allow_executable_links: true,
+            allow_unc_network_links: true,
+            allow_ntfs_ads_links: true,
+            allow_javascript_uri: true,
+            allow_vbscript_uri: true,
+            allow_data_uri: true,
             allow_remote_images: false,
             ..Default::default()
         };
         let parsed = AppSettings::from_json_str(&custom.to_json_string());
         assert!((parsed.ui_font_size - 14.0).abs() < 0.01);
+        assert_eq!(parsed.ui_font_name.as_deref(), Some("Segoe UI"));
         assert_eq!(parsed.editor_font_family, FontPreference::Serif);
         assert!((parsed.editor_font_size - 16.5).abs() < 0.01);
+        assert_eq!(parsed.editor_font_name.as_deref(), Some("Consolas"));
         assert_eq!(parsed.reader_font_family, FontPreference::Monospace);
         assert!((parsed.reader_font_size - 18.0).abs() < 0.01);
+        assert_eq!(parsed.reader_font_name.as_deref(), Some("Georgia"));
         assert!(!parsed.allow_external_links);
         assert!(!parsed.allow_local_file_links);
         assert!(parsed.allow_executable_links);
+        assert!(parsed.allow_unc_network_links);
+        assert!(parsed.allow_ntfs_ads_links);
+        assert!(parsed.allow_javascript_uri);
+        assert!(parsed.allow_vbscript_uri);
+        assert!(parsed.allow_data_uri);
         assert!(!parsed.allow_remote_images);
 
         // Out-of-range font sizes are clamped cleanly

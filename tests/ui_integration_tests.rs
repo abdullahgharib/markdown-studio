@@ -7816,15 +7816,79 @@ fn test_security_settings_gate_external_local_executable_links_and_remote_images
         "expected opt-in executable link to open"
     );
 
-    // UNC network share paths & javascript: remain ALWAYS blocked even when executable opt-in is true
+    // UNC network shares, NTFS ADS, and unsafe URI schemes are blocked by default,
+    // even when allow_executable_links is true, and can each be enabled individually.
     app.last_opened_link = None;
     app.open_link_target(&ctx, r"\\server\share\payload.exe");
     assert!(app.last_opened_link.is_none());
     assert!(app.exporter.status_text.contains("Blocked unsafe executable or network link"));
 
+    app.open_link_target(&ctx, r"\\server\share\doc.md");
+    assert!(app.last_opened_link.is_none());
+    assert!(app.exporter.status_text.contains("Blocked unsafe executable or network link"));
+
+    app.settings.allow_unc_network_links = true;
+    app.open_link_target(&ctx, r"\\server\share\doc.md");
+    assert_eq!(app.last_opened_link.as_deref(), Some(r"\\server\share\doc.md"));
+
+    // UNC executable requires BOTH allow_unc_network_links and allow_executable_links
+    app.settings.allow_executable_links = false;
+    app.last_opened_link = None;
+    app.open_link_target(&ctx, r"\\server\share\payload.exe");
+    assert!(app.last_opened_link.is_none());
+    app.settings.allow_executable_links = true;
+    app.open_link_target(&ctx, r"\\server\share\payload.exe");
+    assert_eq!(
+        app.last_opened_link.as_deref(),
+        Some(r"\\server\share\payload.exe")
+    );
+
+    // NTFS Alternate Data Stream (:)
+    app.settings.allow_local_file_links = true;
+    app.last_opened_link = None;
+    let ads_link = format!("{}:hidden", text_file.display());
+    app.open_link_target(&ctx, &ads_link);
+    assert!(app.last_opened_link.is_none());
+    assert!(app.exporter.status_text.contains("Blocked unsafe executable or network link"));
+    app.settings.allow_ntfs_ads_links = true;
+    app.open_link_target(&ctx, &ads_link);
+    assert_eq!(app.last_opened_link.as_deref(), Some(ads_link.as_str()));
+
+    // Unsafe URI schemes: javascript:, vbscript:, data:
+    app.last_opened_link = None;
     app.open_link_target(&ctx, "javascript:alert(1)");
     assert!(app.last_opened_link.is_none());
     assert!(app.exporter.status_text.contains("Blocked unsafe or invalid link"));
+    app.settings.allow_javascript_uri = true;
+    app.open_link_target(&ctx, "javascript:alert(1)");
+    assert_eq!(app.last_opened_link.as_deref(), Some("javascript:alert(1)"));
+
+    app.last_opened_link = None;
+    app.open_link_target(&ctx, "vbscript:msgbox(1)");
+    assert!(app.last_opened_link.is_none());
+    app.settings.allow_vbscript_uri = true;
+    app.open_link_target(&ctx, "vbscript:msgbox(1)");
+    assert_eq!(app.last_opened_link.as_deref(), Some("vbscript:msgbox(1)"));
+
+    app.last_opened_link = None;
+    app.open_link_target(&ctx, "data:text/html,hello");
+    assert!(app.last_opened_link.is_none());
+    app.settings.allow_data_uri = true;
+    app.open_link_target(&ctx, "data:text/html,hello");
+    assert_eq!(app.last_opened_link.as_deref(), Some("data:text/html,hello"));
+
+    // Security tab UI renders all new granular toggles + Restore Safe Defaults
+    let _ = ui_step(&ctx, &mut app, 0.78, vec![]);
+    app.settings_modal.open = true;
+    app.settings_modal.active_tab = markdown_studio::ui::settings_modal::SettingsTab::Security;
+    let _ = ui_step(&ctx, &mut app, 0.80, vec![]);
+    let out_sec = ui_step(&ctx, &mut app, 0.82, vec![]);
+    let _ = find_rendered_text(&out_sec, "Allow opening UNC network shares", 0.0, 1280.0, 0.0);
+    let _ = find_rendered_text(&out_sec, "Allow opening NTFS Alternate Data Streams", 0.0, 1280.0, 0.0);
+    let _ = find_rendered_text(&out_sec, "Allow javascript: URIs", 0.0, 1280.0, 0.0);
+    let _ = find_rendered_text(&out_sec, "Allow vbscript: URIs", 0.0, 1280.0, 0.0);
+    let _ = find_rendered_text(&out_sec, "Allow data: URIs", 0.0, 1280.0, 0.0);
+    app.settings_modal.open = false;
 
     // Remote images setting propagates cleanly to reader_state and blocks remote badge/image render crash
     app.settings.allow_remote_images = false;
@@ -7879,4 +7943,91 @@ fn test_toolbar_vector_chrome_icons_render_without_tofu_across_themes() {
             assert!(texts.iter().any(|t| t == "Settings"));
         }
     }
+}
+
+#[test]
+fn test_system_font_discovery_and_custom_font_selection_in_settings() {
+    use markdown_studio::ui::fonts::{installed_system_fonts, load_system_font_pair};
+    use markdown_studio::ui::settings::AppSettings;
+    use markdown_studio::ui::settings_modal::SettingsTab;
+
+    let catalog = installed_system_fonts();
+    assert!(
+        !catalog.is_empty(),
+        "expected OS system font discovery to return at least one font"
+    );
+    let sample_font = catalog[0].family.clone();
+    let sample_mono = catalog
+        .iter()
+        .find(|f| f.is_monospace)
+        .map(|f| f.family.clone())
+        .unwrap_or_else(|| sample_font.clone());
+    assert!(
+        load_system_font_pair(&sample_font).is_some(),
+        "expected load_system_font_pair to load {sample_font}"
+    );
+
+    let ctx = egui::Context::default();
+    let (dir, mut app) = new_isolated_app(&ctx);
+    let settings_path = dir.path().join("settings.json");
+    app.buffer = DocumentBuffer::from_str("# Custom Font Test\n\nBody paragraph text.\n");
+    let mut t = 1.0_f64;
+    let _ = ui_step(&ctx, &mut app, t, vec![]);
+
+    assert!(!app.editor_state.use_custom_font);
+    assert!(!app.reader_state.reader_use_custom_font);
+
+    // Select custom OS fonts for UI, Source Editor, and Reader/WYSIWYG
+    app.settings.ui_font_name = Some(sample_font.clone());
+    app.settings.editor_font_name = Some(sample_mono.clone());
+    app.settings.reader_font_name = Some(sample_font.clone());
+    let _ = app.settings.save_to(&settings_path);
+
+    t += 0.02;
+    let _ = ui_step(&ctx, &mut app, t, vec![]);
+    assert!(app.editor_state.use_custom_font);
+    assert!(app.reader_state.reader_use_custom_font);
+
+    let reloaded = AppSettings::load_from(&settings_path);
+    assert_eq!(reloaded.ui_font_name.as_deref(), Some(sample_font.as_str()));
+    assert_eq!(
+        reloaded.editor_font_name.as_deref(),
+        Some(sample_mono.as_str())
+    );
+    assert_eq!(
+        reloaded.reader_font_name.as_deref(),
+        Some(sample_font.as_str())
+    );
+
+    // Open Settings -> Appearance, scroll to bottom if needed, and click Reset Appearance Defaults
+    app.settings_modal.open = true;
+    app.settings_modal.active_tab = SettingsTab::Appearance;
+    t += 0.02;
+    let _ = ui_step(&ctx, &mut app, t, vec![]);
+    t += 0.02;
+    let _ = ui_step(
+        &ctx,
+        &mut app,
+        t,
+        vec![
+            egui::Event::PointerMoved(egui::pos2(640.0, 360.0)),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -600.0),
+                modifiers: Modifiers::NONE,
+            },
+        ],
+    );
+    t += 0.02;
+    let out = ui_step(&ctx, &mut app, t, vec![]);
+    let reset_pos = find_rendered_text(&out, "Reset Appearance Defaults", 0.0, 1280.0, 0.0);
+    let _ = click_at(&ctx, &mut app, &mut t, reset_pos, Modifiers::NONE);
+
+    assert_eq!(app.settings.ui_font_name, None);
+    assert_eq!(app.settings.editor_font_name, None);
+    assert_eq!(app.settings.reader_font_name, None);
+    t += 0.02;
+    let _ = ui_step(&ctx, &mut app, t, vec![]);
+    assert!(!app.editor_state.use_custom_font);
+    assert!(!app.reader_state.reader_use_custom_font);
 }

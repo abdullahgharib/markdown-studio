@@ -46,6 +46,7 @@ struct CachedEditorLine {
 struct LineLayoutCache {
     theme_mode: ThemeMode,
     font_family: crate::ui::settings::FontPreference,
+    use_custom_font: bool,
     font_size_bits: u32,
     ppp_bits: u32,
     atlas: Weak<egui::epaint::mutex::Mutex<egui::epaint::TextureAtlas>>,
@@ -129,6 +130,7 @@ pub struct VirtualEditorState {
     pub autoscroll_active: bool,
     pub font_family: crate::ui::settings::FontPreference,
     pub font_size: f32,
+    pub use_custom_font: bool,
     line_cache: LineLayoutCache,
 }
 
@@ -154,6 +156,7 @@ impl Default for VirtualEditorState {
             autoscroll_active: false,
             font_family: crate::ui::settings::FontPreference::Monospace,
             font_size: 14.0,
+            use_custom_font: false,
             line_cache: LineLayoutCache::default(),
         }
     }
@@ -179,6 +182,7 @@ impl VirtualEditorState {
         ui: &egui::Ui,
         theme_mode: ThemeMode,
         font_family: crate::ui::settings::FontPreference,
+        use_custom_font: bool,
         font_size: f32,
     ) {
         let cur_atlas = ui.fonts(|f| f.texture_atlas());
@@ -188,6 +192,7 @@ impl VirtualEditorState {
         if atlas_changed
             || self.line_cache.theme_mode != theme_mode
             || self.line_cache.font_family != font_family
+            || self.line_cache.use_custom_font != use_custom_font
             || self.line_cache.font_size_bits != font_bits
             || self.line_cache.ppp_bits != ppp_bits
         {
@@ -195,6 +200,7 @@ impl VirtualEditorState {
             self.line_cache.total_bytes = 0;
             self.line_cache.theme_mode = theme_mode;
             self.line_cache.font_family = font_family;
+            self.line_cache.use_custom_font = use_custom_font;
             self.line_cache.font_size_bits = font_bits;
             self.line_cache.ppp_bits = ppp_bits;
             self.line_cache.atlas = Arc::downgrade(&cur_atlas);
@@ -310,11 +316,19 @@ pub fn render_virtual_editor(
         state.request_focus = false;
     }
 
-    let font_id = FontId::new(
-        state.font_size.clamp(11.0, 28.0),
-        state.font_family.to_font_family(),
+    let family = if state.use_custom_font {
+        egui::FontFamily::Name("custom_editor".into())
+    } else {
+        state.font_family.to_font_family()
+    };
+    let font_id = FontId::new(state.font_size.clamp(11.0, 28.0), family);
+    state.prepare_line_cache(
+        ui,
+        theme.mode,
+        state.font_family,
+        state.use_custom_font,
+        font_id.size,
     );
-    state.prepare_line_cache(ui, theme.mode, state.font_family, font_id.size);
     let row_height = (font_id.size * 1.5).round().max(18.0);
     let char_width = ui.fonts(|f| f.glyph_width(&font_id, 'm')).max(7.5);
     let total_lines = buf.len_lines().max(1);
@@ -1760,6 +1774,7 @@ mod tests {
                     ui,
                     theme.mode,
                     crate::ui::settings::FontPreference::Monospace,
+                    false,
                     font_id.size,
                 );
                 let (s1, tr1, _bidi1, g1) =

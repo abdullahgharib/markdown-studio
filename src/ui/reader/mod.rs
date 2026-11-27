@@ -183,6 +183,7 @@ pub struct VirtualReaderState {
     pub auto_calc_tables: bool,
     pub reader_font_family: FontPreference,
     pub reader_font_size: f32,
+    pub reader_use_custom_font: bool,
     pub allow_remote_images: bool,
     pub image_label_editor: Option<ImageLabelEditorState>,
     pub image_lightbox: Option<ImageLightboxState>,
@@ -235,6 +236,7 @@ impl Default for VirtualReaderState {
             auto_calc_tables: true,
             reader_font_family: FontPreference::SystemSans,
             reader_font_size: 15.5,
+            reader_use_custom_font: false,
             allow_remote_images: true,
             image_label_editor: None,
             image_lightbox: None,
@@ -356,6 +358,7 @@ impl VirtualReaderState {
             show_inline_markup,
             ppp.to_bits(),
             self.reader_font_family,
+            self.reader_use_custom_font,
             self.reader_font_size.clamp(12.0, 28.0).to_bits(),
             self.compute_search_sig(),
         );
@@ -2312,6 +2315,7 @@ fn activate_wysiwyg_block(
             code_lang,
             state.reader_font_size,
             state.reader_font_family,
+            state.reader_use_custom_font,
         );
         let galley = ui.fonts(|f| f.layout_job(job));
         let (inner_left, inner_top) = if is_code {
@@ -2714,6 +2718,7 @@ fn build_wysiwyg_edit_layout_job(
     code_lang: &str,
     reader_font_size: f32,
     font_pref: FontPreference,
+    use_custom_font: bool,
 ) -> LayoutJob {
     let mut job = LayoutJob::default();
     job.wrap.max_width = wrap_width.max(40.0);
@@ -2791,6 +2796,7 @@ fn build_wysiwyg_edit_layout_job(
         },
         base_size,
         font_pref,
+        use_custom_font,
         base_color,
         theme,
         show_markup,
@@ -2828,6 +2834,7 @@ fn append_inline_markdown_spans(
     style: InlineEditStyle,
     base_size: f32,
     font_pref: FontPreference,
+    use_custom_font: bool,
     base_color: Color32,
     theme: &WordTheme,
     show_markup: bool,
@@ -2844,9 +2851,9 @@ fn append_inline_markdown_spans(
             return;
         }
         let family = if st.bold {
-            font_pref.to_bold_font_family()
+            font_pref.resolved_bold_font_family(use_custom_font)
         } else {
-            font_pref.to_font_family()
+            font_pref.resolved_font_family(use_custom_font)
         };
         let color = if st.link { theme.link_color } else { base_color };
         let mut fmt = TextFormat {
@@ -2921,6 +2928,7 @@ fn append_inline_markdown_spans(
                             next_st,
                             base_size,
                             font_pref,
+                            use_custom_font,
                             base_color,
                             theme,
                             show_markup,
@@ -2983,6 +2991,7 @@ fn append_inline_markdown_spans(
                             next_st,
                             base_size,
                             font_pref,
+                            use_custom_font,
                             base_color,
                             theme,
                             show_markup,
@@ -3007,6 +3016,7 @@ fn append_inline_markdown_spans(
                             next_st,
                             base_size,
                             font_pref,
+                            use_custom_font,
                             base_color,
                             theme,
                             show_markup,
@@ -3031,6 +3041,7 @@ fn append_inline_markdown_spans(
                             next_st,
                             base_size,
                             font_pref,
+                            use_custom_font,
                             base_color,
                             theme,
                             show_markup,
@@ -3069,6 +3080,7 @@ fn append_inline_markdown_spans(
                             next_st,
                             base_size,
                             font_pref,
+                            use_custom_font,
                             base_color,
                             theme,
                             show_markup,
@@ -3102,6 +3114,7 @@ fn append_inline_markdown_spans(
                             next_st,
                             base_size,
                             font_pref,
+                            use_custom_font,
                             base_color,
                             theme,
                             show_markup,
@@ -3130,6 +3143,7 @@ fn append_inline_markdown_spans(
                         next_st,
                         base_size,
                         font_pref,
+                        use_custom_font,
                         base_color,
                         theme,
                         show_markup,
@@ -3154,7 +3168,10 @@ fn append_inline_markdown_spans(
                 job.append(&s[i..label_start], 0.0, delim_fmt.clone());
                 if is_img {
                     let img_label_fmt = TextFormat {
-                        font_id: FontId::new(base_size * 0.92, font_pref.to_font_family()),
+                        font_id: FontId::new(
+                            base_size * 0.92,
+                            font_pref.resolved_font_family(use_custom_font),
+                        ),
                         color: theme.accent,
                         background: theme.accent_soft,
                         ..Default::default()
@@ -3169,6 +3186,7 @@ fn append_inline_markdown_spans(
                         next_st,
                         base_size,
                         font_pref,
+                        use_custom_font,
                         base_color,
                         theme,
                         show_markup,
@@ -3943,6 +3961,7 @@ fn render_inline_wysiwyg_block(
                 let code_lang_for_layout = cur_lang.clone();
                 let reader_font_size = state.reader_font_size;
                 let reader_font_family = state.reader_font_family;
+                let reader_use_custom_font = state.reader_use_custom_font;
                 let mut layouter =
                     |ui: &egui::Ui, string: &str, wrap_width: f32| -> Arc<egui::Galley> {
                         let job = build_wysiwyg_edit_layout_job(
@@ -3956,6 +3975,7 @@ fn render_inline_wysiwyg_block(
                             &code_lang_for_layout,
                             reader_font_size,
                             reader_font_family,
+                            reader_use_custom_font,
                         );
                         ui.fonts(|f| f.layout_job(job))
                     };
@@ -5217,6 +5237,7 @@ fn render_doc_block(
             } else {
                 let size = heading_font_size_for(*level, state.reader_font_size);
                 let font_pref = state.reader_font_family;
+                let use_custom = state.reader_use_custom_font;
                 let allow_remote = state.allow_remote_images;
                 let prefix_m = if wysiwyg && show_markup {
                     Some(format!("{} ", "#".repeat((*level).clamp(1, 6) as usize)))
@@ -5247,6 +5268,7 @@ fn render_doc_block(
                             1.28,
                             true,
                             font_pref,
+                            use_custom,
                             theme.heading_color,
                             iw,
                             *alignment,
@@ -5349,6 +5371,7 @@ fn render_doc_block(
                 let body_line_mult = state.line_spacing.body_multiplier();
                 let body_font_size = state.reader_font_size.clamp(12.0, 28.0);
                 let font_pref = state.reader_font_family;
+                let use_custom = state.reader_use_custom_font;
                 let allow_remote = state.allow_remote_images;
                 let galley_cache = &mut state.galley_cache;
                 let image_label_editor = &mut state.image_label_editor;
@@ -5364,6 +5387,7 @@ fn render_doc_block(
                             body_line_mult,
                             false,
                             font_pref,
+                            use_custom,
                             theme.text_primary,
                             iw,
                             *alignment,
@@ -5957,7 +5981,11 @@ fn render_doc_block(
                                 let marker_sz = (state.reader_font_size.clamp(12.0, 28.0) * 0.94).clamp(11.0, 26.0);
                                 ui.label(
                                     RichText::new(format!("{}.", start + idx))
-                                        .family(state.reader_font_family.to_font_family())
+                                        .family(
+                                            state
+                                                .reader_font_family
+                                                .resolved_font_family(state.reader_use_custom_font),
+                                        )
                                         .size(marker_sz)
                                         .color(theme.text_muted),
                                 );
@@ -6062,6 +6090,7 @@ fn render_doc_block(
                 let base_dir_owned = state.base_dir.clone();
                 let table_font_size = (13.5 * (state.reader_font_size.clamp(12.0, 28.0) / 15.5)).clamp(11.0, 24.0);
                 let font_pref = state.reader_font_family;
+                let use_custom = state.reader_use_custom_font;
                 let allow_remote = state.allow_remote_images;
                 let galley_cache = &mut state.galley_cache;
                 let image_label_editor = &mut state.image_label_editor;
@@ -6116,6 +6145,7 @@ fn render_doc_block(
                                                 col_w,
                                                 table_font_size,
                                                 font_pref,
+                                                use_custom,
                                                 align,
                                                 true,
                                                 theme,
@@ -6178,6 +6208,7 @@ fn render_doc_block(
                                                 col_w,
                                                 table_font_size,
                                                 font_pref,
+                                                use_custom,
                                                 align,
                                                 false,
                                                 theme,
@@ -6991,6 +7022,7 @@ fn render_inline_math_wrapped_runs(
     line_height_mult: f32,
     force_bold: bool,
     font_pref: FontPreference,
+    use_custom_font: bool,
     base_color: Color32,
     content_w: f32,
     direction: TextDirection,
@@ -7079,6 +7111,7 @@ fn render_inline_math_wrapped_runs(
                             line_height_mult,
                             force_bold,
                             font_pref,
+                            use_custom_font,
                             base_color,
                             direction,
                             theme,
@@ -7125,6 +7158,7 @@ fn render_runs_with_images(
     line_height_mult: f32,
     force_bold: bool,
     font_pref: FontPreference,
+    use_custom_font: bool,
     base_color: Color32,
     content_w: f32,
     alignment: BlockAlignment,
@@ -7168,6 +7202,7 @@ fn render_runs_with_images(
                 line_height_mult.to_bits().hash(&mut hasher);
                 force_bold.hash(&mut hasher);
                 font_pref.hash(&mut hasher);
+                use_custom_font.hash(&mut hasher);
                 core::mem::discriminant(&alignment).hash(&mut hasher);
                 core::mem::discriminant(&direction).hash(&mut hasher);
                 base_color.to_array().hash(&mut hasher);
@@ -7184,6 +7219,7 @@ fn render_runs_with_images(
                     line_height_mult,
                     force_bold,
                     font_pref,
+                    use_custom_font,
                     base_color,
                     direction,
                     theme,
@@ -7233,6 +7269,7 @@ fn render_runs_with_images(
                 line_height_mult,
                 force_bold,
                 font_pref,
+                use_custom_font,
                 base_color,
                 content_w,
                 direction,
@@ -7267,6 +7304,7 @@ fn render_runs_with_images(
                         line_height_mult,
                         force_bold,
                         font_pref,
+                        use_custom_font,
                         base_color,
                         content_w,
                         direction,
@@ -7294,6 +7332,7 @@ fn render_runs_with_images(
                         line_height_mult,
                         force_bold,
                         font_pref,
+                        use_custom_font,
                         base_color,
                         direction,
                         theme,
@@ -7890,6 +7929,7 @@ fn render_table_cell(
     col_w: f32,
     table_font_size: f32,
     font_pref: FontPreference,
+    use_custom_font: bool,
     align: TableAlign,
     is_header: bool,
     theme: &WordTheme,
@@ -7950,6 +7990,7 @@ fn render_table_cell(
                         1.32,
                         is_header,
                         font_pref,
+                        use_custom_font,
                         color,
                         cell_dir,
                         theme,
@@ -8029,6 +8070,7 @@ fn render_table_cell(
                 1.32,
                 is_header,
                 font_pref,
+                use_custom_font,
                 color,
                 col_w,
                 cell_dir,
@@ -8063,6 +8105,7 @@ fn render_table_cell(
             (col_w.round() as i32).hash(&mut hasher);
             table_font_size.to_bits().hash(&mut hasher);
             font_pref.hash(&mut hasher);
+            use_custom_font.hash(&mut hasher);
             is_header.hash(&mut hasher);
             core::mem::discriminant(&egui_align).hash(&mut hasher);
             core::mem::discriminant(&cell_dir).hash(&mut hasher);
@@ -8086,6 +8129,7 @@ fn render_table_cell(
                 1.32,
                 is_header,
                 font_pref,
+                use_custom_font,
                 color,
                 cell_dir,
                 theme,
@@ -8131,6 +8175,7 @@ fn build_runs_layout_job(
     line_height_mult: f32,
     force_bold: bool,
     font_pref: FontPreference,
+    use_custom_font: bool,
     base_color: Color32,
     direction: TextDirection,
     theme: &WordTheme,
@@ -8171,9 +8216,9 @@ fn build_runs_layout_job(
         let family = if run.code {
             FontFamily::Monospace
         } else if is_bold || run.is_footnote_ref {
-            font_pref.to_bold_font_family()
+            font_pref.resolved_bold_font_family(use_custom_font)
         } else {
-            font_pref.to_font_family()
+            font_pref.resolved_font_family(use_custom_font)
         };
 
         let color = if run.link_url.is_some() || run.is_footnote_ref {

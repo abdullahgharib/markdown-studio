@@ -3,6 +3,7 @@ pub mod context_menu;
 pub mod dialogs;
 pub mod editor;
 pub mod explorer;
+pub mod fonts;
 pub mod instance;
 pub mod os_integration;
 pub mod reader;
@@ -200,6 +201,7 @@ pub struct MarkdownApp {
     font_scanned_buf_key: (u64, u64),
     font_rxs: Vec<mpsc::Receiver<u8>>,
     font_scan_rx: Option<mpsc::Receiver<((u64, u64), u8)>>,
+    applied_custom_fonts_key: (Option<String>, Option<String>, Option<String>),
     os_sync_rx: Option<mpsc::Receiver<PathBuf>>,
     last_window_title_key: Option<(u64, bool, usize, Option<PathBuf>)>,
     last_applied_zoom: f32,
@@ -398,6 +400,7 @@ impl MarkdownApp {
         reader_state.auto_calc_tables = settings.auto_calc_tables;
         reader_state.reader_font_family = settings.reader_font_family;
         reader_state.reader_font_size = settings.reader_font_size;
+        reader_state.reader_use_custom_font = settings.reader_font_name.is_some();
         reader_state.allow_remote_images = settings.allow_remote_images;
         if view_mode == ViewMode::Wysiwyg
             && let Some(line_idx) = env_opt("MD_STUDIO_EDIT_LINE", "MD_WORD_EDIT_LINE")
@@ -425,7 +428,7 @@ impl MarkdownApp {
                     explorer_state.set_root(parent.to_path_buf());
                 }
 
-        Self {
+        let mut app = Self {
             doc_id,
             tabs: vec![TabSlot {
                 id: doc_id,
@@ -455,6 +458,7 @@ impl MarkdownApp {
             font_scanned_buf_key: (0, 0),
             font_rxs: Vec::new(),
             font_scan_rx: None,
+            applied_custom_fonts_key: (None, None, None),
             os_sync_rx: None,
             last_window_title_key: None,
             last_applied_zoom: 1.0,
@@ -493,6 +497,7 @@ impl MarkdownApp {
                 st.request_focus = matches!(view_mode, ViewMode::Source | ViewMode::Split);
                 st.font_family = settings.editor_font_family;
                 st.font_size = settings.editor_font_size;
+                st.use_custom_font = settings.editor_font_name.is_some();
                 st
             },
             settings,
@@ -522,22 +527,44 @@ impl MarkdownApp {
             test_clipboard_html: None,
             goal_state: StatusBarGoalState::default(),
             allow_close_now: false,
-        }
+        };
+        app.apply_font_stack_if_changed(ctx);
+        app
     }
 
     fn persist_settings(&self) {
         let _ = self.settings.save_to(&self.settings_path);
     }
 
+    fn apply_font_stack_if_changed(&mut self, ctx: &egui::Context) {
+        let key = (
+            self.settings.ui_font_name.clone(),
+            self.settings.editor_font_name.clone(),
+            self.settings.reader_font_name.clone(),
+        );
+        if key != self.applied_custom_fonts_key {
+            ctx.set_fonts(build_fonts_with_loaded_groups(
+                self.loaded_font_groups,
+                key.0.as_deref(),
+                key.1.as_deref(),
+                key.2.as_deref(),
+            ));
+            self.applied_custom_fonts_key = key;
+            ctx.request_repaint();
+        }
+    }
+
     fn sync_pane_preferences(&mut self) {
         self.editor_state.font_family = self.settings.editor_font_family;
         self.editor_state.font_size = self.settings.editor_font_size;
+        self.editor_state.use_custom_font = self.settings.editor_font_name.is_some();
         self.reader_state.page_width = self.settings.page_width;
         self.reader_state.line_spacing = self.settings.line_spacing;
         self.reader_state.auto_calc_math = self.settings.auto_calc_math;
         self.reader_state.auto_calc_tables = self.settings.auto_calc_tables;
         self.reader_state.reader_font_family = self.settings.reader_font_family;
         self.reader_state.reader_font_size = self.settings.reader_font_size;
+        self.reader_state.reader_use_custom_font = self.settings.reader_font_name.is_some();
         self.reader_state.allow_remote_images = self.settings.allow_remote_images;
     }
 
@@ -3066,7 +3093,12 @@ impl MarkdownApp {
             if newly_loaded != 0 {
                 self.pending_font_groups &= !newly_loaded;
                 self.loaded_font_groups |= newly_loaded;
-                ctx.set_fonts(build_fonts_with_loaded_groups(self.loaded_font_groups));
+                ctx.set_fonts(build_fonts_with_loaded_groups(
+                    self.loaded_font_groups,
+                    self.settings.ui_font_name.as_deref(),
+                    self.settings.editor_font_name.as_deref(),
+                    self.settings.reader_font_name.as_deref(),
+                ));
                 ctx.request_repaint();
             }
         }
@@ -3084,6 +3116,9 @@ impl MarkdownApp {
                                 self.loaded_font_groups |= cached_bits;
                                 ctx.set_fonts(build_fonts_with_loaded_groups(
                                     self.loaded_font_groups,
+                                    self.settings.ui_font_name.as_deref(),
+                                    self.settings.editor_font_name.as_deref(),
+                                    self.settings.reader_font_name.as_deref(),
                                 ));
                                 ctx.request_repaint();
                             }
@@ -3135,7 +3170,12 @@ impl MarkdownApp {
                 let cached_bits = cached_font_groups_mask(missing);
                 if cached_bits != 0 {
                     self.loaded_font_groups |= cached_bits;
-                    ctx.set_fonts(build_fonts_with_loaded_groups(self.loaded_font_groups));
+                    ctx.set_fonts(build_fonts_with_loaded_groups(
+                        self.loaded_font_groups,
+                        self.settings.ui_font_name.as_deref(),
+                        self.settings.editor_font_name.as_deref(),
+                        self.settings.reader_font_name.as_deref(),
+                    ));
                     ctx.request_repaint();
                 }
                 let uncached = missing & !cached_bits;
@@ -3758,6 +3798,7 @@ impl MarkdownApp {
         self.reader_state.modal_open = modal_open_now || self.context_menu.is_open();
         self.reader_state.search_whole_word = self.find_bar.whole_word;
         self.reader_state.base_dir = self.current_base_dir();
+        self.apply_font_stack_if_changed(ctx);
         self.sync_pane_preferences();
         if self.find_bar.open {
             self.find_bar
@@ -4071,6 +4112,7 @@ impl MarkdownApp {
         }
         if settings_outcome.settings_changed {
             apply_ui_font_size(ctx, self.settings.ui_font_size);
+            self.apply_font_stack_if_changed(ctx);
             self.show_markup = self.settings.show_markup;
             self.sync_pane_preferences();
             self.persist_settings();
@@ -4138,9 +4180,34 @@ fn block_index_contains_range(index: &ViewportBlockIndex, range: &std::ops::Rang
 }
 
 impl MarkdownApp {
-    /// Opens or navigates to a validated link target (`#anchor`, `https://`, `www.`, `mailto:`, or local file).
+    /// Opens or navigates to a validated link target (`#anchor`, `https://`, `www.`, `mailto:`, or local file),
+    /// honoring user-configured Security preferences.
     pub fn open_link_target(&mut self, ctx: &egui::Context, raw_url: &str) {
         let Some(target) = classify_link_url(raw_url) else {
+            if let Some((scheme, uri)) = classify_unsafe_uri_scheme(raw_url) {
+                let allowed = match scheme {
+                    "javascript" => self.settings.allow_javascript_uri,
+                    "vbscript" => self.settings.allow_vbscript_uri,
+                    "data" => self.settings.allow_data_uri,
+                    _ => false,
+                };
+                if allowed {
+                    self.last_opened_link = Some(uri.clone());
+                    if self.open_external_links_with_os {
+                        if let Err(err) = open_with_os(&uri) {
+                            ctx.open_url(egui::OpenUrl::new_tab(&uri));
+                            self.exporter.status_text =
+                                format!("Opened {uri} via fallback ({err})");
+                        } else {
+                            self.exporter.status_text = format!("Opened {uri}");
+                        }
+                    } else {
+                        ctx.open_url(egui::OpenUrl::new_tab(&uri));
+                        self.exporter.status_text = format!("Opened {uri}");
+                    }
+                    return;
+                }
+            }
             self.exporter.status_text = format!("Blocked unsafe or invalid link: {raw_url}");
             return;
         };
@@ -4182,7 +4249,23 @@ impl MarkdownApp {
                 } else {
                     raw_path
                 };
-                if is_unc_raw || is_always_blocked_local_link_path(&resolved) {
+                if is_malformed_local_link_path(&resolved) {
+                    self.exporter.status_text = format!(
+                        "Blocked unsafe executable or network link: {}",
+                        resolved.display()
+                    );
+                    return;
+                }
+                let is_unc = is_unc_raw || is_unc_local_link_path(&resolved);
+                if is_unc && !self.settings.allow_unc_network_links {
+                    self.exporter.status_text = format!(
+                        "Blocked unsafe executable or network link: {}",
+                        resolved.display()
+                    );
+                    return;
+                }
+                let is_ads = is_ntfs_ads_local_link_path(&resolved);
+                if is_ads && !self.settings.allow_ntfs_ads_links {
                     self.exporter.status_text = format!(
                         "Blocked unsafe executable or network link: {}",
                         resolved.display()
@@ -4197,6 +4280,36 @@ impl MarkdownApp {
                     );
                     return;
                 }
+
+                // UNC network shares & NTFS Alternate Data Streams bypass local .exists()/canonicalize()
+                // to avoid stalling on unreachable SMB shares or losing `:stream` suffixes.
+                if is_unc || is_ads {
+                    if !exec_resolved && !is_unc && !self.settings.allow_local_file_links {
+                        self.exporter.status_text = format!(
+                            "Blocked local file link (disabled in Settings -> Security): {}",
+                            resolved.display()
+                        );
+                        return;
+                    }
+                    self.last_opened_link = Some(raw_url.to_string());
+                    let target_str = resolved.to_string_lossy().to_string();
+                    if self.open_external_links_with_os {
+                        match open_with_os(&target_str) {
+                            Ok(()) => {
+                                self.exporter.status_text =
+                                    format!("Opened {}", resolved.display());
+                            }
+                            Err(err) => {
+                                self.exporter.status_text =
+                                    format!("Failed to open {}: {err}", resolved.display());
+                            }
+                        }
+                    } else {
+                        self.exporter.status_text = format!("Opened {}", resolved.display());
+                    }
+                    return;
+                }
+
                 if !resolved.exists() {
                     self.exporter.status_text =
                         format!("Linked file not found: {}", resolved.display());
@@ -4205,7 +4318,12 @@ impl MarkdownApp {
                 let canon_resolved = resolved
                     .canonicalize()
                     .unwrap_or_else(|_| resolved.clone());
-                if is_always_blocked_local_link_path(&canon_resolved) {
+                if is_malformed_local_link_path(&canon_resolved)
+                    || (is_unc_local_link_path(&canon_resolved)
+                        && !self.settings.allow_unc_network_links)
+                    || (is_ntfs_ads_local_link_path(&canon_resolved)
+                        && !self.settings.allow_ntfs_ads_links)
+                {
                     self.exporter.status_text = format!(
                         "Blocked unsafe executable or network link: {}",
                         resolved.display()
@@ -5836,6 +5954,36 @@ fn core_fonts() -> &'static FontDefinitions {
             .families
             .insert(FontFamily::Name("serif_bold".into()), serif_bold_chain);
 
+        // Seed custom font families from Frame 0 so changing custom fonts mid-session never panics
+        // while `ctx.set_fonts(...)` queues updates for Frame N+1.
+        let default_custom_editor = fonts
+            .families
+            .get(&FontFamily::Monospace)
+            .cloned()
+            .unwrap_or_default();
+        let default_custom_reader = fonts
+            .families
+            .get(&FontFamily::Proportional)
+            .cloned()
+            .unwrap_or_default();
+        let default_custom_reader_bold = fonts
+            .families
+            .get(&FontFamily::Name("bold".into()))
+            .cloned()
+            .unwrap_or_else(|| default_custom_reader.clone());
+        fonts.families.insert(
+            FontFamily::Name("custom_editor".into()),
+            default_custom_editor,
+        );
+        fonts.families.insert(
+            FontFamily::Name("custom_reader".into()),
+            default_custom_reader,
+        );
+        fonts.families.insert(
+            FontFamily::Name("custom_reader_bold".into()),
+            default_custom_reader_bold,
+        );
+
         fonts
     })
 }
@@ -5862,96 +6010,171 @@ fn cached_font_groups_mask(mask: u8) -> u8 {
     covered
 }
 
-fn build_fonts_with_loaded_groups(loaded_mask: u8) -> FontDefinitions {
+fn build_fonts_with_loaded_groups(
+    loaded_mask: u8,
+    ui_font: Option<&str>,
+    editor_font: Option<&str>,
+    reader_font: Option<&str>,
+) -> FontDefinitions {
     let mut fonts = core_fonts().clone();
-    if loaded_mask == 0 {
-        return fonts;
-    }
 
-    let mut lazy_names: Vec<String> = Vec::new();
-    {
-        let guard = lazy_font_cache().lock().unwrap_or_else(|e| e.into_inner());
-        for bit in [
-            FONT_GROUP_EMOJI,
-            FONT_GROUP_EXTRA_SCRIPTS,
-            FONT_GROUP_CJK,
-        ] {
-            if (loaded_mask & bit) != 0
-                && let Some(entries) = guard.get(&bit) {
+    if loaded_mask != 0 {
+        let mut lazy_names: Vec<String> = Vec::new();
+        {
+            let guard = lazy_font_cache().lock().unwrap_or_else(|e| e.into_inner());
+            for bit in [
+                FONT_GROUP_EMOJI,
+                FONT_GROUP_EXTRA_SCRIPTS,
+                FONT_GROUP_CJK,
+            ] {
+                if (loaded_mask & bit) != 0
+                    && let Some(entries) = guard.get(&bit)
+                {
                     for (name, data) in entries {
                         fonts.font_data.insert(name.clone(), Arc::clone(data));
                         lazy_names.push(name.clone());
                     }
                 }
-        }
-    }
-
-    if lazy_names.is_empty() {
-        return fonts;
-    }
-
-    if let Some(list) = fonts.families.get_mut(&FontFamily::Proportional) {
-        let insert_at = list
-            .iter()
-            .take_while(|n| {
-                matches!(
-                    n.as_str(),
-                    "system_regular" | "system_arabic" | "system_symbols"
-                )
-            })
-            .count();
-        for (offset, name) in lazy_names.iter().enumerate() {
-            list.insert(insert_at + offset, name.clone());
-        }
-    }
-
-    if let Some(list) = fonts.families.get_mut(&FontFamily::Monospace) {
-        for name in &lazy_names {
-            if !list.contains(name) {
-                list.push(name.clone());
             }
         }
-    }
 
-    if let Some(list) = fonts.families.get_mut(&FontFamily::Name("bold".into())) {
-        let insert_at = list
-            .iter()
-            .take_while(|n| {
-                matches!(
-                    n.as_str(),
-                    "system_bold"
-                        | "system_arabic_bold"
-                        | "system_regular"
-                        | "system_arabic"
-                        | "system_symbols"
-                )
-            })
-            .count();
-        for (offset, name) in lazy_names.iter().enumerate() {
-            list.insert(insert_at + offset, name.clone());
-        }
-    }
-
-    for (fam_name, primary_keys) in [
-        ("serif", &["system_serif"][..]),
-        ("serif_bold", &["system_serif_bold", "system_serif"][..]),
-    ] {
-        if let Some(list) = fonts.families.get_mut(&FontFamily::Name(fam_name.into())) {
-            let insert_at = list
-                .iter()
-                .take_while(|n| {
-                    primary_keys.contains(&n.as_str())
-                        || matches!(
+        if !lazy_names.is_empty() {
+            if let Some(list) = fonts.families.get_mut(&FontFamily::Proportional) {
+                let insert_at = list
+                    .iter()
+                    .take_while(|n| {
+                        matches!(
                             n.as_str(),
                             "system_regular" | "system_arabic" | "system_symbols"
                         )
-                })
-                .count();
-            for (offset, name) in lazy_names.iter().enumerate() {
-                list.insert(insert_at + offset, name.clone());
+                    })
+                    .count();
+                for (offset, name) in lazy_names.iter().enumerate() {
+                    list.insert(insert_at + offset, name.clone());
+                }
+            }
+
+            if let Some(list) = fonts.families.get_mut(&FontFamily::Monospace) {
+                for name in &lazy_names {
+                    if !list.contains(name) {
+                        list.push(name.clone());
+                    }
+                }
+            }
+
+            if let Some(list) = fonts.families.get_mut(&FontFamily::Name("bold".into())) {
+                let insert_at = list
+                    .iter()
+                    .take_while(|n| {
+                        matches!(
+                            n.as_str(),
+                            "system_bold"
+                                | "system_arabic_bold"
+                                | "system_regular"
+                                | "system_arabic"
+                                | "system_symbols"
+                        )
+                    })
+                    .count();
+                for (offset, name) in lazy_names.iter().enumerate() {
+                    list.insert(insert_at + offset, name.clone());
+                }
+            }
+
+            for (fam_name, primary_keys) in [
+                ("serif", &["system_serif"][..]),
+                ("serif_bold", &["system_serif_bold", "system_serif"][..]),
+            ] {
+                if let Some(list) = fonts.families.get_mut(&FontFamily::Name(fam_name.into())) {
+                    let insert_at = list
+                        .iter()
+                        .take_while(|n| {
+                            primary_keys.contains(&n.as_str())
+                                || matches!(
+                                    n.as_str(),
+                                    "system_regular" | "system_arabic" | "system_symbols"
+                                )
+                        })
+                        .count();
+                    for (offset, name) in lazy_names.iter().enumerate() {
+                        list.insert(insert_at + offset, name.clone());
+                    }
+                }
             }
         }
     }
+
+    if let Some(name) = ui_font
+        && let Some((reg, bold)) = fonts::load_system_font_pair(name)
+    {
+        fonts.font_data.insert("custom_ui_regular".to_owned(), reg);
+        if let Some(list) = fonts.families.get_mut(&FontFamily::Proportional) {
+            list.insert(0, "custom_ui_regular".to_owned());
+        }
+        let bold_key = if let Some(b) = bold {
+            fonts.font_data.insert("custom_ui_bold".to_owned(), b);
+            "custom_ui_bold"
+        } else {
+            "custom_ui_regular"
+        };
+        if let Some(list) = fonts.families.get_mut(&FontFamily::Name("bold".into())) {
+            list.insert(0, bold_key.to_owned());
+        }
+    }
+
+    let mono_chain = fonts
+        .families
+        .get(&FontFamily::Monospace)
+        .cloned()
+        .unwrap_or_default();
+    let mut custom_ed_chain = Vec::with_capacity(1 + mono_chain.len());
+    if let Some(name) = editor_font
+        && let Some((reg, _)) = fonts::load_system_font_pair(name)
+    {
+        fonts
+            .font_data
+            .insert("custom_editor_regular".to_owned(), reg);
+        custom_ed_chain.push("custom_editor_regular".to_owned());
+    }
+    custom_ed_chain.extend(mono_chain);
+    fonts
+        .families
+        .insert(FontFamily::Name("custom_editor".into()), custom_ed_chain);
+
+    let prop_chain = fonts
+        .families
+        .get(&FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+    let bold_chain = fonts
+        .families
+        .get(&FontFamily::Name("bold".into()))
+        .cloned()
+        .unwrap_or_default();
+    let mut custom_rdr_chain = Vec::with_capacity(1 + prop_chain.len());
+    let mut custom_rdr_bold_chain = Vec::with_capacity(2 + bold_chain.len());
+    if let Some(name) = reader_font
+        && let Some((reg, bold)) = fonts::load_system_font_pair(name)
+    {
+        fonts
+            .font_data
+            .insert("custom_reader_regular".to_owned(), Arc::clone(&reg));
+        custom_rdr_chain.push("custom_reader_regular".to_owned());
+        if let Some(b) = bold {
+            fonts.font_data.insert("custom_reader_bold".to_owned(), b);
+            custom_rdr_bold_chain.push("custom_reader_bold".to_owned());
+        }
+        custom_rdr_bold_chain.push("custom_reader_regular".to_owned());
+    }
+    custom_rdr_chain.extend(prop_chain);
+    custom_rdr_bold_chain.extend(bold_chain);
+    fonts
+        .families
+        .insert(FontFamily::Name("custom_reader".into()), custom_rdr_chain);
+    fonts.families.insert(
+        FontFamily::Name("custom_reader_bold".into()),
+        custom_rdr_bold_chain,
+    );
 
     fonts
 }
@@ -6065,45 +6288,66 @@ fn spawn_lazy_font_loader(missing_mask: u8, ctx: egui::Context) -> mpsc::Receive
     rx
 }
 
-/// Returns `true` for UNC/network paths, control chars, ADS streams, or trailing dots/spaces
-/// that must always be blocked regardless of user settings.
-pub fn is_always_blocked_local_link_path(path: &Path) -> bool {
+/// Classifies `javascript:`, `vbscript:`, and `data:` URIs when control characters are absent.
+pub fn classify_unsafe_uri_scheme(raw_url: &str) -> Option<(&'static str, String)> {
+    let trimmed = raw_url
+        .trim()
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .trim();
+    if trimmed.is_empty() || trimmed.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    for scheme in ["javascript", "vbscript", "data"] {
+        if lower.starts_with(scheme) && lower.as_bytes().get(scheme.len()) == Some(&b':') {
+            return Some((scheme, trimmed.to_string()));
+        }
+    }
+    None
+}
+
+/// Returns `true` for UNC/network share paths (`\\server\share`, `//server/share`, `\\?\UNC\`).
+pub fn is_unc_local_link_path(path: &Path) -> bool {
     let raw_str = path.to_string_lossy();
     let is_non_verbatim_unc = raw_str.starts_with(r"\\") && !raw_str.starts_with(r"\\?\");
     let is_verbatim_unc = raw_str
         .get(..8)
         .is_some_and(|p| p.eq_ignore_ascii_case(r"\\?\UNC\"));
-    if is_non_verbatim_unc
-        || is_verbatim_unc
-        || raw_str.starts_with("//")
-        || raw_str.chars().any(|c| c.is_control())
-    {
+    if is_non_verbatim_unc || is_verbatim_unc || raw_str.starts_with("//") {
         return true;
     }
-    if matches!(
+    matches!(
         path.components().next(),
         Some(std::path::Component::Prefix(p))
             if matches!(
                 p.kind(),
                 std::path::Prefix::UNC(_, _) | std::path::Prefix::VerbatimUNC(_, _)
             )
-    ) {
-        return true;
-    }
-    // Block NTFS Alternate Data Streams (`file.txt:stream::$DATA`) while permitting `C:\...` drive colon.
+    )
+}
+
+/// Returns `true` for NTFS Alternate Data Streams (`file.txt:stream`).
+pub fn is_ntfs_ads_local_link_path(path: &Path) -> bool {
+    let raw_str = path.to_string_lossy();
     let mut colon_check = raw_str.as_ref();
     if let Some(after_verbatim) = colon_check.strip_prefix(r"\\?\") {
         colon_check = after_verbatim;
     }
     let bytes = colon_check.as_bytes();
     if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
-        if colon_check[2..].contains(':') {
-            return true;
-        }
-    } else if colon_check.contains(':') {
+        colon_check[2..].contains(':')
+    } else {
+        colon_check.contains(':')
+    }
+}
+
+/// Returns `true` for control characters or Windows trailing dots/spaces on path components.
+pub fn is_malformed_local_link_path(path: &Path) -> bool {
+    let raw_str = path.to_string_lossy();
+    if raw_str.chars().any(|c| c.is_control()) {
         return true;
     }
-    // Block Windows trailing dots/spaces on path components (stripped by ShellExecuteW).
     for comp in path.components() {
         if let std::path::Component::Normal(s) = comp {
             let s_lossy = s.to_string_lossy();
@@ -6113,6 +6357,13 @@ pub fn is_always_blocked_local_link_path(path: &Path) -> bool {
         }
     }
     false
+}
+
+/// Returns `true` for UNC/network paths, NTFS ADS streams, control chars, or trailing dots/spaces.
+pub fn is_always_blocked_local_link_path(path: &Path) -> bool {
+    is_unc_local_link_path(path)
+        || is_ntfs_ads_local_link_path(path)
+        || is_malformed_local_link_path(path)
 }
 
 /// Returns `true` for executable, script, shortcut, or active document extensions.

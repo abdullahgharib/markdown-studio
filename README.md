@@ -7,7 +7,7 @@
 [![Platforms](https://img.shields.io/badge/Platforms-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#installation)
 [![CI](https://github.com/abdullahgharib/markdown-studio/actions/workflows/ci.yml/badge.svg)](https://github.com/abdullahgharib/markdown-studio/actions/workflows/ci.yml)
 
-**Current Version:** `0.8.4` (`markdown_studio`)
+**Current Version:** `0.8.5` (`markdown_studio`)
 
 ---
 
@@ -49,8 +49,8 @@ Most modern Markdown editors bundle a full Chromium browser via Electron, consum
 - **Context-Aware Right-Click Menus**: Full right-click menus with keyboard navigation (`Arrow` keys/`Enter`/`Esc`), nested `Formatting ▸` / `Headings ▸` submenus, and Light/Sepia/Dark theming across **Source/WYSIWYG/Split**, **Reader/Preview** (strictly read-only in Reader, supporting links, images, code/Math/Mermaid blocks, and Markdown/TSV table copy/recalc/edit), **Tab Bar**, and **File Explorer** (rename, confirmed delete, reveal, and path copy within workspace boundaries).
 - **Crash-Safe Auto-Recovery & External Diff Detection**: Automatic session snapshots (`session.json` + streaming `recovery/` drafts) and clean auto-reload / visual diff modal when files change on disk.
 - **Writing Goals & Reading Time**: Status bar word/character counts, estimated reading time, and configurable writing goal tracker.
-- **Three Paper Themes & Typography Preferences**: **Light** (*Classic Paper*), **Sepia** (*Warm Paper*), and **Dark** (*Midnight Studio*), crisp vector-rendered toolbar chrome icons, configurable UI/Editor/Reader font families and sizes (`Settings -> Appearance & Fonts`, `Ctrl+,`), page width and line spacing, `F11` Focus Mode, `Ctrl+Scroll`/Pinch zoom (`60%–200%`), and middle-click two-arrow auto-scroll.
-- **Granular Link & Media Security Settings (`Settings -> Security`)**: Control external links (`http/https/mailto`), local file links, executable/script opt-in (disabled by default with safety warnings), and remote image fetching — while unconditionally blocking UNC network paths and `javascript:`/`vbscript:`/`data:` URIs.
+- **Three Paper Themes & Unlimited System Font Preferences**: **Light** (*Classic Paper*), **Sepia** (*Warm Paper*), and **Dark** (*Midnight Studio*), crisp vector-rendered toolbar chrome icons, searchable pickers supporting **any installed OS font** (`.ttf`, `.otf`, `.ttc`, `.otc` via native OS font discovery) or built-in preset individually for Menu/UI, Source Editor, and Reader/WYSIWYG along with configurable font sizes (`Settings -> Appearance & Fonts`, `Ctrl+,`), page width and line spacing, `F11` Focus Mode, `Ctrl+Scroll`/Pinch zoom (`60%–200%`), and middle-click two-arrow auto-scroll.
+- **Full Configurable Link & Media Security Settings (`Settings -> Security`)**: Individually enable or disable every link category and resource policy — External Links (`http/https/mailto`), Local File Links, Remote Image Loading, and safe-by-default opt-in controls for Executable/Script Files, UNC Network Shares (`\\server\share`), NTFS Alternate Data Streams (`file.txt:stream`), `javascript:`, `vbscript:`, and `data:` URIs (with safety warnings and `Restore Safe Defaults`).
 
 ### Publishing & Export
 - **Vector PDF**: Paginated PDFs with hierarchical `H1`–`H6` outline bookmarks, clickable URL/`#anchor`/footnote annotations, configurable `{title}`/`{page}`/`{pages}`/`{date}` headers and footers, embedded local images, and high-DPI rasterized Mermaid & 2D math figures.

@@ -118,7 +118,7 @@ impl TableEvalCache {
 
 #[derive(Debug, Default)]
 pub(super) struct ReaderGalleyCache {
-    pub epoch: (u64, ThemeMode, LineSpacing, bool, u32, FontPreference, u32, u64),
+    pub epoch: (u64, ThemeMode, LineSpacing, bool, u32, FontPreference, bool, u32, u64),
     pub atlas: Weak<egui::epaint::mutex::Mutex<egui::epaint::TextureAtlas>>,
     tick: u64,
     pub entries: FxHashMap<(usize, usize, u64), CachedGalley>,
