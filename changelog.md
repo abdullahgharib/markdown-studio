@@ -5,6 +5,20 @@ For architecture, features, shortcuts, and build instructions, see [README.md](R
 
 ---
 
+### `v0.8.4` (2026-11-27) — Unified Tabbed Settings, Security Controls, Cross-Platform Chrome Icons & Font Preferences
+- **Unified Settings & Preferences Dialog (`src/ui/settings_modal.rs`, `src/ui/settings.rs`, `src/ui/os_integration.rs`, `src/ui/mod.rs`)**:
+  - Added a centralized tabbed `SettingsModal` (`Ctrl+,` or toolbar `Settings` button) unifying **Appearance & Fonts**, **Security**, and **OS Integration** (embedding `OsIntegrationModal::show_contents` cleanly and routing `ToolbarAction::OpenOsIntegrationModal` directly to the OS Integration tab).
+  - Persisted new `FontPreference` (`SystemSans`, `Serif`, `Monospace`) and font-size settings (`ui_font_size`, `editor_font_family`, `editor_font_size`, `reader_font_family`, `reader_font_size`) plus security toggles in zero-dependency `settings.json` with range clamping and reset buttons.
+- **Appearance, Fonts & Crisp Menu Typography (`src/ui/theme.rs`, `src/ui/editor.rs`, `src/ui/reader/mod.rs`, `src/ui/reader/caches.rs`, `src/ui/mod.rs`, `src/document/math.rs`)**:
+  - Deepened `text_muted` contrast in `WordTheme::light()` and `WordTheme::sepia()` so menu/toolbar secondary text looks crisp rather than dull, added `apply_ui_font_size()`, registered native `serif` and `serif_bold` font families preserving multilingual fallbacks, and wired live configurable editor & reader/WYSIWYG font families and sizes with automatic `LineLayoutCache` and `ReaderGalleyCache` invalidation.
+- **Cross-Distro Linux / macOS Fonts & Vector Chrome Icons (`src/ui/toolbar.rs`, `src/ui/mod.rs`)**:
+  - Replaced fragile Unicode toolbar chrome glyphs (`M↓`, `✓ Saved` / `● Unsaved`, `▾` chevrons on `Recent`/`Undo`/`Redo`/`Export`/Math/Tables dropdowns, and `✎ Text` / `∫ Math` / `⊞ Tables` ribbon tab icons) with crisp `egui::Painter` vector shapes so toolbar chrome never renders `□` tofu on minimal Linux or macOS font setups.
+  - Expanded Linux font lookup across Arch (`/usr/share/fonts/TTF`, `/usr/share/fonts/liberation`, `/usr/share/fonts/noto`, `/usr/share/fonts/dejavu`), Fedora, and Ubuntu alongside `fc-match` fallback inside `OnceLock`, and expanded macOS font candidates (`HelveticaNeue.ttc`, `SFNS.ttf`, `SFNSMono.ttf`, `Georgia.ttf`).
+- **Link & Remote Image Security Controls (`src/ui/mod.rs`, `src/ui/reader/images.rs`)**:
+  - Added safe-by-default toggles in **Settings -> Security** for external links (`allow_external_links`), local file links (`allow_local_file_links`), opt-in executable/script links (`allow_executable_links`, defaulting `false` with warning banner), and remote image fetching (`allow_remote_images`), while keeping UNC network paths, NTFS Alternate Data Streams, and `javascript:`/`vbscript:`/`data:` URIs unconditionally blocked.
+- **Tests (`src/ui/settings.rs`, `tests/ui_integration_tests.rs`)**:
+  - Added `font_and_security_settings_defaults_roundtrip_and_clamp`, `test_settings_modal_tabs_appearance_fonts_and_persistence`, `test_security_settings_gate_external_local_executable_links_and_remote_images`, and `test_toolbar_vector_chrome_icons_render_without_tofu_across_themes`.
+
 ### `v0.8.3` (2026-11-27) — Context Menu Submenu Stability, WYSIWYG Selection, Reader `Ctrl+A` & Rich HTML Copy
 - **Fixed Submenu Hover Crash (`src/ui/context_menu.rs`)**: Snapshotted `open_submenu_path` into `render_path` before rendering nested panels in `ContextMenuState::render_panels`, preventing an out-of-bounds slice panic when moving from an open `Formatting ▸` / `Headings ▸` submenu back onto root items, and added immediate repaint requests on submenu transitions.
 - **Preserved WYSIWYG Right-Click Selections (`src/ui/reader/mod.rs`)**: Preserved `output.state.cursor` and `buf.selection_range()` across `PointerButton::Secondary` press frames and open context-menu overlays, and rendered custom selection highlights from `buf.selection_range()` while `TextEdit` is unfocused or a context menu is active.

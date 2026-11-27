@@ -7,7 +7,7 @@
 [![Platforms](https://img.shields.io/badge/Platforms-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#installation)
 [![CI](https://github.com/abdullahgharib/markdown-studio/actions/workflows/ci.yml/badge.svg)](https://github.com/abdullahgharib/markdown-studio/actions/workflows/ci.yml)
 
-**Current Version:** `0.8.3` (`markdown_studio`)
+**Current Version:** `0.8.4` (`markdown_studio`)
 
 ---
 
@@ -49,7 +49,8 @@ Most modern Markdown editors bundle a full Chromium browser via Electron, consum
 - **Context-Aware Right-Click Menus**: Full right-click menus with keyboard navigation (`Arrow` keys/`Enter`/`Esc`), nested `Formatting ▸` / `Headings ▸` submenus, and Light/Sepia/Dark theming across **Source/WYSIWYG/Split**, **Reader/Preview** (strictly read-only in Reader, supporting links, images, code/Math/Mermaid blocks, and Markdown/TSV table copy/recalc/edit), **Tab Bar**, and **File Explorer** (rename, confirmed delete, reveal, and path copy within workspace boundaries).
 - **Crash-Safe Auto-Recovery & External Diff Detection**: Automatic session snapshots (`session.json` + streaming `recovery/` drafts) and clean auto-reload / visual diff modal when files change on disk.
 - **Writing Goals & Reading Time**: Status bar word/character counts, estimated reading time, and configurable writing goal tracker.
-- **Three Paper Themes & Comfort Controls**: **Light** (*Classic Paper*), **Sepia** (*Warm Paper*), and **Dark** (*Midnight Studio*), configurable page width and line spacing, `F11` Focus Mode, `Ctrl+Scroll`/Pinch zoom (`60%–200%`), and middle-click two-arrow auto-scroll.
+- **Three Paper Themes & Typography Preferences**: **Light** (*Classic Paper*), **Sepia** (*Warm Paper*), and **Dark** (*Midnight Studio*), crisp vector-rendered toolbar chrome icons, configurable UI/Editor/Reader font families and sizes (`Settings -> Appearance & Fonts`, `Ctrl+,`), page width and line spacing, `F11` Focus Mode, `Ctrl+Scroll`/Pinch zoom (`60%–200%`), and middle-click two-arrow auto-scroll.
+- **Granular Link & Media Security Settings (`Settings -> Security`)**: Control external links (`http/https/mailto`), local file links, executable/script opt-in (disabled by default with safety warnings), and remote image fetching — while unconditionally blocking UNC network paths and `javascript:`/`vbscript:`/`data:` URIs.
 
 ### Publishing & Export
 - **Vector PDF**: Paginated PDFs with hierarchical `H1`–`H6` outline bookmarks, clickable URL/`#anchor`/footnote annotations, configurable `{title}`/`{page}`/`{pages}`/`{date}` headers and footers, embedded local images, and high-DPI rasterized Mermaid & 2D math figures.
@@ -73,6 +74,7 @@ Most modern Markdown editors bundle a full Chromium browser via Electron, consum
 | `Ctrl+B` / `Ctrl+I` / `Ctrl+U` / `Ctrl+K` | Bold / Italic / Underline / Insert Link |
 | `Ctrl+F` / `Ctrl+H` / `F3` / `Shift+F3` | Find & Replace / Next & Previous match |
 | `Ctrl+=` / `Ctrl+-` / `Ctrl+0` | Zoom In / Zoom Out / Reset (100%) |
+| `Ctrl+,` | Open Settings & Preferences (Appearance/Fonts, Security, OS Integration) |
 | `Ctrl+Scroll` / Trackpad Pinch | Smooth Zoom (`60%–200%`) |
 | `Middle-Click` / `Middle-Drag` | Two-arrow smooth auto-scroll |
 | `Click` (Reader) / `Ctrl+Click` (Edit) | Open external URLs, relative `.md` files, `#anchor`, or `[^footnote]` |
@@ -95,7 +97,7 @@ cd markdown-studio
 cargo build --release
 # Output: target\release\markdown_studio.exe
 ```
-*(Optional: If Windows SDK `rc.exe` is installed, `build.rs` embeds the app icon and `VERSIONINFO` metadata automatically. You can also register Windows Explorer context menus via the in-app **OS Menu** button under `HKCU\Software\Classes` without admin rights.)*
+*(Optional: If Windows SDK `rc.exe` is installed, `build.rs` embeds the app icon and `VERSIONINFO` metadata automatically. You can also register Windows Explorer context menus via **Settings -> OS Integration** under `HKCU\Software\Classes` without admin rights.)*
 
 #### Linux (Ubuntu / Debian)
 Install the system libraries required by `eframe`/`egui` and `rfd`, then build:

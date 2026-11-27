@@ -2,7 +2,7 @@ use std::ops::Range;
 use std::sync::{Arc, Weak};
 
 use egui::text::LayoutJob;
-use egui::{Color32, EventFilter, FontFamily, FontId, Key, Sense, Stroke, TextFormat, Vec2};
+use egui::{Color32, EventFilter, FontId, Key, Sense, Stroke, TextFormat, Vec2};
 use rustc_hash::FxHashMap;
 
 use crate::document::editing::{indent_lines, outdent_lines, word_range_in_line};
@@ -45,6 +45,7 @@ struct CachedEditorLine {
 #[derive(Debug, Default)]
 struct LineLayoutCache {
     theme_mode: ThemeMode,
+    font_family: crate::ui::settings::FontPreference,
     font_size_bits: u32,
     ppp_bits: u32,
     atlas: Weak<egui::epaint::mutex::Mutex<egui::epaint::TextureAtlas>>,
@@ -126,6 +127,8 @@ pub struct VirtualEditorState {
     pub last_max_scroll_y: f32,
     pub pending_scroll_delta_y: f32,
     pub autoscroll_active: bool,
+    pub font_family: crate::ui::settings::FontPreference,
+    pub font_size: f32,
     line_cache: LineLayoutCache,
 }
 
@@ -149,6 +152,8 @@ impl Default for VirtualEditorState {
             last_max_scroll_y: 0.0,
             pending_scroll_delta_y: 0.0,
             autoscroll_active: false,
+            font_family: crate::ui::settings::FontPreference::Monospace,
+            font_size: 14.0,
             line_cache: LineLayoutCache::default(),
         }
     }
@@ -169,19 +174,27 @@ impl VirtualEditorState {
         self.line_cache.total_bytes = 0;
     }
 
-    fn prepare_line_cache(&mut self, ui: &egui::Ui, theme_mode: ThemeMode, font_size: f32) {
+    fn prepare_line_cache(
+        &mut self,
+        ui: &egui::Ui,
+        theme_mode: ThemeMode,
+        font_family: crate::ui::settings::FontPreference,
+        font_size: f32,
+    ) {
         let cur_atlas = ui.fonts(|f| f.texture_atlas());
         let atlas_changed = self.line_cache.atlas.as_ptr() != Arc::as_ptr(&cur_atlas);
         let font_bits = font_size.to_bits();
         let ppp_bits = ui.ctx().pixels_per_point().to_bits();
         if atlas_changed
             || self.line_cache.theme_mode != theme_mode
+            || self.line_cache.font_family != font_family
             || self.line_cache.font_size_bits != font_bits
             || self.line_cache.ppp_bits != ppp_bits
         {
             self.line_cache.entries.clear();
             self.line_cache.total_bytes = 0;
             self.line_cache.theme_mode = theme_mode;
+            self.line_cache.font_family = font_family;
             self.line_cache.font_size_bits = font_bits;
             self.line_cache.ppp_bits = ppp_bits;
             self.line_cache.atlas = Arc::downgrade(&cur_atlas);
@@ -297,9 +310,12 @@ pub fn render_virtual_editor(
         state.request_focus = false;
     }
 
-    let font_id = FontId::new(14.0, FontFamily::Monospace);
-    state.prepare_line_cache(ui, theme.mode, font_id.size);
-    let row_height = 21.0_f32;
+    let font_id = FontId::new(
+        state.font_size.clamp(11.0, 28.0),
+        state.font_family.to_font_family(),
+    );
+    state.prepare_line_cache(ui, theme.mode, state.font_family, font_id.size);
+    let row_height = (font_id.size * 1.5).round().max(18.0);
     let char_width = ui.fonts(|f| f.glyph_width(&font_id, 'm')).max(7.5);
     let total_lines = buf.len_lines().max(1);
     let gutter_digits = total_lines.to_string().len().max(3);
@@ -1735,12 +1751,17 @@ mod tests {
         let long_line = "x".repeat(20_000);
         let buf = DocumentBuffer::from_str(&long_line);
         let mut state = VirtualEditorState::default();
-        let font_id = FontId::new(14.0, FontFamily::Monospace);
+        let font_id = FontId::new(14.0, egui::FontFamily::Monospace);
         let theme = WordTheme::from_mode(ThemeMode::Light);
 
         let _ = ctx.run(Default::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                state.prepare_line_cache(ui, theme.mode, font_id.size);
+                state.prepare_line_cache(
+                    ui,
+                    theme.mode,
+                    crate::ui::settings::FontPreference::Monospace,
+                    font_id.size,
+                );
                 let (s1, tr1, _bidi1, g1) =
                     state.get_or_build_line(ui, &buf, 0, &font_id, &theme);
                 assert!(tr1);

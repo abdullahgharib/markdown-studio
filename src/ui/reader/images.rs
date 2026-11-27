@@ -732,12 +732,16 @@ pub(super) fn load_cached_image_state(
     url: &str,
     base_dir: Option<&Path>,
     doc_path: Option<&Path>,
+    allow_remote_images: bool,
 ) -> ImageLoadState {
     let trimmed = url.trim();
     if trimmed.is_empty() || trimmed.starts_with("data:") {
         return ImageLoadState::Unavailable;
     }
     let is_remote = is_remote_http_url(trimmed);
+    if is_remote && !allow_remote_images {
+        return ImageLoadState::Unavailable;
+    }
     let key = if is_remote {
         (trimmed.to_string(), None, None)
     } else {
@@ -1045,7 +1049,7 @@ pub(super) fn load_cached_image_texture(
     base_dir: Option<&Path>,
     doc_path: Option<&Path>,
 ) -> Option<TextureHandle> {
-    match load_cached_image_state(ctx, url, base_dir, doc_path) {
+    match load_cached_image_state(ctx, url, base_dir, doc_path, true) {
         ImageLoadState::Loaded(tex) => Some(tex),
         ImageLoadState::Loading | ImageLoadState::Unavailable => None,
     }

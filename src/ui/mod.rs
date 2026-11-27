@@ -8,6 +8,7 @@ pub mod os_integration;
 pub mod reader;
 pub mod session;
 pub mod settings;
+pub mod settings_modal;
 pub mod tabs;
 pub mod theme;
 pub mod toolbar;
@@ -55,11 +56,12 @@ use crate::ui::reader::{
     ImageLightboxState, LinkTarget, ReaderAction, ReaderTextPos, VirtualReaderState,
 };
 use crate::ui::settings::AppSettings;
+use crate::ui::settings_modal::{SettingsModal, SettingsTab};
 use crate::ui::tabs::{
     render_tab_bar, InactiveTabState, OutlineItem, TabBarAction, TabBarState, TabSlot,
     TabVisualInfo,
 };
-use crate::ui::theme::{ThemeMode, WordTheme};
+use crate::ui::theme::{apply_ui_font_size, ThemeMode, WordTheme};
 use crate::ui::toolbar::{
     render_toolbar, vivid_button, CalcToolbarInfo, ReadingToolbarInfo, ToolbarAction,
     ToolbarButtonKind, ToolbarState, ViewMode,
@@ -162,6 +164,7 @@ pub struct MarkdownApp {
     pub unsaved_modal: UnsavedChangesModal,
     pub print_modal: PrintDialogModal,
     pub os_modal: OsIntegrationModal,
+    pub settings_modal: SettingsModal,
     pub external_diff_modal: ExternalDiffModal,
     pub explorer_rename_modal: ExplorerRenameModal,
     pub explorer_delete_modal: ExplorerDeleteConfirmModal,
@@ -322,6 +325,7 @@ impl MarkdownApp {
         let settings = AppSettings::load_from(&settings_path);
         let theme = WordTheme::from_mode(settings.theme_mode);
         theme.apply_to_ctx(ctx);
+        apply_ui_font_size(ctx, settings.ui_font_size);
 
         let initial_buf_id = buffer.buf_id();
         let initial_blocks = if buffer.is_empty() {
@@ -392,6 +396,9 @@ impl MarkdownApp {
         reader_state.line_spacing = settings.line_spacing;
         reader_state.auto_calc_math = settings.auto_calc_math;
         reader_state.auto_calc_tables = settings.auto_calc_tables;
+        reader_state.reader_font_family = settings.reader_font_family;
+        reader_state.reader_font_size = settings.reader_font_size;
+        reader_state.allow_remote_images = settings.allow_remote_images;
         if view_mode == ViewMode::Wysiwyg
             && let Some(line_idx) = env_opt("MD_STUDIO_EDIT_LINE", "MD_WORD_EDIT_LINE")
                 .and_then(|s| s.trim().parse::<usize>().ok())
@@ -481,17 +488,19 @@ impl MarkdownApp {
             last_opened_link: None,
             open_external_links_with_os: false,
             pending_anchor_after_open: None,
+            editor_state: {
+                let mut st = VirtualEditorState::default();
+                st.request_focus = matches!(view_mode, ViewMode::Source | ViewMode::Split);
+                st.font_family = settings.editor_font_family;
+                st.font_size = settings.editor_font_size;
+                st
+            },
             settings,
             settings_path,
             ast_parser,
             block_index,
             exporter: BackgroundExporter::with_repaint_ctx(ctx.clone()),
             toolbar_state: ToolbarState::default(),
-            editor_state: {
-                let mut st = VirtualEditorState::default();
-                st.request_focus = matches!(view_mode, ViewMode::Source | ViewMode::Split);
-                st
-            },
             reader_state,
             explorer_state,
             sidebar_tab: SidebarTab::Outline,
@@ -501,6 +510,7 @@ impl MarkdownApp {
             unsaved_modal: UnsavedChangesModal::default(),
             print_modal: PrintDialogModal::default(),
             os_modal: OsIntegrationModal::default(),
+            settings_modal: SettingsModal::default(),
             external_diff_modal: ExternalDiffModal::default(),
             explorer_rename_modal: ExplorerRenameModal::default(),
             explorer_delete_modal: ExplorerDeleteConfirmModal::default(),
@@ -517,6 +527,18 @@ impl MarkdownApp {
 
     fn persist_settings(&self) {
         let _ = self.settings.save_to(&self.settings_path);
+    }
+
+    fn sync_pane_preferences(&mut self) {
+        self.editor_state.font_family = self.settings.editor_font_family;
+        self.editor_state.font_size = self.settings.editor_font_size;
+        self.reader_state.page_width = self.settings.page_width;
+        self.reader_state.line_spacing = self.settings.line_spacing;
+        self.reader_state.auto_calc_math = self.settings.auto_calc_math;
+        self.reader_state.auto_calc_tables = self.settings.auto_calc_tables;
+        self.reader_state.reader_font_family = self.settings.reader_font_family;
+        self.reader_state.reader_font_size = self.settings.reader_font_size;
+        self.reader_state.allow_remote_images = self.settings.allow_remote_images;
     }
 
     fn current_base_dir(&self) -> Option<PathBuf> {
@@ -711,10 +733,7 @@ impl MarkdownApp {
             incoming.external_change_detected,
         );
 
-        self.reader_state.page_width = self.settings.page_width;
-        self.reader_state.line_spacing = self.settings.line_spacing;
-        self.reader_state.auto_calc_math = self.settings.auto_calc_math;
-        self.reader_state.auto_calc_tables = self.settings.auto_calc_tables;
+        self.sync_pane_preferences();
         self.reader_state.base_dir = self.current_base_dir();
         self.last_requested_parse = (0, 0, 0);
         self.find_bar.last_buf_version = u64::MAX;
@@ -761,10 +780,7 @@ impl MarkdownApp {
         self.font_scanned_buf_key = incoming.font_scanned_buf_key;
         self.disk_stamp = incoming.disk_stamp;
         self.external_change_detected = incoming.external_change_detected;
-        self.reader_state.page_width = self.settings.page_width;
-        self.reader_state.line_spacing = self.settings.line_spacing;
-        self.reader_state.auto_calc_math = self.settings.auto_calc_math;
-        self.reader_state.auto_calc_tables = self.settings.auto_calc_tables;
+        self.sync_pane_preferences();
         self.reader_state.base_dir = self.current_base_dir();
         self.last_requested_parse = (0, 0, 0);
         self.find_bar.last_buf_version = u64::MAX;
@@ -1692,6 +1708,7 @@ impl MarkdownApp {
             || self.print_modal.open
             || self.insert_link_modal.open
             || self.os_modal.open
+            || self.settings_modal.open
             || self.external_diff_modal.open
             || self.explorer_rename_modal.open
             || self.explorer_delete_modal.open
@@ -1758,6 +1775,8 @@ impl MarkdownApp {
                 ToolbarAction::OpenReplaceBar
             } else if i.consume_key(cmd_only, Key::F) {
                 ToolbarAction::FocusFindBar
+            } else if i.consume_key(cmd_only, Key::Comma) {
+                ToolbarAction::OpenSettings
             } else if i.consume_key(egui::Modifiers::NONE, Key::F11) {
                 ToolbarAction::ToggleFocusMode
             } else {
@@ -2314,8 +2333,19 @@ impl MarkdownApp {
                 }
                 ctx.request_repaint();
             }
+            ToolbarAction::OpenSettings => {
+                self.settings_modal.open_tab(
+                    SettingsTab::Appearance,
+                    &mut self.os_modal,
+                    &self.settings,
+                );
+            }
             ToolbarAction::OpenOsIntegrationModal => {
-                self.os_modal.open_with_settings(&self.settings);
+                self.settings_modal.open_tab(
+                    SettingsTab::OsIntegration,
+                    &mut self.os_modal,
+                    &self.settings,
+                );
             }
         }
 
@@ -3129,6 +3159,7 @@ impl MarkdownApp {
             || self.print_modal.open
             || self.insert_link_modal.open
             || self.os_modal.open
+            || self.settings_modal.open
             || self.external_diff_modal.open
             || self.explorer_rename_modal.open
             || self.explorer_delete_modal.open;
@@ -3466,6 +3497,7 @@ impl MarkdownApp {
             || self.print_modal.open
             || self.insert_link_modal.open
             || self.os_modal.open
+            || self.settings_modal.open
             || self.external_diff_modal.open
             || self.explorer_rename_modal.open
             || self.explorer_delete_modal.open;
@@ -3726,8 +3758,7 @@ impl MarkdownApp {
         self.reader_state.modal_open = modal_open_now || self.context_menu.is_open();
         self.reader_state.search_whole_word = self.find_bar.whole_word;
         self.reader_state.base_dir = self.current_base_dir();
-        self.reader_state.auto_calc_math = self.settings.auto_calc_math;
-        self.reader_state.auto_calc_tables = self.settings.auto_calc_tables;
+        self.sync_pane_preferences();
         if self.find_bar.open {
             self.find_bar
                 .ensure_matches_fresh_with_ctx(&self.buffer, Some(ctx));
@@ -4027,6 +4058,28 @@ impl MarkdownApp {
             );
         }
 
+        let settings_outcome = self.settings_modal.show(
+            ctx,
+            &self.theme,
+            &mut self.settings,
+            &self.settings_path,
+            &mut self.os_modal,
+        );
+        if settings_outcome.theme_changed {
+            self.theme = WordTheme::from_mode(self.settings.theme_mode);
+            self.theme.apply_to_ctx(ctx);
+        }
+        if settings_outcome.settings_changed {
+            apply_ui_font_size(ctx, self.settings.ui_font_size);
+            self.show_markup = self.settings.show_markup;
+            self.sync_pane_preferences();
+            self.persist_settings();
+            ctx.request_repaint();
+        }
+        if let Some(msg) = settings_outcome.status_message {
+            self.exporter.status_text = msg;
+        }
+
         if let Some(msg) =
             self.os_modal
                 .show(ctx, &self.theme, &mut self.settings, &self.settings_path)
@@ -4097,6 +4150,11 @@ impl MarkdownApp {
                 self.jump_to_anchor(Some(ctx), &slug);
             }
             LinkTarget::External(url) => {
+                if !self.settings.allow_external_links {
+                    self.exporter.status_text =
+                        format!("Blocked external link (disabled in Settings -> Security): {url}");
+                    return;
+                }
                 self.last_opened_link = Some(url.clone());
                 if self.open_external_links_with_os {
                     match open_with_os(&url) {
@@ -4124,7 +4182,15 @@ impl MarkdownApp {
                 } else {
                     raw_path
                 };
-                if is_unc_raw || is_dangerous_local_link_path(&resolved) {
+                if is_unc_raw || is_always_blocked_local_link_path(&resolved) {
+                    self.exporter.status_text = format!(
+                        "Blocked unsafe executable or network link: {}",
+                        resolved.display()
+                    );
+                    return;
+                }
+                let exec_resolved = is_executable_local_link_path(&resolved);
+                if exec_resolved && !self.settings.allow_executable_links {
                     self.exporter.status_text = format!(
                         "Blocked unsafe executable or network link: {}",
                         resolved.display()
@@ -4139,9 +4205,24 @@ impl MarkdownApp {
                 let canon_resolved = resolved
                     .canonicalize()
                     .unwrap_or_else(|_| resolved.clone());
-                if is_dangerous_local_link_path(&canon_resolved) {
+                if is_always_blocked_local_link_path(&canon_resolved) {
                     self.exporter.status_text = format!(
                         "Blocked unsafe executable or network link: {}",
+                        resolved.display()
+                    );
+                    return;
+                }
+                let is_exec = exec_resolved || is_executable_local_link_path(&canon_resolved);
+                if is_exec && !self.settings.allow_executable_links {
+                    self.exporter.status_text = format!(
+                        "Blocked unsafe executable or network link: {}",
+                        resolved.display()
+                    );
+                    return;
+                }
+                if !is_exec && !self.settings.allow_local_file_links {
+                    self.exporter.status_text = format!(
+                        "Blocked local file link (disabled in Settings -> Security): {}",
                         resolved.display()
                     );
                     return;
@@ -5448,6 +5529,8 @@ fn lazy_group_font_specs(group: u8) -> &'static [(&'static str, &'static [&'stat
                 r"C:\Windows\Fonts\seguiemj.ttf",
                 "/System/Library/Fonts/Apple Color Emoji.ttc",
                 "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+                "/usr/share/fonts/noto/NotoColorEmoji.ttf",
+                "/usr/share/fonts/google-noto-emoji/NotoColorEmoji.ttf",
             ],
         )],
         FONT_GROUP_EXTRA_SCRIPTS => &[
@@ -5461,6 +5544,8 @@ fn lazy_group_font_specs(group: u8) -> &'static [(&'static str, &'static [&'stat
             &[
                 r"C:\Windows\Fonts\malgun.ttf",
                 "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.otf",
+                "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+                "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
                 "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttf",
                 "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
             ],
@@ -5469,73 +5554,129 @@ fn lazy_group_font_specs(group: u8) -> &'static [(&'static str, &'static [&'stat
     }
 }
 
+#[cfg(target_os = "linux")]
+fn fc_match_font_path(pattern: &str) -> Option<PathBuf> {
+    let output = std::process::Command::new("fc-match")
+        .args(["-f", "%{file}\n", pattern])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let trimmed = raw.lines().next().map(str::trim).unwrap_or("");
+    if trimmed.is_empty() {
+        return None;
+    }
+    let p = PathBuf::from(trimmed);
+    p.is_file().then_some(p)
+}
+
+fn read_first_font_bytes(paths: &[&str], _linux_fc_patterns: &[&str]) -> Option<Vec<u8>> {
+    for path in paths {
+        if let Ok(bytes) = std::fs::read(path) {
+            return Some(bytes);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    for pattern in _linux_fc_patterns {
+        if let Some(found) = fc_match_font_path(pattern)
+            && let Ok(bytes) = std::fs::read(found)
+        {
+            return Some(bytes);
+        }
+    }
+    None
+}
+
 fn core_fonts() -> &'static FontDefinitions {
     static CORE_FONTS: OnceLock<FontDefinitions> = OnceLock::new();
     CORE_FONTS.get_or_init(|| {
         let mut fonts = FontDefinitions::default();
 
-        // 1. Primary native OS proportional UI & Latin font.
+        // 1. Primary native OS proportional UI & Latin font (regular weight across Windows/macOS/Linux distros).
         let mut reg_inserted = false;
-        for path in [
-            r"C:\Windows\Fonts\segoeui.ttf",
-            "/System/Library/Fonts/Supplemental/Arial.ttf",
-            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        ] {
-            if let Ok(bytes) = std::fs::read(path) {
-                fonts
-                    .font_data
-                    .insert("system_regular".to_owned(), FontData::from_owned(bytes).into());
-                if let Some(list) = fonts.families.get_mut(&FontFamily::Proportional) {
-                    list.insert(0, "system_regular".to_owned());
-                }
-                reg_inserted = true;
-                break;
+        if let Some(bytes) = read_first_font_bytes(
+            &[
+                r"C:\Windows\Fonts\segoeui.ttf",
+                "/System/Library/Fonts/Supplemental/Arial.ttf",
+                "/System/Library/Fonts/HelveticaNeue.ttc",
+                "/System/Library/Fonts/SFNS.ttf",
+                "/Library/Fonts/Arial.ttf",
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+                "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
+                "/usr/share/fonts/liberation-sans/LiberationSans-Regular.ttf",
+                "/usr/share/fonts/TTF/DejaVuSans.ttf",
+                "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+                "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+                "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+                "/usr/share/fonts/google-noto/NotoSans-Regular.ttf",
+            ],
+            &["sans:weight=regular", "DejaVu Sans", "Liberation Sans"],
+        ) {
+            fonts
+                .font_data
+                .insert("system_regular".to_owned(), FontData::from_owned(bytes).into());
+            if let Some(list) = fonts.families.get_mut(&FontFamily::Proportional) {
+                list.insert(0, "system_regular".to_owned());
             }
+            reg_inserted = true;
         }
 
-        // 2. Multilingual / Arabic script + UI symbol fonts (✓, ▾, ▴, ▶, ◀).
+        // 2. Multilingual / Arabic script + UI symbol fonts.
         let mut extra_fallbacks: Vec<String> = Vec::new();
-        for path in [
-            r"C:\Windows\Fonts\tahoma.ttf",
-            r"C:\Windows\Fonts\arial.ttf",
-            "/System/Library/Fonts/Supplemental/Arial.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        ] {
-            if let Ok(bytes) = std::fs::read(path) {
-                fonts
-                    .font_data
-                    .insert("system_arabic".to_owned(), FontData::from_owned(bytes).into());
-                extra_fallbacks.push("system_arabic".to_owned());
-                break;
-            }
+        if let Some(bytes) = read_first_font_bytes(
+            &[
+                r"C:\Windows\Fonts\tahoma.ttf",
+                r"C:\Windows\Fonts\arial.ttf",
+                "/System/Library/Fonts/Supplemental/Arial.ttf",
+                "/usr/share/fonts/TTF/DejaVuSans.ttf",
+                "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+                "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                "/usr/share/fonts/noto/NotoSansArabic-Regular.ttf",
+                "/usr/share/fonts/noto/NotoNaskhArabic-Regular.ttf",
+            ],
+            &[":lang=ar", "DejaVu Sans"],
+        ) {
+            fonts
+                .font_data
+                .insert("system_arabic".to_owned(), FontData::from_owned(bytes).into());
+            extra_fallbacks.push("system_arabic".to_owned());
         }
-        for path in [
-            r"C:\Windows\Fonts\seguisym.ttf",
-            "/System/Library/Fonts/Apple Symbols.ttf",
-            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        ] {
-            if let Ok(bytes) = std::fs::read(path) {
-                fonts
-                    .font_data
-                    .insert("system_symbols".to_owned(), FontData::from_owned(bytes).into());
-                extra_fallbacks.push("system_symbols".to_owned());
-                break;
-            }
+        if let Some(bytes) = read_first_font_bytes(
+            &[
+                r"C:\Windows\Fonts\seguisym.ttf",
+                "/System/Library/Fonts/Apple Symbols.ttf",
+                "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+                "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf",
+                "/usr/share/fonts/noto/NotoSansSymbols-Regular.ttf",
+                "/usr/share/fonts/TTF/DejaVuSans.ttf",
+                "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+                "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            ],
+            &["DejaVu Sans", "Noto Sans Symbols 2", ":charset=2713"],
+        ) {
+            fonts
+                .font_data
+                .insert("system_symbols".to_owned(), FontData::from_owned(bytes).into());
+            extra_fallbacks.push("system_symbols".to_owned());
         }
-        for path in [
-            "/System/Library/Fonts/ZapfDingbats.ttf",
-            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-            "/System/Library/Fonts/LucidaGrande.ttc",
-        ] {
-            if let Ok(bytes) = std::fs::read(path) {
-                fonts
-                    .font_data
-                    .insert("system_dingbats".to_owned(), FontData::from_owned(bytes).into());
-                extra_fallbacks.push("system_dingbats".to_owned());
-                break;
-            }
+        if let Some(bytes) = read_first_font_bytes(
+            &[
+                "/System/Library/Fonts/ZapfDingbats.ttf",
+                "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+                "/System/Library/Fonts/LucidaGrande.ttc",
+            ],
+            &[],
+        ) {
+            fonts
+                .font_data
+                .insert("system_dingbats".to_owned(), FontData::from_owned(bytes).into());
+            extra_fallbacks.push("system_dingbats".to_owned());
         }
 
         if let Some(list) = fonts.families.get_mut(&FontFamily::Proportional) {
@@ -5546,21 +5687,29 @@ fn core_fonts() -> &'static FontDefinitions {
         }
 
         // 3. Monospace font + multilingual fallbacks for Source Editor & Code Blocks.
-        for path in [
-            r"C:\Windows\Fonts\CascadiaMono.ttf",
-            r"C:\Windows\Fonts\consola.ttf",
-            "/System/Library/Fonts/Menlo.ttc",
-            "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-        ] {
-            if let Ok(bytes) = std::fs::read(path) {
-                fonts
-                    .font_data
-                    .insert("system_mono".to_owned(), FontData::from_owned(bytes).into());
-                if let Some(list) = fonts.families.get_mut(&FontFamily::Monospace) {
-                    list.insert(0, "system_mono".to_owned());
-                }
-                break;
+        if let Some(bytes) = read_first_font_bytes(
+            &[
+                r"C:\Windows\Fonts\CascadiaMono.ttf",
+                r"C:\Windows\Fonts\consola.ttf",
+                "/System/Library/Fonts/Menlo.ttc",
+                "/System/Library/Fonts/Monaco.ttf",
+                "/System/Library/Fonts/SFNSMono.ttf",
+                "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+                "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
+                "/usr/share/fonts/liberation-mono/LiberationMono-Regular.ttf",
+                "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+                "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
+                "/usr/share/fonts/dejavu-sans-mono-fonts/DejaVuSansMono.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+                "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
+            ],
+            &["monospace:weight=regular", "DejaVu Sans Mono", "Liberation Mono"],
+        ) {
+            fonts
+                .font_data
+                .insert("system_mono".to_owned(), FontData::from_owned(bytes).into());
+            if let Some(list) = fonts.families.get_mut(&FontFamily::Monospace) {
+                list.insert(0, "system_mono".to_owned());
             }
         }
         if let Some(list) = fonts.families.get_mut(&FontFamily::Monospace) {
@@ -5579,40 +5728,113 @@ fn core_fonts() -> &'static FontDefinitions {
 
         // 4. Bold proportional & Bold Arabic font family preserving full fallback chain.
         let mut bold_chain = Vec::with_capacity(2 + proportional_chain.len());
-        for path in [
-            r"C:\Windows\Fonts\segoeuib.ttf",
-            r"C:\Windows\Fonts\arialbd.ttf",
-            "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
-            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        ] {
-            if let Ok(bytes) = std::fs::read(path) {
-                fonts
-                    .font_data
-                    .insert("system_bold".to_owned(), FontData::from_owned(bytes).into());
-                bold_chain.push("system_bold".to_owned());
-                break;
-            }
+        if let Some(bytes) = read_first_font_bytes(
+            &[
+                r"C:\Windows\Fonts\segoeuib.ttf",
+                r"C:\Windows\Fonts\arialbd.ttf",
+                "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+                "/System/Library/Fonts/HelveticaNeue.ttc",
+                "/Library/Fonts/Arial Bold.ttf",
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+                "/usr/share/fonts/liberation/LiberationSans-Bold.ttf",
+                "/usr/share/fonts/liberation-sans/LiberationSans-Bold.ttf",
+                "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+                "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+                "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans-Bold.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                "/usr/share/fonts/noto/NotoSans-Bold.ttf",
+            ],
+            &["sans:weight=bold", "DejaVu Sans:weight=bold"],
+        ) {
+            fonts
+                .font_data
+                .insert("system_bold".to_owned(), FontData::from_owned(bytes).into());
+            bold_chain.push("system_bold".to_owned());
         }
-        for path in [
-            r"C:\Windows\Fonts\tahomabd.ttf",
-            r"C:\Windows\Fonts\arialbd.ttf",
-            "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        ] {
-            if let Ok(bytes) = std::fs::read(path) {
-                fonts.font_data.insert(
-                    "system_arabic_bold".to_owned(),
-                    FontData::from_owned(bytes).into(),
-                );
-                bold_chain.push("system_arabic_bold".to_owned());
-                break;
-            }
+        if let Some(bytes) = read_first_font_bytes(
+            &[
+                r"C:\Windows\Fonts\tahomabd.ttf",
+                r"C:\Windows\Fonts\arialbd.ttf",
+                "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+                "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+                "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+                "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans-Bold.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                "/usr/share/fonts/noto/NotoSansArabic-Bold.ttf",
+            ],
+            &[],
+        ) {
+            fonts.font_data.insert(
+                "system_arabic_bold".to_owned(),
+                FontData::from_owned(bytes).into(),
+            );
+            bold_chain.push("system_arabic_bold".to_owned());
         }
-        bold_chain.extend(proportional_chain);
+        bold_chain.extend(proportional_chain.clone());
         fonts
             .families
             .insert(FontFamily::Name("bold".into()), bold_chain);
+
+        // 5. Serif & Serif-Bold families for user-selectable typography in Settings.
+        let mut serif_chain = Vec::with_capacity(1 + proportional_chain.len());
+        if let Some(bytes) = read_first_font_bytes(
+            &[
+                r"C:\Windows\Fonts\georgia.ttf",
+                r"C:\Windows\Fonts\times.ttf",
+                "/System/Library/Fonts/Supplemental/Georgia.ttf",
+                "/System/Library/Fonts/Supplemental/Times New Roman.ttf",
+                "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
+                "/usr/share/fonts/liberation/LiberationSerif-Regular.ttf",
+                "/usr/share/fonts/liberation-serif/LiberationSerif-Regular.ttf",
+                "/usr/share/fonts/TTF/DejaVuSerif.ttf",
+                "/usr/share/fonts/dejavu/DejaVuSerif.ttf",
+                "/usr/share/fonts/dejavu-serif-fonts/DejaVuSerif.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+                "/usr/share/fonts/noto/NotoSerif-Regular.ttf",
+            ],
+            &["serif:weight=regular", "DejaVu Serif", "Liberation Serif"],
+        ) {
+            fonts
+                .font_data
+                .insert("system_serif".to_owned(), FontData::from_owned(bytes).into());
+            serif_chain.push("system_serif".to_owned());
+        }
+        serif_chain.extend(proportional_chain.clone());
+        fonts
+            .families
+            .insert(FontFamily::Name("serif".into()), serif_chain);
+
+        let mut serif_bold_chain = Vec::with_capacity(2 + proportional_chain.len());
+        if let Some(bytes) = read_first_font_bytes(
+            &[
+                r"C:\Windows\Fonts\georgiab.ttf",
+                r"C:\Windows\Fonts\timesbd.ttf",
+                "/System/Library/Fonts/Supplemental/Georgia Bold.ttf",
+                "/System/Library/Fonts/Supplemental/Times New Roman Bold.ttf",
+                "/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf",
+                "/usr/share/fonts/liberation/LiberationSerif-Bold.ttf",
+                "/usr/share/fonts/liberation-serif/LiberationSerif-Bold.ttf",
+                "/usr/share/fonts/TTF/DejaVuSerif-Bold.ttf",
+                "/usr/share/fonts/dejavu/DejaVuSerif-Bold.ttf",
+                "/usr/share/fonts/dejavu-serif-fonts/DejaVuSerif-Bold.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
+                "/usr/share/fonts/noto/NotoSerif-Bold.ttf",
+            ],
+            &["serif:weight=bold", "DejaVu Serif:weight=bold"],
+        ) {
+            fonts.font_data.insert(
+                "system_serif_bold".to_owned(),
+                FontData::from_owned(bytes).into(),
+            );
+            serif_bold_chain.push("system_serif_bold".to_owned());
+        }
+        if fonts.font_data.contains_key("system_serif") {
+            serif_bold_chain.push("system_serif".to_owned());
+        }
+        serif_bold_chain.extend(proportional_chain);
+        fonts
+            .families
+            .insert(FontFamily::Name("serif_bold".into()), serif_bold_chain);
 
         fonts
     })
@@ -5707,6 +5929,27 @@ fn build_fonts_with_loaded_groups(loaded_mask: u8) -> FontDefinitions {
             .count();
         for (offset, name) in lazy_names.iter().enumerate() {
             list.insert(insert_at + offset, name.clone());
+        }
+    }
+
+    for (fam_name, primary_keys) in [
+        ("serif", &["system_serif"][..]),
+        ("serif_bold", &["system_serif_bold", "system_serif"][..]),
+    ] {
+        if let Some(list) = fonts.families.get_mut(&FontFamily::Name(fam_name.into())) {
+            let insert_at = list
+                .iter()
+                .take_while(|n| {
+                    primary_keys.contains(&n.as_str())
+                        || matches!(
+                            n.as_str(),
+                            "system_regular" | "system_arabic" | "system_symbols"
+                        )
+                })
+                .count();
+            for (offset, name) in lazy_names.iter().enumerate() {
+                list.insert(insert_at + offset, name.clone());
+            }
         }
     }
 
@@ -5822,9 +6065,9 @@ fn spawn_lazy_font_loader(missing_mask: u8, ctx: egui::Context) -> mpsc::Receive
     rx
 }
 
-/// Returns `true` for UNC/network paths or executable/script/shortcut extensions
-/// that must never be launched automatically via OS shell link clicks.
-pub fn is_dangerous_local_link_path(path: &Path) -> bool {
+/// Returns `true` for UNC/network paths, control chars, ADS streams, or trailing dots/spaces
+/// that must always be blocked regardless of user settings.
+pub fn is_always_blocked_local_link_path(path: &Path) -> bool {
     let raw_str = path.to_string_lossy();
     let is_non_verbatim_unc = raw_str.starts_with(r"\\") && !raw_str.starts_with(r"\\?\");
     let is_verbatim_unc = raw_str
@@ -5869,6 +6112,11 @@ pub fn is_dangerous_local_link_path(path: &Path) -> bool {
             }
         }
     }
+    false
+}
+
+/// Returns `true` for executable, script, shortcut, or active document extensions.
+pub fn is_executable_local_link_path(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|ext| {
@@ -5953,6 +6201,12 @@ pub fn is_dangerous_local_link_path(path: &Path) -> bool {
                     | "bin"
             )
         })
+}
+
+/// Returns `true` for UNC/network paths or executable/script/shortcut extensions
+/// that must never be launched automatically via OS shell link clicks.
+pub fn is_dangerous_local_link_path(path: &Path) -> bool {
+    is_always_blocked_local_link_path(path) || is_executable_local_link_path(path)
 }
 
 pub fn configure_fonts(ctx: &egui::Context) {

@@ -39,7 +39,7 @@ use crate::export::ir::{runs_to_plain_text, DocBlock, InlineRun, TableAlign};
 use crate::ui::context_menu::{
     table_runs_to_tsv, ContextMenuTarget, ReaderCodeContext, ReaderImageContext, ReaderTableContext,
 };
-use crate::ui::settings::{LineSpacing, PageWidth};
+use crate::ui::settings::{FontPreference, LineSpacing, PageWidth};
 use crate::ui::theme::{ThemeMode, WordTheme};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -181,6 +181,9 @@ pub struct VirtualReaderState {
     pub autoscroll_active: bool,
     pub auto_calc_math: bool,
     pub auto_calc_tables: bool,
+    pub reader_font_family: FontPreference,
+    pub reader_font_size: f32,
+    pub allow_remote_images: bool,
     pub image_label_editor: Option<ImageLabelEditorState>,
     pub image_lightbox: Option<ImageLightboxState>,
     pub reader_selected_text: Option<String>,
@@ -230,6 +233,9 @@ impl Default for VirtualReaderState {
             autoscroll_active: false,
             auto_calc_math: false,
             auto_calc_tables: true,
+            reader_font_family: FontPreference::SystemSans,
+            reader_font_size: 15.5,
+            allow_remote_images: true,
             image_label_editor: None,
             image_lightbox: None,
             reader_selected_text: None,
@@ -349,6 +355,8 @@ impl VirtualReaderState {
             line_spacing,
             show_inline_markup,
             ppp.to_bits(),
+            self.reader_font_family,
+            self.reader_font_size.clamp(12.0, 28.0).to_bits(),
             self.compute_search_sig(),
         );
         if self.galley_cache.epoch.0 != doc_id {
@@ -774,6 +782,11 @@ fn heading_font_size(level: u8) -> f32 {
         5 => 14.8,
         _ => 13.8,
     }
+}
+
+fn heading_font_size_for(level: u8, reader_font_size: f32) -> f32 {
+    let scale = (reader_font_size.clamp(12.0, 28.0)) / 15.5;
+    (heading_font_size(level) * scale).clamp(11.0, 54.0)
 }
 
 fn resolve_egui_align(alignment: BlockAlignment, direction: TextDirection) -> egui::Align {
@@ -2000,6 +2013,7 @@ fn render_image_lightbox(
             &lb.url,
             lb.base_dir.as_deref(),
             lb.doc_path.as_deref(),
+            state.allow_remote_images,
         );
 
         let max_card_w = (screen.width() - 64.0).max(300.0);
@@ -2296,6 +2310,8 @@ fn activate_wysiwyg_block(
             theme,
             show_markup,
             code_lang,
+            state.reader_font_size,
+            state.reader_font_family,
         );
         let galley = ui.fonts(|f| f.layout_job(job));
         let (inner_left, inner_top) = if is_code {
@@ -2696,6 +2712,8 @@ fn build_wysiwyg_edit_layout_job(
     theme: &WordTheme,
     show_markup: bool,
     code_lang: &str,
+    reader_font_size: f32,
+    font_pref: FontPreference,
 ) -> LayoutJob {
     let mut job = LayoutJob::default();
     job.wrap.max_width = wrap_width.max(40.0);
@@ -2705,9 +2723,10 @@ fn build_wysiwyg_edit_layout_job(
     let bidi = MultilineBidiMap::new(text);
 
     if matches!(kind, ActiveBlockKind::CodeBlock) {
-        let line_h = Some((13.0_f32 * 1.42).round());
+        let code_sz = (13.0 * (reader_font_size.clamp(12.0, 28.0) / 15.5)).clamp(10.5, 24.0);
+        let line_h = Some((code_sz * 1.42).round());
         let mut fmt = TextFormat {
-            font_id: FontId::new(13.0, FontFamily::Monospace),
+            font_id: FontId::new(code_sz, FontFamily::Monospace),
             color: theme.text_primary,
             line_height: line_h,
             ..Default::default()
@@ -2731,14 +2750,22 @@ fn build_wysiwyg_edit_layout_job(
         } else {
             job.append(text, 0.0, fmt);
         }
-        return project_layout_job_to_bidi(job, &bidi, theme.text_primary, 13.0);
+        return project_layout_job_to_bidi(job, &bidi, theme.text_primary, code_sz);
     }
 
     job.justify = alignment == BlockAlignment::Justify;
 
     let (base_size, base_bold, base_color) = match kind {
-        ActiveBlockKind::Heading(lvl) => (heading_font_size(lvl), true, theme.heading_color),
-        ActiveBlockKind::Paragraph | ActiveBlockKind::CodeBlock => (15.0, false, theme.text_primary),
+        ActiveBlockKind::Heading(lvl) => (
+            heading_font_size_for(lvl, reader_font_size),
+            true,
+            theme.heading_color,
+        ),
+        ActiveBlockKind::Paragraph | ActiveBlockKind::CodeBlock => (
+            reader_font_size.clamp(12.0, 28.0),
+            false,
+            theme.text_primary,
+        ),
     };
 
     let delim_fmt = if show_markup {
@@ -2763,6 +2790,7 @@ fn build_wysiwyg_edit_layout_job(
             ..Default::default()
         },
         base_size,
+        font_pref,
         base_color,
         theme,
         show_markup,
@@ -2799,6 +2827,7 @@ fn append_inline_markdown_spans(
     s: &str,
     style: InlineEditStyle,
     base_size: f32,
+    font_pref: FontPreference,
     base_color: Color32,
     theme: &WordTheme,
     show_markup: bool,
@@ -2815,9 +2844,9 @@ fn append_inline_markdown_spans(
             return;
         }
         let family = if st.bold {
-            FontFamily::Name("bold".into())
+            font_pref.to_bold_font_family()
         } else {
-            FontFamily::Proportional
+            font_pref.to_font_family()
         };
         let color = if st.link { theme.link_color } else { base_color };
         let mut fmt = TextFormat {
@@ -2891,6 +2920,7 @@ fn append_inline_markdown_spans(
                             &s[i + open_len..i + open_len + rel_end],
                             next_st,
                             base_size,
+                            font_pref,
                             base_color,
                             theme,
                             show_markup,
@@ -2952,6 +2982,7 @@ fn append_inline_markdown_spans(
                             &s[i + 3..i + 3 + rel_end],
                             next_st,
                             base_size,
+                            font_pref,
                             base_color,
                             theme,
                             show_markup,
@@ -2975,6 +3006,7 @@ fn append_inline_markdown_spans(
                             &s[i + 2..i + 2 + rel_end],
                             next_st,
                             base_size,
+                            font_pref,
                             base_color,
                             theme,
                             show_markup,
@@ -2998,6 +3030,7 @@ fn append_inline_markdown_spans(
                             &s[i + 1..i + 1 + rel_end],
                             next_st,
                             base_size,
+                            font_pref,
                             base_color,
                             theme,
                             show_markup,
@@ -3035,6 +3068,7 @@ fn append_inline_markdown_spans(
                             &s[i + 2..i + 2 + rel_end],
                             next_st,
                             base_size,
+                            font_pref,
                             base_color,
                             theme,
                             show_markup,
@@ -3067,6 +3101,7 @@ fn append_inline_markdown_spans(
                             &s[i + 1..i + 1 + rel_end],
                             next_st,
                             base_size,
+                            font_pref,
                             base_color,
                             theme,
                             show_markup,
@@ -3094,6 +3129,7 @@ fn append_inline_markdown_spans(
                         &s[i + 2..i + 2 + rel_end],
                         next_st,
                         base_size,
+                        font_pref,
                         base_color,
                         theme,
                         show_markup,
@@ -3118,7 +3154,7 @@ fn append_inline_markdown_spans(
                 job.append(&s[i..label_start], 0.0, delim_fmt.clone());
                 if is_img {
                     let img_label_fmt = TextFormat {
-                        font_id: FontId::new(base_size * 0.92, FontFamily::Proportional),
+                        font_id: FontId::new(base_size * 0.92, font_pref.to_font_family()),
                         color: theme.accent,
                         background: theme.accent_soft,
                         ..Default::default()
@@ -3132,6 +3168,7 @@ fn append_inline_markdown_spans(
                         &s[label_start..label_end],
                         next_st,
                         base_size,
+                        font_pref,
                         base_color,
                         theme,
                         show_markup,
@@ -3904,6 +3941,8 @@ fn render_inline_wysiwyg_block(
                 }
 
                 let code_lang_for_layout = cur_lang.clone();
+                let reader_font_size = state.reader_font_size;
+                let reader_font_family = state.reader_font_family;
                 let mut layouter =
                     |ui: &egui::Ui, string: &str, wrap_width: f32| -> Arc<egui::Galley> {
                         let job = build_wysiwyg_edit_layout_job(
@@ -3915,6 +3954,8 @@ fn render_inline_wysiwyg_block(
                             theme,
                             show_markup,
                             &code_lang_for_layout,
+                            reader_font_size,
+                            reader_font_family,
                         );
                         ui.fonts(|f| f.layout_job(job))
                     };
@@ -5174,7 +5215,9 @@ fn render_doc_block(
                     action = a;
                 }
             } else {
-                let size = heading_font_size(*level);
+                let size = heading_font_size_for(*level, state.reader_font_size);
+                let font_pref = state.reader_font_family;
+                let allow_remote = state.allow_remote_images;
                 let prefix_m = if wysiwyg && show_markup {
                     Some(format!("{} ", "#".repeat((*level).clamp(1, 6) as usize)))
                 } else {
@@ -5203,6 +5246,7 @@ fn render_doc_block(
                             size,
                             1.28,
                             true,
+                            font_pref,
                             theme.heading_color,
                             iw,
                             *alignment,
@@ -5214,6 +5258,7 @@ fn render_doc_block(
                             read_only,
                             suppress_clicks,
                             base_dir_owned.as_deref(),
+                            allow_remote,
                             &search_needles,
                             whole_word,
                             galley_cache,
@@ -5302,6 +5347,9 @@ fn render_doc_block(
                 let base_dir_owned = state.base_dir.clone();
                 let suppress_clicks = state.autoscroll_active;
                 let body_line_mult = state.line_spacing.body_multiplier();
+                let body_font_size = state.reader_font_size.clamp(12.0, 28.0);
+                let font_pref = state.reader_font_family;
+                let allow_remote = state.allow_remote_images;
                 let galley_cache = &mut state.galley_cache;
                 let image_label_editor = &mut state.image_label_editor;
                 let image_lightbox = &mut state.image_lightbox;
@@ -5312,9 +5360,10 @@ fn render_doc_block(
                             buf,
                             runs,
                             source_lines,
-                            15.5,
+                            body_font_size,
                             body_line_mult,
                             false,
+                            font_pref,
                             theme.text_primary,
                             iw,
                             *alignment,
@@ -5326,6 +5375,7 @@ fn render_doc_block(
                             read_only,
                             suppress_clicks,
                             base_dir_owned.as_deref(),
+                            allow_remote,
                             &search_needles,
                             whole_word,
                             galley_cache,
@@ -5699,12 +5749,14 @@ fn render_doc_block(
                                         .color(theme.text_muted),
                                 );
                             } else {
+                                let code_sz = (13.0 * (state.reader_font_size.clamp(12.0, 28.0) / 15.5)).clamp(10.5, 24.0);
                                 let code_key = {
                                     let mut hasher = FxHasher::default();
                                     0xC0DE_0001_u64.hash(&mut hasher);
                                     info.hash(&mut hasher);
                                     trimmed_code.hash(&mut hasher);
                                     code_needles.hash(&mut hasher);
+                                    code_sz.to_bits().hash(&mut hasher);
                                     (0xC0DE_0001_usize, trimmed_code.len(), hasher.finish())
                                 };
                                 let code_galley =
@@ -5717,9 +5769,9 @@ fn render_doc_block(
                                         };
                                         code_job.wrap.max_width = f32::INFINITY;
                                         let code_fmt = TextFormat {
-                                            font_id: FontId::new(13.0, FontFamily::Monospace),
+                                            font_id: FontId::new(code_sz, FontFamily::Monospace),
                                             color: theme.text_primary,
-                                            line_height: Some((13.0_f32 * 1.42).round()),
+                                            line_height: Some((code_sz * 1.42).round()),
                                             ..Default::default()
                                         };
                                         if code_needles.is_empty() && trimmed_code.len() <= 32_768 {
@@ -5902,16 +5954,19 @@ fn render_doc_block(
                                 }
                             }
                             None if *ordered => {
+                                let marker_sz = (state.reader_font_size.clamp(12.0, 28.0) * 0.94).clamp(11.0, 26.0);
                                 ui.label(
                                     RichText::new(format!("{}.", start + idx))
-                                        .size(14.5)
+                                        .family(state.reader_font_family.to_font_family())
+                                        .size(marker_sz)
                                         .color(theme.text_muted),
                                 );
                                 ui.add_space(4.0);
                             }
                             None => {
+                                let marker_sz = (state.reader_font_size.clamp(12.0, 28.0) * 0.97).clamp(11.5, 26.0);
                                 ui.label(
-                                    RichText::new("•").size(15.0).color(theme.accent),
+                                    RichText::new("•").size(marker_sz).color(theme.accent),
                                 );
                                 ui.add_space(4.0);
                             }
@@ -6005,6 +6060,9 @@ fn render_doc_block(
                 let whole_word = state.search_whole_word;
                 let suppress_clicks = state.autoscroll_active;
                 let base_dir_owned = state.base_dir.clone();
+                let table_font_size = (13.5 * (state.reader_font_size.clamp(12.0, 28.0) / 15.5)).clamp(11.0, 24.0);
+                let font_pref = state.reader_font_family;
+                let allow_remote = state.allow_remote_images;
                 let galley_cache = &mut state.galley_cache;
                 let image_label_editor = &mut state.image_label_editor;
                 let image_lightbox = &mut state.image_lightbox;
@@ -6056,6 +6114,8 @@ fn render_doc_block(
                                                 None,
                                                 source_lines,
                                                 col_w,
+                                                table_font_size,
+                                                font_pref,
                                                 align,
                                                 true,
                                                 theme,
@@ -6064,6 +6124,7 @@ fn render_doc_block(
                                                 label_selectable,
                                                 suppress_clicks,
                                                 base_dir_owned.as_deref(),
+                                                allow_remote,
                                                 &table_needles,
                                                 whole_word,
                                                 galley_cache,
@@ -6115,6 +6176,8 @@ fn render_doc_block(
                                                 eval_text,
                                                 source_lines,
                                                 col_w,
+                                                table_font_size,
+                                                font_pref,
                                                 align,
                                                 false,
                                                 theme,
@@ -6123,6 +6186,7 @@ fn render_doc_block(
                                                 label_selectable,
                                                 suppress_clicks,
                                                 base_dir_owned.as_deref(),
+                                                allow_remote,
                                                 &table_needles,
                                                 whole_word,
                                                 galley_cache,
@@ -6926,6 +6990,7 @@ fn render_inline_math_wrapped_runs(
     font_size: f32,
     line_height_mult: f32,
     force_bold: bool,
+    font_pref: FontPreference,
     base_color: Color32,
     content_w: f32,
     direction: TextDirection,
@@ -7013,6 +7078,7 @@ fn render_inline_math_wrapped_runs(
                             font_size,
                             line_height_mult,
                             force_bold,
+                            font_pref,
                             base_color,
                             direction,
                             theme,
@@ -7058,6 +7124,7 @@ fn render_runs_with_images(
     font_size: f32,
     line_height_mult: f32,
     force_bold: bool,
+    font_pref: FontPreference,
     base_color: Color32,
     content_w: f32,
     alignment: BlockAlignment,
@@ -7069,6 +7136,7 @@ fn render_runs_with_images(
     read_only: bool,
     suppress_clicks: bool,
     base_dir: Option<&Path>,
+    allow_remote_images: bool,
     search_needles: &[(String, bool)],
     whole_word: bool,
     galley_cache: &mut ReaderGalleyCache,
@@ -7099,6 +7167,7 @@ fn render_runs_with_images(
                 font_size.to_bits().hash(&mut hasher);
                 line_height_mult.to_bits().hash(&mut hasher);
                 force_bold.hash(&mut hasher);
+                font_pref.hash(&mut hasher);
                 core::mem::discriminant(&alignment).hash(&mut hasher);
                 core::mem::discriminant(&direction).hash(&mut hasher);
                 base_color.to_array().hash(&mut hasher);
@@ -7114,6 +7183,7 @@ fn render_runs_with_images(
                     font_size,
                     line_height_mult,
                     force_bold,
+                    font_pref,
                     base_color,
                     direction,
                     theme,
@@ -7162,6 +7232,7 @@ fn render_runs_with_images(
                 font_size,
                 line_height_mult,
                 force_bold,
+                font_pref,
                 base_color,
                 content_w,
                 direction,
@@ -7195,6 +7266,7 @@ fn render_runs_with_images(
                         font_size,
                         line_height_mult,
                         force_bold,
+                        font_pref,
                         base_color,
                         content_w,
                         direction,
@@ -7221,6 +7293,7 @@ fn render_runs_with_images(
                         font_size,
                         line_height_mult,
                         force_bold,
+                        font_pref,
                         base_color,
                         direction,
                         theme,
@@ -7300,6 +7373,7 @@ fn render_runs_with_images(
                                         cmd_down,
                                         base_dir,
                                         buf.file_path.as_deref(),
+                                        allow_remote_images,
                                         tracker,
                                     ) {
                                         img_action = Some(act);
@@ -7324,6 +7398,7 @@ fn render_runs_with_images(
                     true,
                     show_inline_markup,
                     base_dir,
+                    allow_remote_images,
                     theme,
                     read_only,
                     suppress_clicks,
@@ -7397,10 +7472,13 @@ fn render_remote_badge_pill(
     cmd_down: bool,
     base_dir: Option<&Path>,
     doc_path: Option<&Path>,
+    allow_remote_images: bool,
     tracker: &mut ReaderFrameTracker,
 ) -> Option<ReaderAction> {
     let nav_target = image_run_nav_target(run.link_url.as_deref(), Some(url));
-    let resp = if let ImageLoadState::Loaded(tex) = load_cached_image_state(ui.ctx(), url, None, None) {
+    let resp = if let ImageLoadState::Loaded(tex) =
+        load_cached_image_state(ui.ctx(), url, None, None, allow_remote_images)
+    {
         let [tw, th] = tex.size();
         let mut draw_w = tw.max(1) as f32;
         let mut draw_h = th.max(1) as f32;
@@ -7615,6 +7693,7 @@ fn render_image_run(
     show_caption: bool,
     show_inline_markup: bool,
     base_dir: Option<&Path>,
+    allow_remote_images: bool,
     theme: &WordTheme,
     read_only: bool,
     suppress_clicks: bool,
@@ -7639,7 +7718,7 @@ fn render_image_run(
             }
         }
     };
-    match load_cached_image_state(ui.ctx(), url, base_dir, doc_path.as_deref()) {
+    match load_cached_image_state(ui.ctx(), url, base_dir, doc_path.as_deref(), allow_remote_images) {
         ImageLoadState::Loaded(tex) => {
             let [tw, th] = tex.size();
             let mut draw_w = tw.max(1) as f32;
@@ -7809,6 +7888,8 @@ fn render_table_cell(
     eval_text: Option<&str>,
     src_lines: &Range<usize>,
     col_w: f32,
+    table_font_size: f32,
+    font_pref: FontPreference,
     align: TableAlign,
     is_header: bool,
     theme: &WordTheme,
@@ -7817,6 +7898,7 @@ fn render_table_cell(
     label_selectable: bool,
     suppress_clicks: bool,
     base_dir: Option<&Path>,
+    allow_remote_images: bool,
     search_needles: &[(String, bool)],
     whole_word: bool,
     galley_cache: &mut ReaderGalleyCache,
@@ -7864,9 +7946,10 @@ fn render_table_cell(
                     let logical_chunk = logical_text_if_rtl(chunk);
                     let (mut job, link_spans) = build_runs_layout_job(
                         chunk,
-                        13.5,
+                        table_font_size,
                         1.32,
                         is_header,
+                        font_pref,
                         color,
                         cell_dir,
                         theme,
@@ -7915,6 +7998,7 @@ fn render_table_cell(
                         false,
                         show_inline_markup,
                         base_dir,
+                        allow_remote_images,
                         theme,
                         read_only,
                         suppress_clicks,
@@ -7941,9 +8025,10 @@ fn render_table_cell(
                 ui,
                 runs,
                 src_lines,
-                13.5,
+                table_font_size,
                 1.32,
                 is_header,
+                font_pref,
                 color,
                 col_w,
                 cell_dir,
@@ -7976,6 +8061,8 @@ fn render_table_cell(
                 runs.len()
             };
             (col_w.round() as i32).hash(&mut hasher);
+            table_font_size.to_bits().hash(&mut hasher);
+            font_pref.hash(&mut hasher);
             is_header.hash(&mut hasher);
             core::mem::discriminant(&egui_align).hash(&mut hasher);
             core::mem::discriminant(&cell_dir).hash(&mut hasher);
@@ -7995,9 +8082,10 @@ fn render_table_cell(
             };
             let (mut job, link_spans) = build_runs_layout_job(
                 effective_runs,
-                13.5,
+                table_font_size,
                 1.32,
                 is_header,
+                font_pref,
                 color,
                 cell_dir,
                 theme,
@@ -8042,6 +8130,7 @@ fn build_runs_layout_job(
     font_size: f32,
     line_height_mult: f32,
     force_bold: bool,
+    font_pref: FontPreference,
     base_color: Color32,
     direction: TextDirection,
     theme: &WordTheme,
@@ -8082,9 +8171,9 @@ fn build_runs_layout_job(
         let family = if run.code {
             FontFamily::Monospace
         } else if is_bold || run.is_footnote_ref {
-            FontFamily::Name("bold".into())
+            font_pref.to_bold_font_family()
         } else {
-            FontFamily::Proportional
+            font_pref.to_font_family()
         };
 
         let color = if run.link_url.is_some() || run.is_footnote_ref {
@@ -8889,7 +8978,7 @@ mod tests {
         while std::time::Instant::now() < deadline {
             let mut state_out = ImageLoadState::Unavailable;
             let _ = ctx.run(Default::default(), |ctx| {
-                state_out = load_cached_image_state(ctx, url, None, None);
+                state_out = load_cached_image_state(ctx, url, None, None, true);
             });
             match state_out {
                 ImageLoadState::Loading => {
@@ -8927,7 +9016,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut svg_state = ImageLoadState::Unavailable;
         let _ = ctx.run(Default::default(), |ctx| {
-            svg_state = load_cached_image_state(ctx, svg_path.to_str().unwrap(), None, None);
+            svg_state = load_cached_image_state(ctx, svg_path.to_str().unwrap(), None, None, true);
         });
         match svg_state {
             ImageLoadState::Loaded(tex) => assert_eq!(tex.size(), [160, 48]),
@@ -8967,7 +9056,7 @@ mod tests {
         while std::time::Instant::now() < deadline {
             let mut s = ImageLoadState::Unavailable;
             let _ = ctx.run(Default::default(), |ctx| {
-                s = load_cached_image_state(ctx, gif_path.to_str().unwrap(), None, None);
+                s = load_cached_image_state(ctx, gif_path.to_str().unwrap(), None, None, true);
             });
             if let ImageLoadState::Loaded(tex) = s {
                 gif_loaded = Some(tex.size());

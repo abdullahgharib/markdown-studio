@@ -105,6 +105,7 @@ pub enum ToolbarAction {
     ZoomOut,
     ZoomReset,
     SetViewMode(ViewMode),
+    OpenSettings,
     OpenOsIntegrationModal,
 }
 
@@ -353,18 +354,23 @@ fn render_tier1_left_controls(
         sum_w += resp.rect.width() + gap;
     };
 
-    // App mark badge
+    // App mark badge (vector M + downward arrow for crisp cross-platform rendering)
     let logo_resp = egui::Frame::new()
         .fill(theme.accent)
         .corner_radius(CornerRadius::same(6))
         .inner_margin(Margin::symmetric(6, 3))
         .show(ui, |ui| {
-            ui.label(
-                RichText::new("M↓")
-                    .strong()
-                    .size(12.5)
-                    .color(Color32::WHITE),
-            );
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 1.0;
+                ui.label(
+                    RichText::new("M")
+                        .strong()
+                        .size(12.5)
+                        .color(Color32::WHITE),
+                );
+                let (arrow_rect, _) = ui.allocate_exact_size(Vec2::new(8.0, 14.0), Sense::hover());
+                paint_down_arrow(ui.painter(), arrow_rect, Color32::WHITE);
+            });
         })
         .response
         .on_hover_text(format!("Markdown Studio v{}", crate::APP_VERSION));
@@ -468,9 +474,9 @@ fn render_tier1_left_controls(
     }
 
     let (badge_text, badge_color) = if buf.dirty {
-        ("● Unsaved", theme.warning_amber)
+        ("Unsaved", theme.warning_amber)
     } else {
-        ("✓ Saved", theme.success_green)
+        ("Saved", theme.success_green)
     };
     let badge_resp = egui::Frame::new()
         .fill(Color32::from_rgba_unmultiplied(
@@ -491,13 +497,18 @@ fn render_tier1_left_controls(
         .corner_radius(CornerRadius::same(10))
         .inner_margin(Margin::symmetric(7, 2))
         .show(ui, |ui| {
-            inline_label(
-                ui,
-                RichText::new(badge_text)
-                    .size(11.0)
-                    .strong()
-                    .color(badge_color),
-            );
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                let (icon_rect, _) = ui.allocate_exact_size(Vec2::new(10.0, 12.0), Sense::hover());
+                paint_saved_icon(ui.painter(), icon_rect, buf.dirty, badge_color);
+                inline_label(
+                    ui,
+                    RichText::new(badge_text)
+                        .size(11.0)
+                        .strong()
+                        .color(badge_color),
+                );
+            });
         })
         .response;
     track(&badge_resp);
@@ -526,7 +537,17 @@ fn render_tier1_left_controls(
     }
 
     let recent_popup_id = ui.make_persistent_id("recent_files_popup");
-    let recent_btn = ribbon_button(ui, "Recent ▾", "Open Recent File", theme);
+    let recent_open = ui.memory(|m| m.is_popup_open(recent_popup_id));
+    let recent_btn = vivid_dropdown_button(
+        ui,
+        "Recent",
+        12.0,
+        recent_open,
+        true,
+        ToolbarButtonKind::Subtle,
+        "Open Recent File",
+        theme,
+    );
     track(&recent_btn);
     if recent_btn.clicked() {
         ui.memory_mut(|m| m.toggle_popup(recent_popup_id));
@@ -654,7 +675,7 @@ fn render_history_split_button(
     ui.spacing_mut().button_padding = egui::vec2(3.0, 4.0);
     let arrow_r = vivid_button(
         ui,
-        RichText::new("▾").size(11.0),
+        RichText::new("").size(11.0),
         Vec2::new(14.0, main_r.rect.height()),
         5,
         popup_open,
@@ -663,6 +684,14 @@ fn render_history_split_button(
         dropdown_tooltip,
         theme,
     );
+    let arrow_col = dropdown_fg_color(
+        ToolbarButtonKind::Subtle,
+        popup_open,
+        enabled_arrow && ui.is_enabled(),
+        arrow_r.hovered(),
+        theme,
+    );
+    paint_chevron_down(ui.painter(), arrow_r.rect, arrow_col);
     ui.spacing_mut().button_padding = prev_pad;
     if arrow_r.clicked() {
         ui.memory_mut(|m| m.toggle_popup(popup_id));
@@ -854,12 +883,12 @@ fn render_workspace_toggles(
             _ => {
                 let r = ribbon_button(
                     ui,
-                    "OS Menu",
-                    "Windows Right-Click Context Menu & .exe Path Setup",
+                    "Settings",
+                    "Settings, Fonts, Security & OS Integration (Ctrl+,)",
                     theme,
                 );
                 if r.clicked() {
-                    *action = ToolbarAction::OpenOsIntegrationModal;
+                    *action = ToolbarAction::OpenSettings;
                 }
                 r
             }
@@ -909,10 +938,14 @@ fn render_export_buttons(
             }
             2 => {
                 let popup_id = ui.make_persistent_id("export_more_formats_popup");
-                let r = export_accent_soft_button(
+                let export_open = ui.memory(|m| m.is_popup_open(popup_id));
+                let r = vivid_dropdown_button(
                     ui,
-                    "Export ▾",
+                    "Export",
+                    12.5,
+                    export_open,
                     !export_busy,
+                    ToolbarButtonKind::AccentSoft,
                     "Export to HTML, JSON, PDF, or Word",
                     theme,
                 );
@@ -1174,15 +1207,15 @@ fn render_ribbon_tab_switcher(
     state: &mut ToolbarState,
 ) {
     let tabs = [
-        (RibbonTab::Home, "✎ Text", "Text, formatting, lists & document blocks"),
+        (RibbonTab::Home, "   Text", "Text, formatting, lists & document blocks"),
         (
             RibbonTab::Equations,
-            "∫ Math",
+            "   Math",
             "Math symbols, textbook formulas & math calculator",
         ),
         (
             RibbonTab::Tables,
-            "⊞ Tables",
+            "   Tables",
             "Tables & Excel-like formulas and recalculation",
         ),
     ];
@@ -1195,9 +1228,21 @@ fn render_ribbon_tab_switcher(
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing = Vec2::new(2.0, 0.0);
                 for (tab, label, tip) in tabs {
-                    if view_mode_pill_button(ui, label, state.active_tab == tab, tip, theme)
-                        .clicked()
-                    {
+                    let active = state.active_tab == tab;
+                    let resp = view_mode_pill_button(ui, label, active, tip, theme);
+                    let icon_col = dropdown_fg_color(
+                        ToolbarButtonKind::ViewPill,
+                        active,
+                        true,
+                        resp.hovered(),
+                        theme,
+                    );
+                    let icon_rect = egui::Rect::from_min_size(
+                        egui::pos2(resp.rect.left() + 5.0, resp.rect.center().y - 5.0),
+                        Vec2::splat(10.0),
+                    );
+                    paint_ribbon_tab_icon(ui.painter(), tab, icon_rect, icon_col);
+                    if resp.clicked() {
                         state.active_tab = tab;
                     }
                 }
@@ -1496,7 +1541,16 @@ fn render_math_symbol_palette_popup(
 ) {
     let popup_id = ui.make_persistent_id(popup_salt);
     let open = ui.memory(|m| m.is_popup_open(popup_id));
-    let btn = toggle_pill_button(ui, button_label, open, tooltip, theme);
+    let btn = vivid_dropdown_button(
+        ui,
+        button_label,
+        12.0,
+        open,
+        true,
+        ToolbarButtonKind::Subtle,
+        tooltip,
+        theme,
+    );
     if btn.clicked() {
         ui.memory_mut(|m| m.toggle_popup(popup_id));
     }
@@ -1573,7 +1627,7 @@ fn render_equations_ribbon_controls(
 
     render_math_symbol_palette_popup(
         ui,
-        "Greek ▾",
+        "Greek",
         "Greek letters (α, β, γ, Δ, Σ, Ω...)",
         "math_greek_popup",
         MATH_GREEK_SYMBOLS,
@@ -1583,7 +1637,7 @@ fn render_equations_ribbon_controls(
     );
     render_math_symbol_palette_popup(
         ui,
-        "Operators ▾",
+        "Operators",
         "Mathematical & calculus operators (±, ×, ∑, ∫, ∂, ∇...)",
         "math_operators_popup",
         MATH_OPERATOR_SYMBOLS,
@@ -1593,7 +1647,7 @@ fn render_equations_ribbon_controls(
     );
     render_math_symbol_palette_popup(
         ui,
-        "Relations ▾",
+        "Relations",
         "Relations, logic & set symbols (≤, ≥, ≠, ≈, ∈, ∀, ⇒...)",
         "math_relations_popup",
         MATH_RELATION_SYMBOLS,
@@ -1603,7 +1657,7 @@ fn render_equations_ribbon_controls(
     );
     render_math_symbol_palette_popup(
         ui,
-        "Accents ▾",
+        "Accents",
         "Accents, vectors & blackboard sets (x̂, x⃗, ℝ, ℕ, ℂ...)",
         "math_accents_popup",
         MATH_ACCENT_SNIPPETS,
@@ -1614,10 +1668,13 @@ fn render_equations_ribbon_controls(
 
     let tpl_popup_id = ui.make_persistent_id("math_textbook_tpl_popup");
     let tpl_open = ui.memory(|m| m.is_popup_open(tpl_popup_id));
-    let tpl_btn = toggle_pill_button(
+    let tpl_btn = vivid_dropdown_button(
         ui,
-        "Textbook ▾",
+        "Textbook",
+        12.0,
         tpl_open,
+        true,
+        ToolbarButtonKind::Subtle,
         "Insert ready-made textbook equation blocks",
         theme,
     );
@@ -1659,7 +1716,7 @@ fn render_equations_ribbon_controls(
     }
     if toggle_pill_button(
         ui,
-        "⚡ Auto-Calc",
+        "Auto-Calc",
         calc.auto_calc_math,
         "Automatically evaluate math expressions and display live results on equation cards",
         theme,
@@ -1693,11 +1750,11 @@ fn render_tables_ribbon_controls(
     ui.separator();
 
     for (label, formula, tip) in [
-        ("∑ SUM", "=SUM(ABOVE)", "Insert Excel SUM formula (=SUM(ABOVE))"),
-        ("x̄ AVG", "=AVERAGE(ABOVE)", "Insert Excel AVERAGE formula (=AVERAGE(ABOVE))"),
-        ("↓ MIN", "=MIN(ABOVE)", "Insert Excel MIN formula (=MIN(ABOVE))"),
-        ("↑ MAX", "=MAX(ABOVE)", "Insert Excel MAX formula (=MAX(ABOVE))"),
-        ("# COUNT", "=COUNT(ABOVE)", "Insert Excel COUNT formula (=COUNT(ABOVE))"),
+        ("Sum", "=SUM(ABOVE)", "Insert Excel SUM formula (=SUM(ABOVE))"),
+        ("Avg", "=AVERAGE(ABOVE)", "Insert Excel AVERAGE formula (=AVERAGE(ABOVE))"),
+        ("Min", "=MIN(ABOVE)", "Insert Excel MIN formula (=MIN(ABOVE))"),
+        ("Max", "=MAX(ABOVE)", "Insert Excel MAX formula (=MAX(ABOVE))"),
+        ("Count", "=COUNT(ABOVE)", "Insert Excel COUNT formula (=COUNT(ABOVE))"),
         ("IF", "=IF(A1>0, \"Yes\", \"No\")", "Insert Excel conditional IF formula"),
     ] {
         if ribbon_button(ui, label, tip, theme).clicked() {
@@ -1724,7 +1781,7 @@ fn render_tables_ribbon_controls(
     }
     if toggle_pill_button(
         ui,
-        "⚡ Auto-Calc",
+        "Auto-Calc",
         calc.auto_calc_tables,
         "Automatically evaluate Excel-like table formulas live during rendering",
         theme,
@@ -1744,9 +1801,14 @@ fn render_table_grid_inserter_button(
 ) {
     // Word-style Interactive Table Grid Picker popup
     let table_popup_id = ui.make_persistent_id(popup_salt);
-    let table_btn = ribbon_button(
+    let table_open = ui.memory(|m| m.is_popup_open(table_popup_id));
+    let table_btn = vivid_dropdown_button(
         ui,
-        "Table ▾",
+        "Table",
+        12.0,
+        table_open,
+        true,
+        ToolbarButtonKind::Subtle,
         "Interactive GFM Table Grid Inserter",
         theme,
     );
@@ -2070,6 +2132,220 @@ pub(crate) fn vivid_button(
     } else {
         resp.on_hover_text(tooltip)
     }
+}
+
+fn paint_down_arrow(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
+    let cx = rect.center().x;
+    let top = rect.top() + 2.5;
+    let bot = rect.bottom() - 2.5;
+    painter.line_segment(
+        [egui::pos2(cx, top), egui::pos2(cx, bot - 0.5)],
+        Stroke::new(1.75_f32, color),
+    );
+    painter.line_segment(
+        [egui::pos2(cx - 2.8, bot - 3.2), egui::pos2(cx, bot)],
+        Stroke::new(1.65_f32, color),
+    );
+    painter.line_segment(
+        [egui::pos2(cx + 2.8, bot - 3.2), egui::pos2(cx, bot)],
+        Stroke::new(1.65_f32, color),
+    );
+}
+
+fn paint_saved_icon(painter: &egui::Painter, rect: egui::Rect, dirty: bool, color: Color32) {
+    let c = rect.center();
+    if dirty {
+        painter.circle_filled(c, 3.4, color);
+    } else {
+        painter.line_segment(
+            [egui::pos2(c.x - 3.4, c.y + 0.2), egui::pos2(c.x - 0.9, c.y + 2.8)],
+            Stroke::new(1.75_f32, color),
+        );
+        painter.line_segment(
+            [egui::pos2(c.x - 0.9, c.y + 2.8), egui::pos2(c.x + 3.6, c.y - 2.6)],
+            Stroke::new(1.75_f32, color),
+        );
+    }
+}
+
+fn paint_chevron_down(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
+    let c = rect.center();
+    painter.add(Shape::convex_polygon(
+        vec![
+            egui::pos2(c.x - 3.0, c.y - 1.3),
+            egui::pos2(c.x + 3.0, c.y - 1.3),
+            egui::pos2(c.x, c.y + 2.2),
+        ],
+        color,
+        Stroke::NONE,
+    ));
+}
+
+fn paint_ribbon_tab_icon(
+    painter: &egui::Painter,
+    tab: RibbonTab,
+    rect: egui::Rect,
+    color: Color32,
+) {
+    let stroke = Stroke::new(1.3_f32, color);
+    match tab {
+        RibbonTab::Home => {
+            // Vector pencil diagonal stroke
+            painter.line_segment(
+                [
+                    egui::pos2(rect.left() + 1.5, rect.bottom() - 1.5),
+                    egui::pos2(rect.right() - 1.5, rect.top() + 1.5),
+                ],
+                Stroke::new(1.6_f32, color),
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(rect.left() + 1.0, rect.bottom() - 1.0),
+                    egui::pos2(rect.left() + 3.5, rect.bottom() - 1.5),
+                ],
+                stroke,
+            );
+        }
+        RibbonTab::Equations => {
+            // Vector Sigma-like summation strokes
+            painter.line_segment(
+                [
+                    egui::pos2(rect.right() - 1.5, rect.top() + 1.5),
+                    egui::pos2(rect.left() + 2.0, rect.top() + 1.5),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(rect.left() + 2.0, rect.top() + 1.5),
+                    egui::pos2(rect.center().x + 0.5, rect.center().y),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(rect.center().x + 0.5, rect.center().y),
+                    egui::pos2(rect.left() + 2.0, rect.bottom() - 1.5),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(rect.left() + 2.0, rect.bottom() - 1.5),
+                    egui::pos2(rect.right() - 1.5, rect.bottom() - 1.5),
+                ],
+                stroke,
+            );
+        }
+        RibbonTab::Tables => {
+            // Vector 2x2 table grid
+            let r = rect.shrink(1.0);
+            painter.rect_stroke(r, 1.0, stroke, egui::StrokeKind::Inside);
+            painter.line_segment(
+                [
+                    egui::pos2(r.center().x, r.top()),
+                    egui::pos2(r.center().x, r.bottom()),
+                ],
+                Stroke::new(1.0_f32, color),
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(r.left(), r.center().y),
+                    egui::pos2(r.right(), r.center().y),
+                ],
+                Stroke::new(1.0_f32, color),
+            );
+        }
+    }
+}
+
+fn dropdown_fg_color(
+    kind: ToolbarButtonKind,
+    active: bool,
+    enabled: bool,
+    hovered: bool,
+    theme: &WordTheme,
+) -> Color32 {
+    if !enabled {
+        return Color32::from_rgba_unmultiplied(
+            theme.text_muted.r(),
+            theme.text_muted.g(),
+            theme.text_muted.b(),
+            130,
+        );
+    }
+    match kind {
+        ToolbarButtonKind::Primary => Color32::WHITE,
+        ToolbarButtonKind::AccentSoft => {
+            if hovered {
+                if theme.dark {
+                    Color32::WHITE
+                } else {
+                    theme.accent_hover
+                }
+            } else {
+                theme.accent
+            }
+        }
+        ToolbarButtonKind::ViewPill => {
+            if active {
+                theme.accent
+            } else if hovered {
+                theme.text_primary
+            } else {
+                theme.text_muted
+            }
+        }
+        ToolbarButtonKind::Subtle | ToolbarButtonKind::Secondary => {
+            if active {
+                theme.accent
+            } else if hovered {
+                if theme.dark {
+                    Color32::WHITE
+                } else {
+                    theme.accent_hover
+                }
+            } else {
+                theme.text_primary
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn vivid_dropdown_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    font_size: f32,
+    active: bool,
+    enabled: bool,
+    kind: ToolbarButtonKind,
+    tooltip: &str,
+    theme: &WordTheme,
+) -> egui::Response {
+    let text = if kind == ToolbarButtonKind::AccentSoft {
+        RichText::new(format!("{label}  ")).size(font_size).strong()
+    } else {
+        RichText::new(format!("{label}  ")).size(font_size)
+    };
+    let resp = vivid_button(
+        ui,
+        text,
+        Vec2::ZERO,
+        6,
+        active,
+        enabled,
+        kind,
+        tooltip,
+        theme,
+    );
+    let chev_rect = egui::Rect::from_min_max(
+        egui::pos2(resp.rect.right() - 12.0, resp.rect.top()),
+        egui::pos2(resp.rect.right() - 3.0, resp.rect.bottom()),
+    );
+    let col = dropdown_fg_color(kind, active, enabled && ui.is_enabled(), resp.hovered(), theme);
+    paint_chevron_down(ui.painter(), chev_rect, col);
+    resp
 }
 
 fn ribbon_button(

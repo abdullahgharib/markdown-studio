@@ -3908,7 +3908,7 @@ fn test_responsive_toolbar_never_overlaps_across_widths_and_zoom() {
                 }
             }
             egui::Shape::Text(t) if t.pos.y <= y_max => {
-                let txt = t.galley.text();
+                let txt = t.galley.text().trim();
                 if labels.contains(&txt) {
                     let rect = Rect::from_min_size(t.pos, t.galley.rect.size());
                     out.push((txt.to_string(), rect));
@@ -3921,7 +3921,7 @@ fn test_responsive_toolbar_never_overlaps_across_widths_and_zoom() {
     let tier1_labels = [
         "New",
         "Open",
-        "Recent ▾",
+        "Recent",
         "Save",
         "Save As",
         "Undo",
@@ -3936,10 +3936,10 @@ fn test_responsive_toolbar_never_overlaps_across_widths_and_zoom() {
         "Light Mode",
         "Sepia Mode",
         "Dark Mode",
-        "OS Menu",
+        "Settings",
         "PDF",
         "Word (.docx)",
-        "Export ▾",
+        "Export",
         "Print",
     ];
 
@@ -4027,9 +4027,9 @@ fn test_undo_redo_history_popup_and_multi_step_jump() {
     let mut t = 1.0_f64;
     let out = ui_step(&ctx, &mut app, t, vec![]);
 
-    // Find the Undo label and click the adjacent "▾" dropdown arrow on its right
+    // Find the Undo label and click the adjacent vector dropdown chevron button on its right
     let undo_pos = find_rendered_text(&out, "Undo", 0.0, 900.0, 0.0);
-    let undo_chevron_pos = find_rendered_text(&out, "▾", undo_pos.x, undo_pos.x + 60.0, 0.0);
+    let undo_chevron_pos = egui::pos2(undo_pos.x + 25.0, undo_pos.y);
     let _ = click_at(&ctx, &mut app, &mut t, undo_chevron_pos, Modifiers::NONE);
     t += 0.02;
     let out_popup = ui_step(&ctx, &mut app, t, vec![]);
@@ -4042,7 +4042,7 @@ fn test_undo_redo_history_popup_and_multi_step_jump() {
 
     // Now click the Redo history dropdown and jump forward 2 steps back to "One Two Three Four"
     let redo_pos = find_rendered_text(&out, "Redo", 0.0, 900.0, 0.0);
-    let redo_chevron_pos = find_rendered_text(&out, "▾", redo_pos.x, redo_pos.x + 60.0, 0.0);
+    let redo_chevron_pos = egui::pos2(redo_pos.x + 25.0, redo_pos.y);
     let _ = click_at(&ctx, &mut app, &mut t, redo_chevron_pos, Modifiers::NONE);
     t += 0.02;
     let out_redo_popup = ui_step(&ctx, &mut app, t, vec![]);
@@ -4130,14 +4130,19 @@ fn test_os_integration_modal_and_settings_exe_path_roundtrip() {
     assert!(!parsed.auto_sync_exe_path);
     assert_eq!(parsed.effective_exe_path(), custom);
 
-    // 2. Clicking "OS Menu" opens OsIntegrationModal, allows editing path & toggling checkboxes, and Esc closes it
+    // 2. Clicking "Settings" opens unified SettingsModal, switching to "OS Integration" reveals Windows setup, and Esc closes it
     let ctx = egui::Context::default();
     let (_dir, mut app) = new_isolated_app(&ctx);
     let mut t = 1.0_f64;
     let out = ui_step(&ctx, &mut app, t, vec![]);
-    let os_btn_pos = find_rendered_text(&out, "OS Menu", 0.0, 1280.0, 0.0);
-    let _ = click_at(&ctx, &mut app, &mut t, os_btn_pos, Modifiers::NONE);
-    assert!(app.os_modal.open);
+    let settings_btn_pos = find_rendered_text(&out, "Settings", 0.0, 1280.0, 0.0);
+    let _ = click_at(&ctx, &mut app, &mut t, settings_btn_pos, Modifiers::NONE);
+    assert!(app.settings_modal.open);
+
+    t += 0.02;
+    let out_settings = ui_step(&ctx, &mut app, t, vec![]);
+    let os_tab_pos = find_rendered_text(&out_settings, "OS Integration", 0.0, 1280.0, 0.0);
+    let _ = click_at(&ctx, &mut app, &mut t, os_tab_pos, Modifiers::NONE);
 
     t += 0.02;
     let out_modal = ui_step(&ctx, &mut app, t, vec![]);
@@ -4170,7 +4175,20 @@ fn test_os_integration_modal_and_settings_exe_path_roundtrip() {
             modifiers: Modifiers::NONE,
         }],
     );
-    assert!(!app.os_modal.open);
+    assert!(!app.settings_modal.open);
+
+    // Legacy ToolbarAction::OpenOsIntegrationModal still jumps straight to OS Integration tab
+    app.dispatch_action(&ctx, ToolbarAction::OpenOsIntegrationModal);
+    assert!(app.settings_modal.open);
+    t += 0.02;
+    let out_legacy = ui_step(&ctx, &mut app, t, vec![]);
+    let _ = find_rendered_text(
+        &out_legacy,
+        "Target Executable (.exe) Path:",
+        0.0,
+        1280.0,
+        0.0,
+    );
 }
 
 #[test]
@@ -4573,14 +4591,14 @@ fn test_ribbon_tabs_equations_math_calc_and_auto_calc() {
     t += 0.03;
     let out_home = ui_step(&ctx, &mut app, t, vec![]);
 
-    // 1. Switch to Equations ("∫ Math") ribbon tab by clicking it
-    let math_tab_pos = find_rendered_text(&out_home, "∫ Math", 0.0, 1280.0, 30.0);
+    // 1. Switch to Equations ("Math") ribbon tab by clicking it
+    let math_tab_pos = find_rendered_text(&out_home, "Math", 0.0, 1280.0, 30.0);
     let _ = click_at(&ctx, &mut app, &mut t, math_tab_pos, Modifiers::NONE);
     t += 0.03;
     let out_math_tab = ui_step(&ctx, &mut app, t, vec![]);
     assert!(
-        !find_rendered_text_shapes(&out_math_tab, "Textbook ▾").is_empty(),
-        "Equations tab must expose Textbook ▾ template palette"
+        !find_rendered_text_shapes(&out_math_tab, "Textbook").is_empty(),
+        "Equations tab must expose Textbook template palette"
     );
     assert!(
         !find_rendered_text_shapes(&out_math_tab, "= Calculate").is_empty(),
@@ -4613,8 +4631,8 @@ fn test_ribbon_tabs_equations_math_calc_and_auto_calc() {
         app.buffer.as_string()
     );
 
-    // 4. Switch to Tables ("⊞ Tables") ribbon tab and insert textbook math snippet
-    let tables_tab_pos = find_rendered_text(&out_auto, "⊞ Tables", 0.0, 1280.0, 30.0);
+    // 4. Switch to Tables ("Tables") ribbon tab and insert textbook math snippet
+    let tables_tab_pos = find_rendered_text(&out_auto, "Tables", 0.0, 1280.0, 30.0);
     let _ = click_at(&ctx, &mut app, &mut t, tables_tab_pos, Modifiers::NONE);
     t += 0.03;
     let out_tables_tab = ui_step(&ctx, &mut app, t, vec![]);
@@ -4891,9 +4909,9 @@ fn test_file_explorer_sidebar_search_filter_open_tab_and_export_menu() {
     app.dispatch_action(&ctx, ToolbarAction::ToggleOutline);
     assert!(!app.outline_open);
 
-    // Open Export ▾ popup and verify HTML & JSON export options render
+    // Open Export popup and verify HTML & JSON export options render
     let out_closed = ui_step(&ctx, &mut app, t + 0.03, vec![]);
-    let export_pos = find_rendered_text(&out_closed, "Export ▾", 600.0, 1280.0, 0.0);
+    let export_pos = find_rendered_text(&out_closed, "Export", 600.0, 1280.0, 0.0);
     let _ = click_at(&ctx, &mut app, &mut t, export_pos, Modifiers::NONE);
     t += 0.03;
     let out_popup = ui_step(&ctx, &mut app, t, vec![]);
@@ -7685,4 +7703,180 @@ fn test_submenu_hover_no_panic_wysiwyg_selection_reader_ctrl_a_and_rich_copy() {
         "Source Copy must produce rich styled HTML, got: {:?}",
         app.last_copied_html
     );
+}
+
+#[test]
+fn test_settings_modal_tabs_appearance_fonts_and_persistence() {
+    use markdown_studio::ui::settings::{AppSettings, FontPreference};
+    use markdown_studio::ui::settings_modal::SettingsTab;
+
+    let ctx = egui::Context::default();
+    let (dir, mut app) = new_isolated_app(&ctx);
+    let settings_path = dir.path().join("settings.json");
+    app.buffer = DocumentBuffer::from_str("# Typography Test\n\nParagraph text for font sizing.\n");
+    let mut t = 1.0_f64;
+    let _ = ui_step(&ctx, &mut app, t, vec![]);
+
+    // 1. Ctrl+, opens SettingsModal on Appearance tab
+    let _ = press_key(&ctx, &mut app, &mut t, Key::Comma, Modifiers::COMMAND);
+    assert!(app.settings_modal.open);
+    assert_eq!(app.settings_modal.active_tab, SettingsTab::Appearance);
+    t += 0.02;
+    let out_app = ui_step(&ctx, &mut app, t, vec![]);
+    let _ = find_rendered_text(&out_app, "Settings & Preferences", 0.0, 1280.0, 0.0);
+    let _ = find_rendered_text(&out_app, "Typography & Font Preferences", 0.0, 1280.0, 0.0);
+
+    // Switch to Serif / custom font sizes and persist via Security/Appearance roundtrip
+    app.settings.ui_font_size = 14.0;
+    app.settings.editor_font_family = FontPreference::Serif;
+    app.settings.editor_font_size = 18.0;
+    app.settings.reader_font_family = FontPreference::Serif;
+    app.settings.reader_font_size = 20.0;
+    let _ = app.settings.save_to(&settings_path);
+    markdown_studio::ui::theme::apply_ui_font_size(&ctx, app.settings.ui_font_size);
+
+    t += 0.02;
+    let _ = ui_step(&ctx, &mut app, t, vec![]);
+    assert_eq!(app.editor_state.font_family, FontPreference::Serif);
+    assert!((app.editor_state.font_size - 18.0).abs() < 0.01);
+    assert_eq!(app.reader_state.reader_font_family, FontPreference::Serif);
+    assert!((app.reader_state.reader_font_size - 20.0).abs() < 0.01);
+    let applied_body = ctx.style().text_styles[&egui::TextStyle::Body].size;
+    assert!((applied_body - 14.0).abs() < 0.01);
+
+    // 2. Clicking Security tab renders security toggles & Always blocked banner
+    let sec_pos = find_rendered_text(&out_app, "Security", 0.0, 1280.0, 0.0);
+    let _ = click_at(&ctx, &mut app, &mut t, sec_pos, Modifiers::NONE);
+    assert_eq!(app.settings_modal.active_tab, SettingsTab::Security);
+    t += 0.02;
+    let out_sec = ui_step(&ctx, &mut app, t, vec![]);
+    let _ = find_rendered_text(&out_sec, "Link & Network Content Security", 0.0, 1280.0, 0.0);
+    let _ = find_rendered_text(&out_sec, "Allow opening executable", 0.0, 1280.0, 0.0);
+
+    // 3. Reloading AppSettings from disk restores persisted font & size values
+    let reloaded = AppSettings::load_from(&settings_path);
+    assert_eq!(reloaded.editor_font_family, FontPreference::Serif);
+    assert!((reloaded.editor_font_size - 18.0).abs() < 0.01);
+    assert_eq!(reloaded.reader_font_family, FontPreference::Serif);
+    assert!((reloaded.reader_font_size - 20.0).abs() < 0.01);
+    assert!((reloaded.ui_font_size - 14.0).abs() < 0.01);
+
+    // 4. Escape dismisses Settings modal
+    let _ = press_key(&ctx, &mut app, &mut t, Key::Escape, Modifiers::NONE);
+    assert!(!app.settings_modal.open);
+}
+
+#[test]
+fn test_security_settings_gate_external_local_executable_links_and_remote_images() {
+    let ctx = egui::Context::default();
+    let (dir, mut app) = new_isolated_app(&ctx);
+
+    let note_md = dir.path().join("linked.md");
+    std::fs::write(&note_md, "# Linked Note\n").unwrap();
+    let text_file = dir.path().join("notes.txt");
+    std::fs::write(&text_file, "hello").unwrap();
+    let batch_file = dir.path().join("script.bat");
+    std::fs::write(&batch_file, "@echo off\r\n").unwrap();
+
+    // 1. Default safe security policy: external & local links allowed, executables & UNC blocked
+    app.open_link_target(&ctx, "https://example.com/docs");
+    assert_eq!(app.last_opened_link.as_deref(), Some("https://example.com/docs"));
+
+    app.settings.allow_external_links = false;
+    app.last_opened_link = None;
+    app.open_link_target(&ctx, "https://example.com/blocked");
+    assert!(app.last_opened_link.is_none());
+    assert!(app.exporter.status_text.contains("Blocked external link"));
+
+    app.open_link_target(&ctx, note_md.to_str().unwrap());
+    assert_eq!(app.buffer.file_path.as_deref(), Some(note_md.as_path()));
+
+    app.settings.allow_local_file_links = false;
+    app.last_opened_link = None;
+    app.open_link_target(&ctx, text_file.to_str().unwrap());
+    assert!(app.last_opened_link.is_none());
+    assert!(app.exporter.status_text.contains("Blocked local file link"));
+
+    // Executable script is blocked by default
+    app.last_opened_link = None;
+    app.open_link_target(&ctx, batch_file.to_str().unwrap());
+    assert!(app.last_opened_link.is_none());
+    assert!(
+        app.exporter.status_text.contains("Blocked unsafe executable"),
+        "expected executable block status, got: {}",
+        app.exporter.status_text
+    );
+
+    // Explicit opt-in allows opening the local executable script
+    app.settings.allow_executable_links = true;
+    app.open_link_target(&ctx, batch_file.to_str().unwrap());
+    assert_eq!(
+        app.last_opened_link.as_deref(),
+        batch_file.to_str(),
+        "expected opt-in executable link to open"
+    );
+
+    // UNC network share paths & javascript: remain ALWAYS blocked even when executable opt-in is true
+    app.last_opened_link = None;
+    app.open_link_target(&ctx, r"\\server\share\payload.exe");
+    assert!(app.last_opened_link.is_none());
+    assert!(app.exporter.status_text.contains("Blocked unsafe executable or network link"));
+
+    app.open_link_target(&ctx, "javascript:alert(1)");
+    assert!(app.last_opened_link.is_none());
+    assert!(app.exporter.status_text.contains("Blocked unsafe or invalid link"));
+
+    // Remote images setting propagates cleanly to reader_state and blocks remote badge/image render crash
+    app.settings.allow_remote_images = false;
+    app.buffer = DocumentBuffer::from_str("![Remote Badge](https://example.com/badge.png)\n");
+    app.dispatch_action(&ctx, ToolbarAction::SetViewMode(ViewMode::Reader));
+    let out = ui_step(&ctx, &mut app, 1.0, vec![]);
+    assert!(!app.reader_state.allow_remote_images);
+    assert!(!find_rendered_text_shapes(&out, "Remote Badge").is_empty());
+}
+
+#[test]
+fn test_toolbar_vector_chrome_icons_render_without_tofu_across_themes() {
+    use markdown_studio::ui::theme::ThemeMode;
+    use markdown_studio::ui::toolbar::RibbonTab;
+
+    fn collect_top_chrome_texts(shape: &egui::Shape, y_max: f32, out: &mut Vec<String>) {
+        match shape {
+            egui::Shape::Vec(v) => {
+                for s in v {
+                    collect_top_chrome_texts(s, y_max, out);
+                }
+            }
+            egui::Shape::Text(t) if t.pos.y <= y_max => {
+                out.push(t.galley.text().to_string());
+            }
+            _ => {}
+        }
+    }
+
+    for mode in [ThemeMode::Light, ThemeMode::Sepia, ThemeMode::Dark] {
+        let ctx = egui::Context::default();
+        let (_dir, mut app) = new_isolated_app(&ctx);
+        app.dispatch_action(&ctx, ToolbarAction::SetThemeMode(mode));
+        for tab in [RibbonTab::Home, RibbonTab::Equations, RibbonTab::Tables] {
+            app.toolbar_state.active_tab = tab;
+            let out = ui_step(&ctx, &mut app, 1.0, vec![]);
+            let mut texts = Vec::new();
+            for s in &out.shapes {
+                collect_top_chrome_texts(&s.shape, 95.0, &mut texts);
+            }
+            for txt in &texts {
+                for forbidden in ['↓', '✓', '▾', '✎', '⊞', '●'] {
+                    assert!(
+                        !txt.contains(forbidden),
+                        "top chrome label {txt:?} should use vector painter instead of U+{:04X} ({mode:?}, {tab:?})",
+                        forbidden as u32
+                    );
+                }
+            }
+            assert!(texts.iter().any(|t| t == "M"));
+            assert!(texts.iter().any(|t| t == "Saved"));
+            assert!(texts.iter().any(|t| t == "Settings"));
+        }
+    }
 }

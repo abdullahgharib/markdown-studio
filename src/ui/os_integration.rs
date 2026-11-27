@@ -569,7 +569,7 @@ impl OsIntegrationModal {
         self.feedback = None;
     }
 
-    /// Renders the modal and optionally returns a status bar message when an OS change occurred.
+    /// Renders the modal window and optionally returns a status bar message when an OS change occurred.
     pub fn show(
         &mut self,
         ctx: &egui::Context,
@@ -591,184 +591,222 @@ impl OsIntegrationModal {
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .default_width(540.0)
             .show(ctx, |ui| {
-                ui.label(
-                    RichText::new(
-                        "Add Markdown Studio to your Windows Right-Click menu (per-user HKCU, no admin required).",
-                    )
-                    .size(12.5)
-                    .color(theme.text_muted),
-                );
-                ui.add_space(8.0);
-
-                // Current registry status banner
-                let is_registered = self.status.shell_new_enabled || self.status.open_with_enabled;
-                let (pill_lbl, pill_col) = if is_registered {
-                    ("✓ Registered in Windows Menu", theme.success_green)
-                } else {
-                    ("○ Not Registered Yet", theme.text_muted)
-                };
-                egui::Frame::new()
-                    .fill(theme.ribbon_bg)
-                    .stroke(Stroke::new(1.0_f32, theme.border))
-                    .corner_radius(CornerRadius::same(6))
-                    .inner_margin(Margin::symmetric(10, 7))
-                    .show(ui, |ui| {
-                        ui.set_min_width(ui.available_width());
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(pill_lbl).strong().size(12.0).color(pill_col));
-                            if let Some(ref reg_exe) = self.status.registered_exe_path {
-                                let exists_mark = if reg_exe.exists() { "✓" } else { "⚠ missing" };
-                                ui.label(
-                                    RichText::new(format!("({exists_mark}: {})", reg_exe.display()))
-                                        .size(11.5)
-                                        .color(theme.text_muted),
-                                );
-                            }
-                        });
-                    });
-
-                ui.add_space(10.0);
-                ui.label(RichText::new("Target Executable (.exe) Path:").strong().size(12.5));
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.exe_path_input)
-                            .desired_width(355.0)
-                            .hint_text(r"C:\Path\To\Markdown Studio.exe"),
-                    );
-                    if ui
-                        .button("Current .exe")
-                        .on_hover_text("Use the currently running executable path")
-                        .clicked()
-                        && let Ok(cur) = std::env::current_exe() {
-                            self.exe_path_input = cur.to_string_lossy().to_string();
-                            self.feedback = None;
-                        }
-                    if ui
-                        .button("Browse...")
-                        .on_hover_text("Pick Markdown Studio.exe from disk")
-                        .clicked()
-                        && let Some(picked) = rfd::FileDialog::new()
-                            .add_filter("Windows Executable", &["exe"])
-                            .pick_file()
-                        {
-                            self.exe_path_input = picked.to_string_lossy().to_string();
-                            self.feedback = None;
-                        }
-                });
-
-                let typed_path = PathBuf::from(self.exe_path_input.trim());
-                if !self.exe_path_input.trim().is_empty() && !typed_path.exists() {
-                    ui.label(
-                        RichText::new("Note: That path does not exist on disk yet — verify before applying.")
-                            .size(11.5)
-                            .color(theme.warning_amber),
-                    );
-                }
-
-                ui.add_space(8.0);
-                if ui
-                    .checkbox(
-                        &mut self.auto_sync_exe_path,
-                        "Auto-update Windows Registry on startup if the .exe moves",
-                    )
-                    .changed()
-                {
-                    settings.auto_sync_exe_path = self.auto_sync_exe_path;
-                    let _ = settings.save_to(settings_path);
-                }
-
-                ui.add_space(6.0);
-                ui.separator();
-                ui.add_space(6.0);
-                ui.label(RichText::new("Windows Right-Click Options:").strong().size(12.5));
-                ui.checkbox(
-                    &mut self.enable_shell_new,
-                    "Add \"Markdown Document (.md)\" to Right-Click -> New menu",
-                );
-                ui.checkbox(
-                    &mut self.enable_open_with,
-                    "Add \"Open with Markdown Studio\" to file Right-Click menu",
-                );
-
-                if let Some((is_err, ref msg)) = self.feedback {
-                    ui.add_space(6.0);
-                    let col = if is_err {
-                        theme.warning_amber
-                    } else {
-                        theme.success_green
-                    };
-                    ui.label(RichText::new(msg).size(12.0).color(col));
-                }
-
-                ui.add_space(10.0);
-                ui.separator();
-                ui.add_space(6.0);
-
-                ui.horizontal(|ui| {
-                    let apply_btn = egui::Button::new(
-                        RichText::new("Apply / Update Menu")
-                            .strong()
-                            .color(Color32::WHITE),
-                    )
-                    .fill(theme.accent)
-                    .stroke(Stroke::NONE);
-                    if ui.add(apply_btn).clicked() {
-                        let trimmed = self.exe_path_input.trim();
-                        let target = PathBuf::from(trimmed);
-                        if let Err(err) = validate_exe_path(&target) {
-                            self.feedback = Some((true, err.clone()));
-                            status_out = Some(err);
-                        } else {
-                            settings.custom_exe_path = Some(target.clone());
-                            settings.auto_sync_exe_path = self.auto_sync_exe_path;
-                            let _ = settings.save_to(settings_path);
-                            match register_integration(
-                                &target,
-                                self.enable_shell_new,
-                                self.enable_open_with,
-                            ) {
-                                Ok(msg) => {
-                                    self.status = query_integration_status();
-                                    self.feedback = Some((false, msg.clone()));
-                                    status_out = Some(msg);
-                                }
-                                Err(err) => {
-                                    self.feedback = Some((true, err.clone()));
-                                    status_out = Some(err);
-                                }
-                            }
-                        }
-                    }
-
-                    if ui.button("Remove From Menu").clicked() {
-                        match unregister_integration() {
-                            Ok(msg) => {
-                                self.status = query_integration_status();
-                                self.enable_shell_new = false;
-                                self.enable_open_with = false;
-                                self.feedback = Some((false, msg.clone()));
-                                status_out = Some(msg);
-                            }
-                            Err(err) => {
-                                self.feedback = Some((true, err.clone()));
-                                status_out = Some(err);
-                            }
-                        }
-                    }
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Close").clicked() || ui.input(|i| i.key_pressed(Key::Escape))
-                        {
-                            self.open = false;
-                        }
-                    });
-                });
+                status_out = self.show_contents(ui, theme, settings, settings_path, false);
             });
 
         if !keep_open {
             self.open = false;
         }
+        status_out
+    }
+
+    /// Renders the inner OS Integration panel contents (used standalone or embedded in Settings).
+    pub fn show_contents(
+        &mut self,
+        ui: &mut egui::Ui,
+        theme: &WordTheme,
+        settings: &mut AppSettings,
+        settings_path: &Path,
+        embedded: bool,
+    ) -> Option<String> {
+        let mut status_out: Option<String> = None;
+
+        if embedded {
+            ui.label(
+                RichText::new("Windows Explorer & Context Menu Setup")
+                    .strong()
+                    .size(13.5)
+                    .color(theme.text_primary),
+            );
+            ui.add_space(4.0);
+        }
+
+        ui.label(
+            RichText::new(
+                "Add Markdown Studio to your Windows Right-Click menu (per-user HKCU, no admin required).",
+            )
+            .size(12.5)
+            .color(theme.text_muted),
+        );
+        #[cfg(not(target_os = "windows"))]
+        {
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(
+                    "Note: Windows Registry integration is inactive on Linux/macOS; desktop file associations follow your OS desktop environment.",
+                )
+                .size(11.5)
+                .color(theme.text_muted),
+            );
+        }
+        ui.add_space(8.0);
+
+        // Current registry status banner
+        let is_registered = self.status.shell_new_enabled || self.status.open_with_enabled;
+        let (pill_lbl, pill_col) = if is_registered {
+            ("Registered in Windows Menu", theme.success_green)
+        } else {
+            ("Not Registered Yet", theme.text_muted)
+        };
+        egui::Frame::new()
+            .fill(theme.ribbon_bg)
+            .stroke(Stroke::new(1.0_f32, theme.border))
+            .corner_radius(CornerRadius::same(6))
+            .inner_margin(Margin::symmetric(10, 7))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(pill_lbl).strong().size(12.0).color(pill_col));
+                    if let Some(ref reg_exe) = self.status.registered_exe_path {
+                        let exists_mark = if reg_exe.exists() { "found" } else { "missing" };
+                        ui.label(
+                            RichText::new(format!("({exists_mark}: {})", reg_exe.display()))
+                                .size(11.5)
+                                .color(theme.text_muted),
+                        );
+                    }
+                });
+            });
+
+        ui.add_space(10.0);
+        ui.label(RichText::new("Target Executable (.exe) Path:").strong().size(12.5));
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.exe_path_input)
+                    .desired_width(355.0)
+                    .hint_text(r"C:\Path\To\Markdown Studio.exe"),
+            );
+            if ui
+                .button("Current .exe")
+                .on_hover_text("Use the currently running executable path")
+                .clicked()
+                && let Ok(cur) = std::env::current_exe() {
+                    self.exe_path_input = cur.to_string_lossy().to_string();
+                    self.feedback = None;
+                }
+            if ui
+                .button("Browse...")
+                .on_hover_text("Pick Markdown Studio.exe from disk")
+                .clicked()
+                && let Some(picked) = rfd::FileDialog::new()
+                    .add_filter("Windows Executable", &["exe"])
+                    .pick_file()
+                {
+                    self.exe_path_input = picked.to_string_lossy().to_string();
+                    self.feedback = None;
+                }
+        });
+
+        let typed_path = PathBuf::from(self.exe_path_input.trim());
+        if !self.exe_path_input.trim().is_empty() && !typed_path.exists() {
+            ui.label(
+                RichText::new("Note: That path does not exist on disk yet — verify before applying.")
+                    .size(11.5)
+                    .color(theme.warning_amber),
+            );
+        }
+
+        ui.add_space(8.0);
+        if ui
+            .checkbox(
+                &mut self.auto_sync_exe_path,
+                "Auto-update Windows Registry on startup if the .exe moves",
+            )
+            .changed()
+        {
+            settings.auto_sync_exe_path = self.auto_sync_exe_path;
+            let _ = settings.save_to(settings_path);
+        }
+
+        ui.add_space(6.0);
+        ui.separator();
+        ui.add_space(6.0);
+        ui.label(RichText::new("Windows Right-Click Options:").strong().size(12.5));
+        ui.checkbox(
+            &mut self.enable_shell_new,
+            "Add \"Markdown Document (.md)\" to Right-Click -> New menu",
+        );
+        ui.checkbox(
+            &mut self.enable_open_with,
+            "Add \"Open with Markdown Studio\" to file Right-Click menu",
+        );
+
+        if let Some((is_err, ref msg)) = self.feedback {
+            ui.add_space(6.0);
+            let col = if is_err {
+                theme.warning_amber
+            } else {
+                theme.success_green
+            };
+            ui.label(RichText::new(msg).size(12.0).color(col));
+        }
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(6.0);
+
+        ui.horizontal(|ui| {
+            let apply_btn = egui::Button::new(
+                RichText::new("Apply / Update Menu")
+                    .strong()
+                    .color(Color32::WHITE),
+            )
+            .fill(theme.accent)
+            .stroke(Stroke::NONE);
+            if ui.add(apply_btn).clicked() {
+                let trimmed = self.exe_path_input.trim();
+                let target = PathBuf::from(trimmed);
+                if let Err(err) = validate_exe_path(&target) {
+                    self.feedback = Some((true, err.clone()));
+                    status_out = Some(err);
+                } else {
+                    settings.custom_exe_path = Some(target.clone());
+                    settings.auto_sync_exe_path = self.auto_sync_exe_path;
+                    let _ = settings.save_to(settings_path);
+                    match register_integration(
+                        &target,
+                        self.enable_shell_new,
+                        self.enable_open_with,
+                    ) {
+                        Ok(msg) => {
+                            self.status = query_integration_status();
+                            self.feedback = Some((false, msg.clone()));
+                            status_out = Some(msg);
+                        }
+                        Err(err) => {
+                            self.feedback = Some((true, err.clone()));
+                            status_out = Some(err);
+                        }
+                    }
+                }
+            }
+
+            if ui.button("Remove From Menu").clicked() {
+                match unregister_integration() {
+                    Ok(msg) => {
+                        self.status = query_integration_status();
+                        self.enable_shell_new = false;
+                        self.enable_open_with = false;
+                        self.feedback = Some((false, msg.clone()));
+                        status_out = Some(msg);
+                    }
+                    Err(err) => {
+                        self.feedback = Some((true, err.clone()));
+                        status_out = Some(err);
+                    }
+                }
+            }
+
+            if !embedded {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Close").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                        self.open = false;
+                    }
+                });
+            }
+        });
+
         status_out
     }
 }

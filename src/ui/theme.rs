@@ -68,7 +68,7 @@ impl WordTheme {
             border: Color32::from_rgb(213, 221, 232),
             border_subtle: Color32::from_rgb(229, 235, 243),
             text_primary: Color32::from_rgb(24, 32, 46),
-            text_muted: Color32::from_rgb(100, 116, 139),
+            text_muted: Color32::from_rgb(71, 85, 105),
             accent: Color32::from_rgb(37, 99, 235),
             accent_hover: Color32::from_rgb(29, 78, 216),
             accent_soft: Color32::from_rgb(224, 236, 255),
@@ -105,7 +105,7 @@ impl WordTheme {
             border: Color32::from_rgb(216, 204, 180),
             border_subtle: Color32::from_rgb(230, 220, 199),
             text_primary: Color32::from_rgb(51, 40, 30),
-            text_muted: Color32::from_rgb(120, 103, 84),
+            text_muted: Color32::from_rgb(96, 79, 61),
             accent: Color32::from_rgb(180, 83, 9),
             accent_hover: Color32::from_rgb(146, 64, 14),
             accent_soft: Color32::from_rgb(243, 225, 196),
@@ -227,4 +227,29 @@ impl WordTheme {
         style.spacing.scroll.bar_inner_margin = 3.0;
         ctx.set_style(style);
     }
+}
+
+/// Applies the user's configured UI/menu font size across standard `egui::TextStyle` entries.
+pub fn apply_ui_font_size(ctx: &egui::Context, ui_font_size: f32) {
+    let clamped = ui_font_size.clamp(11.0, 16.0);
+    ctx.style_mut(|style| {
+        style
+            .text_styles
+            .insert(egui::TextStyle::Body, egui::FontId::proportional(clamped));
+        style
+            .text_styles
+            .insert(egui::TextStyle::Button, egui::FontId::proportional(clamped));
+        style.text_styles.insert(
+            egui::TextStyle::Small,
+            egui::FontId::proportional((clamped - 2.0).max(9.5)),
+        );
+        style.text_styles.insert(
+            egui::TextStyle::Monospace,
+            egui::FontId::monospace(clamped),
+        );
+        style.text_styles.insert(
+            egui::TextStyle::Heading,
+            egui::FontId::proportional((clamped + 5.5).max(16.0)),
+        );
+    });
 }
