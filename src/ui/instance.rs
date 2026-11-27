@@ -290,7 +290,12 @@ pub fn read_and_remove_handoff_file(path: &Path) -> io::Result<DetachedTabHandof
             "Handoff target must be a regular non-symlink file",
         ));
     }
-    let allowed_dir = default_handoff_dir().canonicalize()?;
+    let Ok(allowed_dir) = default_handoff_dir().canonicalize() else {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Handoff file lies outside private handoffs directory",
+        ));
+    };
     let canon_path = path.canonicalize()?;
     if !canon_path.starts_with(&allowed_dir) {
         return Err(io::Error::new(

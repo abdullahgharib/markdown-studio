@@ -116,7 +116,12 @@ pub fn validate_exe_path(exe_path: &Path) -> Result<(), String> {
     if is_non_verbatim_unc || is_verbatim_unc || raw.starts_with("//") {
         return Err("Network/UNC executable paths are not permitted.".to_string());
     }
-    if !exe_path.is_absolute() {
+    let bytes = raw.as_bytes();
+    let has_windows_drive = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/');
+    if !exe_path.is_absolute() && !has_windows_drive {
         return Err("Executable path must be absolute.".to_string());
     }
     let is_exe = exe_path

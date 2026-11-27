@@ -1,6 +1,6 @@
 # Architecture & Internals
 
-**Markdown Studio** (`markdown_studio` v`0.8.0`) is a native desktop Markdown reader and studio editor written in Rust with `eframe`/`egui`, `ropey`, `comrak`, `memchr`, and `regex`.
+**Markdown Studio** (`markdown_studio` v`0.8.1`) is a native desktop Markdown reader and studio editor written in Rust with `eframe`/`egui`, `ropey`, `comrak`, `memchr`, and `regex`.
 
 ---
 
@@ -55,7 +55,7 @@
 
 | Path | Role & Key Symbols |
 | :--- | :--- |
-| [Cargo.toml](Cargo.toml) | Crate manifest (`markdown_studio` v`0.7.15`), runtime (`eframe`, `egui`, `rfd`, `ropey`, trimmed `comrak` with `default-features = false`, `memchr`, `regex`, `rustc-hash`, `printpdf`, `lopdf`, `docx-rs`, `image` with `webp`, `resvg`, `ureq`), dev (`zip`, `quick-xml`, `criterion`, `tempfile`), release profile tuning (`lto = "thin"`, `codegen-units = 1`, `strip = "symbols"`), and benchmark config. |
+| [Cargo.toml](Cargo.toml) | Crate manifest (`markdown_studio` v`0.8.1`), runtime (`eframe`, `egui`, `rfd`, `ropey`, trimmed `comrak` with `default-features = false`, `memchr`, `regex`, `rustc-hash`, `printpdf`, `lopdf`, `docx-rs`, `image` with `webp`, `resvg`, `ureq`), dev (`zip`, `quick-xml`, `criterion`, `tempfile`), release profile tuning (`lto = "thin"`, `codegen-units = 1`, `strip = "symbols"`), and benchmark config. |
 | [build.rs](build.rs) | Windows build script generating multi-resolution RGBA `.ico` (`16,32,48,64,128,256`) via `src/icon.rs` in `OUT_DIR` and compiling `ICON` + `VERSIONINFO` (`FileVersion`/`ProductVersion`) via `rc.exe`. |
 | [src/icon.rs](src/icon.rs) | Pure-`std` 4×4 supersampled universal Markdown `M↓` badge RGBA icon rasterizer (`render_app_icon_rgba`) shared by `build.rs` and `src/main.rs`. |
 | [src/lib.rs](src/lib.rs) | Library crate root exporting `APP_VERSION` (`env!("CARGO_PKG_VERSION")`), `document`, `export`, `icon`, and `ui`. |

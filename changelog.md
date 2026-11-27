@@ -5,6 +5,13 @@ For architecture, features, shortcuts, and build instructions, see [README.md](R
 
 ---
 
+### `v0.8.1` (2026-11-27) — Cross-Platform Linux & macOS CI Test & Clippy Fixes
+- **Cross-Platform Path & Handoff Validation (`src/ui/os_integration.rs`, `src/ui/instance.rs`)**:
+  - Updated `validate_exe_path` to recognize Windows drive-letter absolute paths (`[A-Za-z]:\` / `/`) across Linux and macOS test runners where `std::path::Path::is_absolute` only checks POSIX leading `/`.
+  - Updated `read_and_remove_handoff_file` to return `ErrorKind::PermissionDenied` rather than `NotFound` when `default_handoff_dir()` does not yet exist on disk.
+- **Linux & macOS Rust 2024 Clippy Cleanups (`src/document/mod.rs`, `src/export/print.rs`)**:
+  - Collapsed nested `if let` chains under `#[cfg(target_os = "linux")]` (`system_total_memory_bytes`) and `#[cfg(all(unix, not(target_os = "macos")))]` (`lp`/`lpr` print dispatch), and switched `if let Some(ref p)` to `opts.printer_name.as_deref()` in Unix/macOS `print.rs` branches.
+
 ### `v0.8.0` (2026-11-27) — Security Hardening, Hardware-Adaptive Scaling & Performance Architecture
 - **Security & DoS Hardening (`src/document/`, `src/export/`, `src/ui/`, `Cargo.toml`)**:
   - **SSRF, Image & Container Bounds (`src/ui/reader/images.rs`, `Cargo.toml`)**: Added `SafePublicResolver` DNS validation blocking loopback, private, link-local/cloud-metadata, CGNAT, and IPv4-mapped IPv6 addresses across manual redirects (up to 5 hops); added bounded `.svgz` decompression via `flate2`, per-frame/total decoded byte bounds for GIF/raster images, canonical non-UNC confinement for local assets, and VRAM-budgeted `ImageTextureCache` LRU eviction.

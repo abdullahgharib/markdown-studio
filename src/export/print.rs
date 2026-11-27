@@ -689,7 +689,7 @@ Write-Output ("Printed " + $selectedPages.Count + " page(s) to " + $pd.PrinterSe
     #[cfg(target_os = "macos")]
     {
         let mut cmd = Command::new("lp");
-        if let Some(ref p) = opts.printer_name {
+        if let Some(p) = opts.printer_name.as_deref() {
             let pt = p.trim();
             if !pt.is_empty() {
                 if pt.starts_with('-') {
@@ -732,7 +732,7 @@ Write-Output ("Printed " + $selectedPages.Count + " page(s) to " + $pd.PrinterSe
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         let mut cmd = Command::new("lp");
-        if let Some(ref p) = opts.printer_name {
+        if let Some(p) = opts.printer_name.as_deref() {
             let pt = p.trim();
             if !pt.is_empty() {
                 if pt.starts_with('-') {
@@ -759,15 +759,15 @@ Write-Output ("Printed " + $selectedPages.Count + " page(s) to " + $pd.PrinterSe
             cmd.args(["-o", "ColorModel=Gray"]);
         }
         cmd.args(["-o", if opts.collate { "Collate=True" } else { "Collate=False" }]);
-        if let Ok(s) = cmd.arg("--").arg(pdf_path).status() {
-            if s.success() {
-                return Ok(format!("Sent print job to `lp` ({})", pdf_path.display()));
-            }
+        if let Ok(s) = cmd.arg("--").arg(pdf_path).status()
+            && s.success()
+        {
+            return Ok(format!("Sent print job to `lp` ({})", pdf_path.display()));
         }
-        if let Ok(s) = Command::new("lpr").arg("--").arg(pdf_path).status() {
-            if s.success() {
-                return Ok(format!("Sent print job to `lpr` ({})", pdf_path.display()));
-            }
+        if let Ok(s) = Command::new("lpr").arg("--").arg(pdf_path).status()
+            && s.success()
+        {
+            return Ok(format!("Sent print job to `lpr` ({})", pdf_path.display()));
         }
         Err("No available print spooler (`lp`/`lpr`) succeeded".to_string())
     }

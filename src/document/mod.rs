@@ -73,14 +73,13 @@ pub fn system_total_memory_bytes() -> u64 {
         {
             if let Ok(info) = std::fs::read_to_string("/proc/meminfo") {
                 for line in info.lines() {
-                    if let Some(rest) = line.strip_prefix("MemTotal:") {
-                        if let Some(kb) = rest
+                    if let Some(rest) = line.strip_prefix("MemTotal:")
+                        && let Some(kb) = rest
                             .split_whitespace()
                             .next()
                             .and_then(|n| n.parse::<u64>().ok())
-                        {
-                            return kb.saturating_mul(1024);
-                        }
+                    {
+                        return kb.saturating_mul(1024);
                     }
                 }
             }
