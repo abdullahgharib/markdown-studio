@@ -1,6 +1,6 @@
 [package]
 name = "markdown_studio"
-version = "0.8.5"
+version = "0.8.6"
 edition = "2024"
 description = "Ultra-fast native desktop Markdown reader and studio editor in Rust"
 license = "AGPL-3.0-or-later"
@@ -29,7 +29,7 @@ image = { version = "0.25.10", default-features = false, features = ["png", "jpe
 resvg = "0.50"
 flate2 = "1"
 ureq = "3.5"
-lopdf = { version = "0.35", default-features = false, features = ["nom_parser"] }
+lopdf = { version = "0.47", default-features = false }
 memchr = "2.8"
 regex = "1.13"
 rustc-hash = "2.1"
@@ -41,7 +41,7 @@ codegen-units = 1
 strip = "symbols"
 
 [dev-dependencies]
-zip = "2.2"
+zip = { version = "9", default-features = false, features = ["deflate"] }
 quick-xml = "0.37"
 criterion = "0.5"
 tempfile = "3"

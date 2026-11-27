@@ -5,6 +5,13 @@ For architecture, features, shortcuts, and build instructions, see [README.md](R
 
 ---
 
+### `v0.8.6` (2026-11-28) — CI Token Permissions Hardening & `lopdf`/`zip` Dependency Security Upgrades
+- **CI Workflow Least-Privilege Permissions (`.github/workflows/ci.yml`)**:
+  - Added explicit top-level `permissions: contents: read` to the GitHub Actions CI workflow (resolving CodeQL `actions/missing-workflow-permissions` alert #1).
+- **Security Dependency Upgrades (`Cargo.toml`, `tests/export_tests.rs`, `tests/security_and_scalability_tests.rs`)**:
+  - Upgraded direct runtime PDF post-processor `lopdf` from `0.35` to `0.47` (`>= 0.42.0`, resolving `GHSA-6fj4-rcr3-r7rr` nested-object recursion stack overflow) with simplified `default-features = false`.
+  - Upgraded dev/test archive reader `zip` from `2.2` to `9` (`9.8.2`, `>= 9.0.5`, resolving `CVE-2026-115905`–`115909` and trimming unused compression/crypto dev features to `["deflate"]`), and updated PDF/ZIP assertions in `tests/export_tests.rs` and `tests/security_and_scalability_tests.rs`.
+
 ### `v0.8.5` (2026-11-27) — Full Configurable Security Toggles & Unlimited OS System Font Support
 - **Full Granular Security Settings (`src/ui/settings.rs`, `src/ui/mod.rs`, `src/ui/settings_modal.rs`)**:
   - Made every previously hard-blocked link/URI category individually toggleable in **Settings -> Security** while keeping all high-risk categories **disabled (`false`) by default** with live safety warnings and `Restore Safe Defaults`:

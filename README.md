@@ -7,7 +7,7 @@
 [![Platforms](https://img.shields.io/badge/Platforms-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#installation)
 [![CI](https://github.com/abdullahgharib/markdown-studio/actions/workflows/ci.yml/badge.svg)](https://github.com/abdullahgharib/markdown-studio/actions/workflows/ci.yml)
 
-**Current Version:** `0.8.5` (`markdown_studio`)
+**Current Version:** `0.8.6` (`markdown_studio`)
 
 ---
 

@@ -108,7 +108,7 @@ fn docx_and_pdf_exports_block_path_escape_and_unsafe_links() {
     let mut rels_text = String::new();
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i).unwrap();
-        if entry.name().ends_with(".rels") {
+        if entry.name().is_ok_and(|n| n.ends_with(".rels")) {
             let mut s = String::new();
             std::io::Read::read_to_string(&mut entry, &mut s).unwrap();
             rels_text.push_str(&s);

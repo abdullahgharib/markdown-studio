@@ -102,9 +102,7 @@ fn pdf_export_produces_valid_multipage_lopdf_document() {
     let catalog = doc.catalog().expect("PDF must have /Catalog");
     assert!(catalog.get(b"Pages").is_ok());
     for (&page_num, &page_id) in &pages {
-        let content = doc
-            .get_page_content(page_id)
-            .expect("each page must have valid content stream");
+        let content = doc.get_page_content(page_id);
         assert!(
             !content.is_empty(),
             "page {page_num} content stream must not be empty"
@@ -343,7 +341,11 @@ Paragraph breaking list.\n\n\
     );
 
     let has_media = (0..zip.len())
-        .filter_map(|i| zip.by_index(i).ok().map(|f| f.name().to_string()))
+        .filter_map(|i| {
+            zip.by_index(i)
+                .ok()
+                .and_then(|f| f.name().ok().map(|n| n.into_owned()))
+        })
         .any(|name| name.starts_with("word/media/"));
     assert!(has_media, "expected image stored under word/media/");
 }
@@ -622,7 +624,11 @@ pie showData
         "expected >= 11 embedded drawings (2 inline 2D math + 3 display math + 6 Mermaid), got {drawing_count}"
     );
     let media_count = (0..zip.len())
-        .filter_map(|i| zip.by_index(i).ok().map(|f| f.name().to_string()))
+        .filter_map(|i| {
+            zip.by_index(i)
+                .ok()
+                .and_then(|f| f.name().ok().map(|n| n.into_owned()))
+        })
         .filter(|name| name.starts_with("word/media/"))
         .count();
     assert!(
@@ -1025,7 +1031,7 @@ fn pdf_export_renders_custom_multi_page_headers_and_footers() {
             .expect("baseline PDF must compile");
     let baseline_doc = lopdf::Document::load_mem(&baseline_bytes).unwrap();
     let baseline_pages = baseline_doc.get_pages();
-    let base_p1_len = baseline_doc.get_page_content(baseline_pages[&1]).unwrap().len();
+    let base_p1_len = baseline_doc.get_page_content(baseline_pages[&1]).len();
 
     let layout = PdfLayoutOptions {
         header_footer: PdfHeaderFooterOptions {
@@ -1052,8 +1058,8 @@ fn pdf_export_renders_custom_multi_page_headers_and_footers() {
     );
     let total_pages = pages.len();
 
-    let p1_content = doc.get_page_content(pages[&1]).unwrap();
-    let last_content = doc.get_page_content(pages[&(total_pages as u32)]).unwrap();
+    let p1_content = doc.get_page_content(pages[&1]);
+    let last_content = doc.get_page_content(pages[&(total_pages as u32)]);
     let p1_str = String::from_utf8_lossy(&p1_content);
     let last_str = String::from_utf8_lossy(&last_content);
     assert!(
