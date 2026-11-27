@@ -63,18 +63,25 @@ pub fn extract_cf_html_fragment(raw: &str) -> String {
 /// Checks whether a candidate OS `CF_HTML` snippet actually corresponds to the pasted `plain_text`,
 /// guarding against stale multi-format clipboards or synthetic `Event::Paste` payloads.
 pub fn html_matches_plain_text(plain_text: &str, html: &str) -> bool {
-    let Some(token) = first_meaningful_token(plain_text) else {
+    let tokens = collect_meaningful_tokens(plain_text);
+    if tokens.is_empty() {
         return true;
+    }
+    let visible_lower = extract_plain_preview_from_html(html).to_lowercase();
+    let sample_indices: &[usize] = match tokens.len() {
+        1 => &[0],
+        2 => &[0, 1],
+        n => &[0, n / 2, n - 1],
     };
-    let visible = extract_plain_preview_from_html(html);
-    let token_lower = token.to_ascii_lowercase();
-    visible.to_ascii_lowercase().contains(&token_lower)
+    sample_indices
+        .iter()
+        .all(|&idx| visible_lower.contains(&tokens[idx].to_lowercase()))
 }
 
-fn first_meaningful_token(text: &str) -> Option<&str> {
-    let bytes = text.as_bytes();
-    let mut start: Option<usize> = None;
+fn collect_meaningful_tokens(text: &str) -> Vec<&str> {
+    let mut tokens = Vec::new();
     let mut fallback: Option<&str> = None;
+    let mut start: Option<usize> = None;
     for (idx, ch) in text.char_indices() {
         if ch.is_alphanumeric() {
             if start.is_none() {
@@ -83,25 +90,41 @@ fn first_meaningful_token(text: &str) -> Option<&str> {
             let s = start.unwrap();
             let next = idx + ch.len_utf8();
             if next - s >= 16 {
-                return Some(&text[s..next]);
+                tokens.push(&text[s..next]);
+                start = None;
+                if tokens.len() >= 16 || idx >= 1024 {
+                    break;
+                }
             }
         } else if let Some(s) = start.take() {
-            let tok = &bytes[s..idx];
+            let tok = &text[s..idx];
             if tok.len() >= 2 {
-                return Some(&text[s..idx]);
+                tokens.push(tok);
+                if tokens.len() >= 16 || idx >= 1024 {
+                    break;
+                }
+            } else if fallback.is_none() {
+                fallback = Some(tok);
             }
-            if fallback.is_none() {
-                fallback = Some(&text[s..idx]);
-            }
+        }
+        if idx >= 1024 && start.is_none() && !tokens.is_empty() {
+            break;
         }
     }
     if let Some(s) = start {
         let tok = &text[s..];
-        if tok.len() >= 2 || fallback.is_none() {
-            return Some(tok);
+        if tok.len() >= 2 {
+            tokens.push(tok);
+        } else if fallback.is_none() {
+            fallback = Some(tok);
         }
     }
-    fallback
+    if tokens.is_empty()
+        && let Some(fb) = fallback
+    {
+        tokens.push(fb);
+    }
+    tokens
 }
 
 fn extract_plain_preview_from_html(html: &str) -> String {

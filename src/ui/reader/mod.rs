@@ -35,11 +35,14 @@ use crate::document::unicode::{
 };
 use crate::document::viewport::ViewportBlockIndex;
 use crate::document::DocumentBuffer;
-use crate::export::ir::{DocBlock, InlineRun, TableAlign};
+use crate::export::ir::{runs_to_plain_text, DocBlock, InlineRun, TableAlign};
+use crate::ui::context_menu::{
+    table_runs_to_tsv, ContextMenuTarget, ReaderCodeContext, ReaderImageContext, ReaderTableContext,
+};
 use crate::ui::settings::{LineSpacing, PageWidth};
 use crate::ui::theme::{ThemeMode, WordTheme};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ReaderAction {
     None,
     EditTable(Range<usize>),
@@ -48,6 +51,10 @@ pub enum ReaderAction {
     JumpToAnchor(String),
     JumpToFootnote(String),
     OpenLink(String),
+    OpenContextMenu {
+        pos: egui::Pos2,
+        target: ContextMenuTarget,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,6 +137,13 @@ pub struct ImageLightboxState {
     pub zoom: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ReaderTextPos {
+    pub doc_line: usize,
+    pub chunk_idx: usize,
+    pub char_idx: usize,
+}
+
 #[derive(Debug)]
 pub struct VirtualReaderState {
     pub active_block_lines: Option<Range<usize>>,
@@ -165,6 +179,12 @@ pub struct VirtualReaderState {
     pub auto_calc_tables: bool,
     pub image_label_editor: Option<ImageLabelEditorState>,
     pub image_lightbox: Option<ImageLightboxState>,
+    pub reader_selected_text: Option<String>,
+    pub reader_sel_anchor: Option<ReaderTextPos>,
+    pub reader_sel_focus: Option<ReaderTextPos>,
+    pub reader_sel_dragging: bool,
+    pub reader_sel_all: bool,
+    pub reader_sel_anchor_y: f32,
     galley_cache: ReaderGalleyCache,
     table_eval_epoch: (u64, u64),
     table_eval_cache: TableEvalCache,
@@ -208,6 +228,12 @@ impl Default for VirtualReaderState {
             auto_calc_tables: true,
             image_label_editor: None,
             image_lightbox: None,
+            reader_selected_text: None,
+            reader_sel_anchor: None,
+            reader_sel_focus: None,
+            reader_sel_dragging: false,
+            reader_sel_all: false,
+            reader_sel_anchor_y: 0.0,
             galley_cache: ReaderGalleyCache::default(),
             table_eval_epoch: (0, 0),
             table_eval_cache: TableEvalCache::default(),
@@ -223,6 +249,16 @@ impl VirtualReaderState {
             base_dir,
             ..Self::default()
         }
+    }
+
+    /// Clears any active Reader-mode text selection.
+    pub fn clear_reader_selection(&mut self) {
+        self.reader_selected_text = None;
+        self.reader_sel_anchor = None;
+        self.reader_sel_focus = None;
+        self.reader_sel_dragging = false;
+        self.reader_sel_all = false;
+        self.reader_sel_anchor_y = 0.0;
     }
 
     /// Requests fluid eased scrolling toward vertical offset `y` inside the active reader pane.
@@ -268,6 +304,9 @@ impl VirtualReaderState {
             ppp.to_bits(),
             self.compute_search_sig(),
         );
+        if self.galley_cache.epoch.0 != doc_id {
+            self.clear_reader_selection();
+        }
         if atlas_changed || self.galley_cache.epoch != epoch {
             self.galley_cache.entries.clear();
             self.galley_cache.epoch = epoch;
@@ -1053,6 +1092,104 @@ fn sync_active_block_from_buf(
     state.last_synced_show_markup = show_markup;
 }
 
+struct ReaderFrameTracker {
+    sel_anchor: Option<ReaderTextPos>,
+    sel_focus: Option<ReaderTextPos>,
+    sel_dragging: bool,
+    sel_all: bool,
+    sel_anchor_y: f32,
+    sel_cleared_by_click: bool,
+    primary_link_clicked: bool,
+    cur_doc_line: usize,
+    next_chunk_for_line: usize,
+    selected_pieces: Vec<(usize, String)>,
+    secondary_pos: Option<egui::Pos2>,
+    right_click_inside_sel: bool,
+    hit_link_url: Option<String>,
+    hit_image: Option<ReaderImageContext>,
+    hit_code: Option<ReaderCodeContext>,
+    hit_table: Option<ReaderTableContext>,
+}
+
+impl ReaderFrameTracker {
+    fn from_state(state: &VirtualReaderState, secondary_pos: Option<egui::Pos2>) -> Self {
+        Self {
+            sel_anchor: state.reader_sel_anchor,
+            sel_focus: state.reader_sel_focus,
+            sel_dragging: state.reader_sel_dragging,
+            sel_all: state.reader_sel_all,
+            sel_anchor_y: state.reader_sel_anchor_y,
+            sel_cleared_by_click: false,
+            primary_link_clicked: false,
+            cur_doc_line: usize::MAX,
+            next_chunk_for_line: 0,
+            selected_pieces: Vec::new(),
+            secondary_pos,
+            right_click_inside_sel: false,
+            hit_link_url: None,
+            hit_image: None,
+            hit_code: None,
+            hit_table: None,
+        }
+    }
+
+    fn next_chunk_id(&mut self, doc_line: usize) -> usize {
+        if self.cur_doc_line != doc_line {
+            self.cur_doc_line = doc_line;
+            self.next_chunk_for_line = 1;
+            0
+        } else {
+            let id = self.next_chunk_for_line;
+            self.next_chunk_for_line += 1;
+            id
+        }
+    }
+
+    fn ordered_sel(&self) -> Option<(ReaderTextPos, ReaderTextPos)> {
+        let a = self.sel_anchor?;
+        let b = self.sel_focus?;
+        if a <= b {
+            Some((a, b))
+        } else {
+            Some((b, a))
+        }
+    }
+}
+
+fn join_selected_pieces(pieces: &[(usize, String)]) -> String {
+    let mut out = String::new();
+    let mut prev_line: Option<usize> = None;
+    for (line, text) in pieces {
+        if text.is_empty() {
+            continue;
+        }
+        if let Some(pl) = prev_line
+            && *line != pl
+        {
+            out.push('\n');
+        }
+        out.push_str(text);
+        prev_line = Some(*line);
+    }
+    out
+}
+
+fn table_source_markdown(buf: &DocumentBuffer, source_lines: &Range<usize>) -> String {
+    let end = source_lines.end.min(buf.len_lines());
+    if source_lines.start >= end {
+        return String::new();
+    }
+    let le = buf.line_ending();
+    let mut out = String::new();
+    for l in source_lines.start..end {
+        if l > source_lines.start {
+            out.push_str(le);
+        }
+        out.push_str(&buf.line_text(l));
+    }
+    out
+}
+
 /// Renders the virtualized rich Markdown Reader / WYSIWYG document page in O(log B) + O(visible).
 #[allow(clippy::too_many_arguments)]
 pub fn render_virtual_reader(
@@ -1073,6 +1210,20 @@ pub fn render_virtual_reader(
     if !read_only {
         state.image_lightbox = None;
     }
+    if state.reader_sel_dragging && !ui.input(|i| i.pointer.primary_down()) {
+        state.reader_sel_dragging = false;
+    }
+
+    let secondary_pos = if !state.autoscroll_active
+        && !state.modal_open
+        && state.image_lightbox.is_none()
+        && !ui.ctx().memory(|m| m.any_popup_open())
+        && ui.input(|i| i.pointer.secondary_clicked())
+    {
+        ui.input(|i| i.pointer.interact_pos().or(i.pointer.latest_pos()))
+    } else {
+        None
+    };
 
     let initial_active_lines = state.active_block_lines.clone();
 
@@ -1181,6 +1332,7 @@ pub fn render_virtual_reader(
     let mut scroll_inner_rect = egui::Rect::NOTHING;
     let mut scroll_offset_y = state.last_scroll_offset_y;
     let mut scroll_max_y = state.last_max_scroll_y;
+    let mut tracker = ReaderFrameTracker::from_state(state, secondary_pos);
 
     egui::Frame::new()
         .fill(theme.desk_bg)
@@ -1257,7 +1409,7 @@ pub fn render_virtual_reader(
                                         let kind = state
                                             .active_block_kind
                                             .unwrap_or(ActiveBlockKind::Paragraph);
-                                        render_inline_wysiwyg_block(
+                                        let a = render_inline_wysiwyg_block(
                                             ui,
                                             buf,
                                             &active_lines,
@@ -1268,6 +1420,9 @@ pub fn render_virtual_reader(
                                             workspace_top,
                                             state,
                                         );
+                                        if a != ReaderAction::None {
+                                            action = a;
+                                        }
                                     } else {
                                         ui.add_space(40.0);
                                         ui.label(
@@ -1374,6 +1529,7 @@ pub fn render_virtual_reader(
                                             read_only,
                                             workspace_top,
                                             state,
+                                            &mut tracker,
                                             0,
                                             &mut rendered_active,
                                         );
@@ -1653,6 +1809,90 @@ pub fn render_virtual_reader(
     state.last_pane_rect = scroll_inner_rect;
     state.last_scroll_offset_y = scroll_offset_y;
     state.last_max_scroll_y = scroll_max_y;
+
+    if !wysiwyg || read_only {
+        if tracker.sel_cleared_by_click {
+            state.clear_reader_selection();
+        } else if tracker.sel_all {
+            state.reader_sel_all = true;
+        } else {
+            state.reader_sel_anchor = tracker.sel_anchor;
+            state.reader_sel_focus = tracker.sel_focus;
+            state.reader_sel_dragging = tracker.sel_dragging;
+            state.reader_sel_anchor_y = tracker.sel_anchor_y;
+            if tracker.sel_anchor.is_some() && tracker.sel_focus.is_some() {
+                if tracker.sel_anchor != tracker.sel_focus {
+                    let joined = join_selected_pieces(&tracker.selected_pieces);
+                    state.reader_selected_text = (!joined.is_empty()).then_some(joined);
+                } else {
+                    state.reader_selected_text = None;
+                }
+            }
+        }
+
+        if !state.modal_open
+            && !ui.ctx().wants_keyboard_input()
+            && ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy)))
+            && let Some(ref txt) = state.reader_selected_text
+            && !txt.is_empty()
+        {
+            ui.ctx().copy_text(txt.clone());
+        }
+    }
+
+    if action == ReaderAction::None
+        && let Some(sec_pos) = tracker.secondary_pos
+        && scroll_inner_rect.contains(sec_pos)
+    {
+        if read_only || !wysiwyg {
+            if state.reader_sel_anchor.is_some()
+                && !tracker.right_click_inside_sel
+                && !state.reader_sel_all
+            {
+                state.clear_reader_selection();
+            }
+            action = ReaderAction::OpenContextMenu {
+                pos: sec_pos,
+                target: ContextMenuTarget::Reader {
+                    selected_text: state.reader_selected_text.clone(),
+                    link_url: tracker.hit_link_url,
+                    image: tracker.hit_image.map(Box::new),
+                    code_block: tracker.hit_code.map(Box::new),
+                    table: tracker.hit_table.map(Box::new),
+                    read_only,
+                },
+            };
+        } else if tracker.hit_table.is_some()
+            || tracker.hit_code.is_some()
+            || tracker.hit_image.is_some()
+        {
+            let sel = buf.selection_range().map(|_| buf.selected_text());
+            action = ReaderAction::OpenContextMenu {
+                pos: sec_pos,
+                target: ContextMenuTarget::Reader {
+                    selected_text: sel,
+                    link_url: tracker.hit_link_url,
+                    image: tracker.hit_image.map(Box::new),
+                    code_block: tracker.hit_code.map(Box::new),
+                    table: tracker.hit_table.map(Box::new),
+                    read_only: false,
+                },
+            };
+        } else {
+            let cursor_line = buf.char_to_line(buf.cursor_char);
+            let sel = buf.selection_range().map(|_| buf.selected_text());
+            action = ReaderAction::OpenContextMenu {
+                pos: sec_pos,
+                target: ContextMenuTarget::Editor {
+                    from_wysiwyg: true,
+                    has_selection: sel.is_some(),
+                    selected_text: sel,
+                    link_url: tracker.hit_link_url,
+                    cursor_line,
+                },
+            };
+        }
+    }
 
     if read_only && state.image_lightbox.is_some()
         && let Some(lb_action) = render_image_lightbox(ui.ctx(), theme, state) {
@@ -3757,7 +3997,75 @@ fn render_inline_wysiwyg_block(
                     || (in_text_rect
                         && ui.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary)));
 
-                if is_triple {
+                let secondary_click = !state.modal_open
+                    && !ui.ctx().memory(|m| m.any_popup_open())
+                    && (output.response.secondary_clicked()
+                        || (in_text_rect
+                            && ui.input(|i| {
+                                i.pointer.button_clicked(egui::PointerButton::Secondary)
+                            })));
+
+                if secondary_click {
+                    let click_log_idx = if let Some(pos) = pointer_pos_opt {
+                        let rel = pos - output.galley_pos;
+                        let vis_idx = output
+                            .galley
+                            .cursor_from_pos(rel)
+                            .ccursor
+                            .index
+                            .min(text_chars);
+                        bidi.logical_col_for_visual(&state.active_block_text, vis_idx)
+                    } else {
+                        prev_logical_cr
+                            .map(|cr| cr.primary.index.min(text_chars))
+                            .unwrap_or(text_chars)
+                    };
+                    let preserve_selection = prev_logical_cr.is_some_and(|cr| {
+                        let lo = cr.primary.index.min(cr.secondary.index).min(text_chars);
+                        let hi = cr.primary.index.max(cr.secondary.index).min(text_chars);
+                        lo < hi && click_log_idx >= lo && click_log_idx <= hi
+                    });
+                    if preserve_selection {
+                        output.state.cursor.set_char_range(prev_logical_cr);
+                        output.state.clone().store(ui.ctx(), inline_id);
+                        state.last_cursor_range = prev_logical_cr;
+                    } else {
+                        let cr = egui::text::CCursorRange::one(egui::text::CCursor::new(
+                            click_log_idx,
+                        ));
+                        output.state.cursor.set_char_range(Some(cr));
+                        output.state.clone().store(ui.ctx(), inline_id);
+                        state.last_cursor_range = Some(cr);
+                        let block_start = buf.line_to_char(src_lines.start);
+                        let prefix_chars = state.active_block_prefix.chars().count();
+                        let click_doc =
+                            local_to_doc_chars(click_log_idx, &state.active_block_text, is_crlf);
+                        buf.set_cursor(
+                            (block_start + prefix_chars + click_doc).min(buf.len_chars()),
+                            false,
+                        );
+                    }
+                    output.response.request_focus();
+                    did_click_select = true;
+                    let link_url = if !is_code && in_text_rect {
+                        extract_markdown_link_at_char(&state.active_block_text, click_log_idx)
+                            .filter(|u| classify_link_url(u).is_some())
+                    } else {
+                        None
+                    };
+                    let cursor_line = buf.char_to_line(buf.cursor_char);
+                    let sel = buf.selection_range().map(|_| buf.selected_text());
+                    action = ReaderAction::OpenContextMenu {
+                        pos: pointer_pos_opt.unwrap_or_else(|| output.response.rect.center()),
+                        target: ContextMenuTarget::Editor {
+                            from_wysiwyg: true,
+                            has_selection: sel.is_some(),
+                            selected_text: sel,
+                            link_url,
+                            cursor_line,
+                        },
+                    };
+                } else if is_triple {
                     let cr = egui::text::CCursorRange::two(
                         egui::text::CCursor::new(0),
                         egui::text::CCursor::new(text_chars),
@@ -3845,8 +4153,10 @@ fn render_inline_wysiwyg_block(
 
                 let text_mutated = state.active_block_text != prev_block_text;
                 if !did_click_select && !text_mutated && !bidi.is_identity {
-                    let pointer_pressed = ui.input(|i| i.pointer.any_pressed());
-                    let is_drag = output.response.dragged() || output.response.drag_started();
+                    let pointer_pressed =
+                        ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
+                    let is_drag = output.response.dragged_by(egui::PointerButton::Primary)
+                        || output.response.drag_started_by(egui::PointerButton::Primary);
                     if ((output.response.hovered() && pointer_pressed) || is_drag)
                         && let Some(pos) = pointer_pos_opt {
                             let rel = pos - output.galley_pos;
@@ -4524,7 +4834,8 @@ fn render_inline_wysiwyg_block(
             && !was_any_popup_open
             && !popup_open
             && ui.input(|i| i.key_pressed(egui::Key::Escape)))
-        || (res.text_resp.lost_focus()
+        || (!state.modal_open
+            && res.text_resp.lost_focus()
             && !res.had_focus_request
             && !was_any_popup_open
             && !popup_open
@@ -4553,6 +4864,7 @@ fn handle_inactive_wysiwyg_click(
     show_markup: bool,
     hitboxes: &[RenderedGalleyHitbox],
     state: &mut VirtualReaderState,
+    has_hit_image: bool,
 ) -> ReaderAction {
     let mut action = ReaderAction::None;
     let click = ui.interact(
@@ -4586,7 +4898,56 @@ fn handle_inactive_wysiwyg_click(
         .interact_pointer_pos()
         .or(pointer_pos)
         .and_then(|pos| hit_test_block_links(hitboxes, pos));
-    if click.clicked() && cmd_down {
+    if click.secondary_clicked() && !has_hit_image {
+        let pos = click.interact_pointer_pos().or(pointer_pos);
+        let block_start = buf.line_to_char(source_lines.start);
+        let block_end = if !source_lines.is_empty() && source_lines.end <= buf.len_lines() {
+            let last_line = source_lines.end - 1;
+            buf.line_to_char(last_line) + buf.line_len_without_newline(last_line)
+        } else {
+            block_start
+        };
+        let preserve_selection = buf
+            .selection_range()
+            .is_some_and(|sel| sel.start < sel.end && sel.start <= block_end && sel.end >= block_start);
+        if preserve_selection {
+            state.active_block_lines = Some(source_lines.clone());
+            state.active_block_kind = Some(kind);
+            sync_active_block_from_buf(buf, show_markup, state);
+            state.focus_inline_editor = true;
+            state.sync_cursor_from_buf = true;
+        } else {
+            activate_wysiwyg_block(
+                Some(ui),
+                buf,
+                source_lines,
+                kind,
+                content_w,
+                theme,
+                show_markup,
+                Some(rect),
+                pos,
+                1,
+                state,
+            );
+        }
+        let link_url = click_link.and_then(|t| match t {
+            NavTarget::Link(raw, _) => Some(raw.clone()),
+            NavTarget::Footnote(_) => None,
+        });
+        let cursor_line = buf.char_to_line(buf.cursor_char);
+        let sel = buf.selection_range().map(|_| buf.selected_text());
+        action = ReaderAction::OpenContextMenu {
+            pos: pos.unwrap_or_else(|| rect.center()),
+            target: ContextMenuTarget::Editor {
+                from_wysiwyg: true,
+                has_selection: sel.is_some(),
+                selected_text: sel,
+                link_url,
+                cursor_line,
+            },
+        };
+    } else if click.clicked() && cmd_down {
         if let Some(target) = click_link {
             action = nav_target_action(target);
         }
@@ -4631,6 +4992,7 @@ fn render_doc_block(
     read_only: bool,
     workspace_top: f32,
     state: &mut VirtualReaderState,
+    tracker: &mut ReaderFrameTracker,
     list_depth: usize,
     rendered_active: &mut bool,
 ) -> ReaderAction {
@@ -4711,6 +5073,7 @@ fn render_doc_block(
                             galley_cache,
                             image_label_editor,
                             image_lightbox,
+                            tracker,
                         );
                     });
                 let handled_nav = runs_res.outcome != RunsClickOutcome::None || runs_res.handled_ui;
@@ -4737,6 +5100,7 @@ fn render_doc_block(
                             show_markup,
                             &runs_res.hitboxes,
                             state,
+                            tracker.hit_image.is_some(),
                         );
                         if a != ReaderAction::None {
                             action = a;
@@ -4821,6 +5185,7 @@ fn render_doc_block(
                             galley_cache,
                             image_label_editor,
                             image_lightbox,
+                            tracker,
                         );
                     });
                 let handled_nav = runs_res.outcome != RunsClickOutcome::None || runs_res.handled_ui;
@@ -4847,6 +5212,7 @@ fn render_doc_block(
                             show_markup,
                             &runs_res.hitboxes,
                             state,
+                            tracker.hit_image.is_some(),
                         );
                         if a != ReaderAction::None {
                             action = a;
@@ -4885,6 +5251,7 @@ fn render_doc_block(
                                     read_only,
                                     workspace_top,
                                     state,
+                                    tracker,
                                     list_depth,
                                     rendered_active,
                                 );
@@ -4961,7 +5328,7 @@ fn render_doc_block(
                     ui.ctx().request_repaint_after(Duration::from_millis(200));
                 }
                 let mut body_rect = egui::Rect::NOTHING;
-                egui::Frame::new()
+                let code_frame_resp = egui::Frame::new()
                     .fill(theme.code_bg)
                     .stroke(Stroke::new(1.0_f32, theme.code_border))
                     .inner_margin(egui::Margin::same(14))
@@ -5234,6 +5601,7 @@ fn render_doc_block(
                                             code_key,
                                             Arc::clone(&g),
                                             Arc::new(Vec::new()),
+                                            None,
                                         );
                                         g
                                     };
@@ -5241,9 +5609,20 @@ fn render_doc_block(
                                     .id_salt(("code_hscroll", source_lines.start))
                                     .auto_shrink([false, true])
                                     .show(ui, |ui| {
-                                        ui.add(
-                                            egui::Label::new(code_galley)
-                                                .selectable(label_selectable),
+                                        let mut code_hitboxes = Vec::new();
+                                        let _ = present_galley_text_chunk(
+                                            ui,
+                                            code_galley,
+                                            Arc::new(Vec::new()),
+                                            None,
+                                            source_lines,
+                                            label_selectable,
+                                            read_only,
+                                            state.autoscroll_active,
+                                            false,
+                                            theme,
+                                            &mut code_hitboxes,
+                                            tracker,
                                         );
                                     });
                             }
@@ -5258,6 +5637,19 @@ fn render_doc_block(
                         });
                         body_rect = body_resp.response.rect;
                     });
+                let code_card_rect = code_frame_resp.response.rect;
+                if tracker
+                    .secondary_pos
+                    .is_some_and(|p| code_card_rect.is_positive() && code_card_rect.contains(p))
+                {
+                    tracker.hit_code = Some(ReaderCodeContext {
+                        info: info.clone(),
+                        code: code.trim_end_matches('\n').to_string(),
+                        source_lines: source_lines.clone(),
+                        is_math: is_math_code_info(info),
+                        is_mermaid: is_mermaid_code_info(info),
+                    });
+                }
                 if wysiwyg
                     && !read_only
                     && !state.autoscroll_active
@@ -5394,6 +5786,7 @@ fn render_doc_block(
                                     read_only,
                                     workspace_top,
                                     state,
+                                    tracker,
                                     list_depth + 1,
                                     rendered_active,
                                 );
@@ -5483,7 +5876,7 @@ fn render_doc_block(
                 } else {
                     0..rows.len()
                 };
-                egui::Frame::new()
+                let table_frame_resp = egui::Frame::new()
                     .fill(theme.paper_bg)
                     .stroke(Stroke::new(1.0_f32, theme.border))
                     .corner_radius(6.0)
@@ -5522,6 +5915,7 @@ fn render_doc_block(
                                                 theme,
                                                 wysiwyg && show_markup,
                                                 read_only,
+                                                label_selectable,
                                                 suppress_clicks,
                                                 base_dir_owned.as_deref(),
                                                 &table_needles,
@@ -5529,6 +5923,7 @@ fn render_doc_block(
                                                 galley_cache,
                                                 image_label_editor,
                                                 image_lightbox,
+                                                tracker,
                                             ) {
                                                 action = cell_act;
                                             }
@@ -5579,6 +5974,7 @@ fn render_doc_block(
                                                 theme,
                                                 wysiwyg && show_markup,
                                                 read_only,
+                                                label_selectable,
                                                 suppress_clicks,
                                                 base_dir_owned.as_deref(),
                                                 &table_needles,
@@ -5586,6 +5982,7 @@ fn render_doc_block(
                                                 galley_cache,
                                                 image_label_editor,
                                                 image_lightbox,
+                                                tracker,
                                             ) {
                                                 action = cell_act;
                                             }
@@ -5602,6 +5999,29 @@ fn render_doc_block(
                                 });
                         });
                     });
+                if tracker
+                    .secondary_pos
+                    .is_some_and(|p| table_frame_resp.response.rect.contains(p))
+                {
+                    let has_formulas = evaluated_formulas
+                        .as_deref()
+                        .is_some_and(|(_, mask)| mask.iter().any(|r| r.iter().any(|&b| b)))
+                        || table_at_line(buf, source_lines.start).is_some_and(|t| {
+                            t.rows
+                                .iter()
+                                .flatten()
+                                .any(|c| extract_table_cell_formula(c).0.is_some())
+                        });
+                    let eval_grid_opt = evaluated_formulas
+                        .as_deref()
+                        .map(|(grid, _)| grid.as_slice());
+                    tracker.hit_table = Some(ReaderTableContext {
+                        source_lines: source_lines.clone(),
+                        markdown: table_source_markdown(buf, source_lines),
+                        tsv: table_runs_to_tsv(header, rows, eval_grid_opt),
+                        has_formulas,
+                    });
+                }
             });
         }
         DocBlock::ThematicBreak { source_lines } => {
@@ -5707,6 +6127,7 @@ fn render_doc_block(
                                     read_only,
                                     workspace_top,
                                     state,
+                                    tracker,
                                     list_depth,
                                     rendered_active,
                                 );
@@ -5865,7 +6286,7 @@ fn append_bidi_highlighted_run(
     vis_chars
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 enum RunsClickOutcome {
     None,
     Action(ReaderAction),
@@ -5974,17 +6395,69 @@ fn hit_test_block_links(
     None
 }
 
+fn logical_text_if_rtl(runs: &[InlineRun]) -> Option<Arc<str>> {
+    let has_rtl = runs
+        .iter()
+        .any(|r| r.text.chars().any(|c| is_rtl_char(c) || c == '\u{200D}'));
+    if has_rtl {
+        Some(Arc::from(runs_to_plain_text(runs)))
+    } else {
+        None
+    }
+}
+
+fn paint_selection_span(
+    painter: &egui::Painter,
+    galley: &egui::Galley,
+    galley_pos: egui::Pos2,
+    vis_start: usize,
+    vis_end: usize,
+    fill: Color32,
+) {
+    if vis_start >= vis_end {
+        return;
+    }
+    let c_min = galley.from_ccursor(egui::text::CCursor::new(vis_start)).rcursor;
+    let c_max = galley.from_ccursor(egui::text::CCursor::new(vis_end)).rcursor;
+    for ri in c_min.row..=c_max.row {
+        if let Some(row) = galley.rows.get(ri) {
+            let x0 = if ri == c_min.row {
+                row.x_offset(c_min.column)
+            } else {
+                row.rect.left()
+            };
+            let x1 = if ri == c_max.row {
+                row.x_offset(c_max.column)
+            } else {
+                row.rect.right()
+            };
+            let lo = x0.min(x1);
+            let hi = x0.max(x1);
+            if hi > lo {
+                let sel_rect = egui::Rect::from_min_max(
+                    galley_pos + Vec2::new(lo, row.min_y()),
+                    galley_pos + Vec2::new(hi, row.max_y()),
+                );
+                painter.rect_filled(sel_rect, 2.0, fill);
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn present_galley_text_chunk(
     ui: &mut egui::Ui,
     galley: Arc<egui::Galley>,
     link_spans: Arc<Vec<GalleyLinkSpan>>,
+    logical_text: Option<&str>,
     src_lines: &Range<usize>,
     selectable: bool,
     read_only: bool,
     suppress_clicks: bool,
     cmd_down: bool,
+    theme: &WordTheme,
     hitboxes: &mut Vec<RenderedGalleyHitbox>,
+    tracker: &mut ReaderFrameTracker,
 ) -> RunsClickOutcome {
     let sense = if selectable && !suppress_clicks {
         Sense::click_and_drag()
@@ -5993,7 +6466,7 @@ fn present_galley_text_chunk(
     };
     let resp = ui.add(
         egui::Label::new(Arc::clone(&galley))
-            .selectable(selectable)
+            .selectable(false)
             .sense(sense),
     );
     let galley_pos = label_galley_pos(resp.rect, &galley);
@@ -6003,7 +6476,30 @@ fn present_galley_text_chunk(
         link_spans: Arc::clone(&link_spans),
     });
 
+    let doc_line = src_lines.start;
+    let chunk_idx = tracker.next_chunk_id(doc_line);
+    let mut outcome = RunsClickOutcome::None;
+
     if selectable && !suppress_clicks {
+        let vis_text = galley.text();
+        let vis_chars = vis_text.chars().count();
+        let logical_str = logical_text.unwrap_or(vis_text);
+        let log_chars = logical_str.chars().count();
+        let bidi_opt = logical_text.map(MultilineBidiMap::new);
+        let pos_to_log = |pos: egui::Pos2| -> usize {
+            let vis_idx = galley
+                .cursor_from_pos(pos - galley_pos)
+                .ccursor
+                .index
+                .min(vis_chars);
+            if let Some(ref bm) = bidi_opt {
+                bm.logical_col_for_visual(logical_str, vis_idx).min(log_chars)
+            } else {
+                vis_idx.min(log_chars)
+            }
+        };
+
+        let mut hovered_link = false;
         if resp.hovered() {
             let hover_pos =
                 ui.input(|i| i.pointer.hover_pos().or_else(|| i.pointer.interact_pos()));
@@ -6014,25 +6510,223 @@ fn present_galley_text_chunk(
                 show_link_hover_tooltip(ui, resp.id.with("link_tip"), &tip);
                 if read_only || cmd_down {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    hovered_link = true;
                 }
             }
+            if !hovered_link {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+            }
         }
-        if resp.clicked() {
+
+        if resp.clicked_by(egui::PointerButton::Primary) {
             let click_pos = resp
                 .interact_pointer_pos()
                 .or_else(|| ui.input(|i| i.pointer.interact_pos()));
             if let Some(target) = click_pos
                 .and_then(|pos| hit_test_galley_link(&galley, galley_pos, pos, &link_spans))
-                && (read_only || cmd_down) {
-                    return RunsClickOutcome::Action(nav_target_action(target));
-                }
-            if !read_only && !cmd_down && !src_lines.is_empty() {
-                return RunsClickOutcome::Action(ReaderAction::JumpToSourceLine(src_lines.start));
+                && (read_only || cmd_down)
+            {
+                tracker.primary_link_clicked = true;
+                outcome = RunsClickOutcome::Action(nav_target_action(target));
+            } else if !read_only && !cmd_down && !src_lines.is_empty() {
+                outcome = RunsClickOutcome::Action(ReaderAction::JumpToSourceLine(src_lines.start));
             }
         }
+
+        if !tracker.primary_link_clicked {
+            if resp.triple_clicked_by(egui::PointerButton::Primary) {
+                tracker.sel_anchor = Some(ReaderTextPos {
+                    doc_line,
+                    chunk_idx,
+                    char_idx: 0,
+                });
+                tracker.sel_focus = Some(ReaderTextPos {
+                    doc_line,
+                    chunk_idx,
+                    char_idx: log_chars,
+                });
+                tracker.sel_dragging = false;
+                tracker.sel_all = false;
+                tracker.sel_anchor_y = resp.rect.center().y;
+                tracker.sel_cleared_by_click = false;
+            } else if resp.double_clicked_by(egui::PointerButton::Primary) {
+                if let Some(pos) = resp
+                    .interact_pointer_pos()
+                    .or_else(|| ui.input(|i| i.pointer.interact_pos()))
+                {
+                    let log_idx = pos_to_log(pos);
+                    let w_range = word_range_in_line(logical_str, log_idx).unwrap_or(0..log_chars);
+                    tracker.sel_anchor = Some(ReaderTextPos {
+                        doc_line,
+                        chunk_idx,
+                        char_idx: w_range.start.min(log_chars),
+                    });
+                    tracker.sel_focus = Some(ReaderTextPos {
+                        doc_line,
+                        chunk_idx,
+                        char_idx: w_range.end.min(log_chars),
+                    });
+                    tracker.sel_dragging = false;
+                    tracker.sel_all = false;
+                    tracker.sel_anchor_y = pos.y;
+                    tracker.sel_cleared_by_click = false;
+                }
+            } else if resp.drag_started_by(egui::PointerButton::Primary) {
+                if let Some(pos) = ui
+                    .input(|i| i.pointer.press_origin())
+                    .or_else(|| resp.interact_pointer_pos())
+                {
+                    let log_idx = pos_to_log(pos);
+                    let p = ReaderTextPos {
+                        doc_line,
+                        chunk_idx,
+                        char_idx: log_idx,
+                    };
+                    let shift = ui.input(|i| i.modifiers.shift);
+                    if !shift || tracker.sel_anchor.is_none() {
+                        tracker.sel_anchor = Some(p);
+                        tracker.sel_anchor_y = pos.y;
+                    }
+                    tracker.sel_focus = Some(p);
+                    tracker.sel_dragging = true;
+                    tracker.sel_all = false;
+                    tracker.sel_cleared_by_click = false;
+                }
+            } else if tracker.sel_dragging && ui.input(|i| i.pointer.primary_down()) {
+                if let Some(ptr) =
+                    ui.input(|i| i.pointer.interact_pos().or(i.pointer.latest_pos()))
+                {
+                    if resp.rect.contains(ptr)
+                        || (ptr.y >= resp.rect.top() && ptr.y <= resp.rect.bottom())
+                    {
+                        tracker.sel_focus = Some(ReaderTextPos {
+                            doc_line,
+                            chunk_idx,
+                            char_idx: pos_to_log(ptr),
+                        });
+                    } else if ptr.y > resp.rect.bottom() && resp.rect.bottom() >= tracker.sel_anchor_y
+                    {
+                        tracker.sel_focus = Some(ReaderTextPos {
+                            doc_line,
+                            chunk_idx,
+                            char_idx: log_chars,
+                        });
+                    } else if ptr.y < resp.rect.top() && resp.rect.top() <= tracker.sel_anchor_y {
+                        let start_p = ReaderTextPos {
+                            doc_line,
+                            chunk_idx,
+                            char_idx: 0,
+                        };
+                        if tracker.sel_focus.is_none_or(|f| f > start_p) {
+                            tracker.sel_focus = Some(start_p);
+                        }
+                    }
+                }
+            } else if resp.clicked_by(egui::PointerButton::Primary)
+                && !ui.input(|i| i.modifiers.shift)
+            {
+                tracker.sel_anchor = None;
+                tracker.sel_focus = None;
+                tracker.sel_all = false;
+                tracker.sel_cleared_by_click = true;
+            }
+        }
+
+        if let Some(sec_pos) = tracker.secondary_pos
+            && resp.rect.contains(sec_pos)
+        {
+            if let Some(NavTarget::Link(raw_url, _)) =
+                hit_test_galley_link(&galley, galley_pos, sec_pos, &link_spans)
+            {
+                tracker.hit_link_url = Some(raw_url.clone());
+            }
+            if tracker.sel_all {
+                tracker.right_click_inside_sel = true;
+            } else if let Some((lo_p, hi_p)) = tracker.ordered_sel()
+                && lo_p < hi_p
+            {
+                let clicked_p = ReaderTextPos {
+                    doc_line,
+                    chunk_idx,
+                    char_idx: pos_to_log(sec_pos),
+                };
+                if clicked_p >= lo_p && clicked_p <= hi_p {
+                    tracker.right_click_inside_sel = true;
+                }
+            }
+        }
+
+        let local_range = if tracker.sel_all {
+            (log_chars > 0).then_some(0..log_chars)
+        } else if let Some((lo_p, hi_p)) = tracker.ordered_sel()
+            && lo_p < hi_p
+        {
+            let chunk_start = ReaderTextPos {
+                doc_line,
+                chunk_idx,
+                char_idx: 0,
+            };
+            let chunk_end = ReaderTextPos {
+                doc_line,
+                chunk_idx,
+                char_idx: log_chars,
+            };
+            if hi_p > chunk_start && lo_p < chunk_end {
+                let s = if lo_p > chunk_start { lo_p.char_idx } else { 0 };
+                let e = if hi_p < chunk_end {
+                    hi_p.char_idx
+                } else {
+                    log_chars
+                };
+                (s < e).then_some(s..e)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(lr) = local_range {
+            let piece: String = logical_str
+                .chars()
+                .skip(lr.start)
+                .take(lr.end - lr.start)
+                .collect();
+            if !piece.is_empty() {
+                tracker.selected_pieces.push((doc_line, piece));
+            }
+            let painter = ui.painter();
+            if let Some(ref bm) = bidi_opt {
+                for vr in bm.visual_ranges_for_logical_span(lr.start, lr.end) {
+                    paint_selection_span(
+                        painter,
+                        &galley,
+                        galley_pos,
+                        vr.start,
+                        vr.end,
+                        theme.selection_bg,
+                    );
+                }
+            } else {
+                paint_selection_span(
+                    painter,
+                    &galley,
+                    galley_pos,
+                    lr.start,
+                    lr.end,
+                    theme.selection_bg,
+                );
+            }
+        }
+    } else if let Some(sec_pos) = tracker.secondary_pos
+        && resp.rect.contains(sec_pos)
+        && let Some(NavTarget::Link(raw_url, _)) =
+            hit_test_galley_link(&galley, galley_pos, sec_pos, &link_spans)
+    {
+        tracker.hit_link_url = Some(raw_url.clone());
     }
 
-    RunsClickOutcome::None
+    outcome
 }
 
 fn split_run_by_newlines_and_words(run: &InlineRun) -> Vec<Vec<InlineRun>> {
@@ -6099,6 +6793,7 @@ fn render_inline_math_wrapped_runs(
     search_needles: &[(String, bool)],
     whole_word: bool,
     hitboxes: &mut Vec<RenderedGalleyHitbox>,
+    tracker: &mut ReaderFrameTracker,
 ) -> RunsClickOutcome {
     enum WrappedSeg {
         Text(InlineRun),
@@ -6165,8 +6860,10 @@ fn render_inline_math_wrapped_runs(
                         }
                     }
                     WrappedSeg::Text(tok) => {
+                        let tok_slice = [tok];
+                        let logical_tok = logical_text_if_rtl(&tok_slice);
                         let (mut job, link_spans) = build_runs_layout_job(
-                            &[tok],
+                            &tok_slice,
                             font_size,
                             line_height_mult,
                             force_bold,
@@ -6184,12 +6881,15 @@ fn render_inline_math_wrapped_runs(
                             ui,
                             galley,
                             Arc::new(link_spans),
+                            logical_tok.as_deref(),
                             src_lines,
                             selectable,
                             read_only,
                             suppress_clicks,
                             cmd_down,
+                            theme,
                             hitboxes,
+                            tracker,
                         );
                         if res != RunsClickOutcome::None {
                             outcome = res;
@@ -6228,6 +6928,7 @@ fn render_runs_with_images(
     galley_cache: &mut ReaderGalleyCache,
     image_label_editor: &mut Option<ImageLabelEditorState>,
     image_lightbox: &mut Option<ImageLightboxState>,
+    tracker: &mut ReaderFrameTracker,
 ) -> RunsRenderResult {
     let egui_align = resolve_egui_align(alignment, direction);
     let cmd_down = ui.input(|i| i.modifiers.command || i.modifiers.ctrl);
@@ -6278,22 +6979,31 @@ fn render_runs_with_images(
                 job.halign = egui_align;
                 job.wrap.max_width = content_w;
                 job.justify = alignment == BlockAlignment::Justify;
+                let logical_text = if show_inline_markup {
+                    None
+                } else {
+                    logical_text_if_rtl(runs)
+                };
                 galley_cache.insert_bounded(
                     cache_key,
                     ui.fonts(|f| f.layout_job(job)),
                     Arc::new(link_spans),
+                    logical_text,
                 )
             };
             outcome = present_galley_text_chunk(
                 ui,
                 cached.galley,
                 cached.link_spans,
+                cached.logical_text.as_deref(),
                 src_lines,
                 selectable,
                 read_only,
                 suppress_clicks,
                 cmd_down,
+                theme,
                 &mut hitboxes,
+                tracker,
             );
             return;
         }
@@ -6319,79 +7029,90 @@ fn render_runs_with_images(
                 search_needles,
                 whole_word,
                 &mut hitboxes,
+                tracker,
             );
             return;
         }
 
         let mut text_chunk: Vec<InlineRun> = Vec::new();
         let mut prefix_used = prefix_markup;
-        let mut flush_text_chunk = |ui: &mut egui::Ui, chunk: &[InlineRun]| {
-            if chunk.is_empty() {
-                return;
-            }
-            let res = if chunk.iter().any(|r| r.is_math) {
-                render_inline_math_wrapped_runs(
-                    ui,
-                    chunk,
-                    src_lines,
-                    font_size,
-                    line_height_mult,
-                    force_bold,
-                    base_color,
-                    content_w,
-                    direction,
-                    theme,
-                    show_inline_markup,
-                    prefix_used.take().as_deref(),
-                    selectable,
-                    read_only,
-                    suppress_clicks,
-                    cmd_down,
-                    search_needles,
-                    whole_word,
-                    &mut hitboxes,
-                )
-            } else {
-                let (mut job, link_spans) = build_runs_layout_job(
-                    chunk,
-                    font_size,
-                    line_height_mult,
-                    force_bold,
-                    base_color,
-                    direction,
-                    theme,
-                    show_inline_markup,
-                    prefix_used.take().as_deref(),
-                    search_needles,
-                    whole_word,
-                );
-                job.halign = egui_align;
-                job.wrap.max_width = content_w;
-                job.justify = alignment == BlockAlignment::Justify;
-                let galley = ui.fonts(|f| f.layout_job(job));
-                present_galley_text_chunk(
-                    ui,
-                    galley,
-                    Arc::new(link_spans),
-                    src_lines,
-                    selectable,
-                    read_only,
-                    suppress_clicks,
-                    cmd_down,
-                    &mut hitboxes,
-                )
+        let mut flush_text_chunk =
+            |ui: &mut egui::Ui, chunk: &[InlineRun], tracker: &mut ReaderFrameTracker| {
+                if chunk.is_empty() {
+                    return;
+                }
+                let res = if chunk.iter().any(|r| r.is_math) {
+                    render_inline_math_wrapped_runs(
+                        ui,
+                        chunk,
+                        src_lines,
+                        font_size,
+                        line_height_mult,
+                        force_bold,
+                        base_color,
+                        content_w,
+                        direction,
+                        theme,
+                        show_inline_markup,
+                        prefix_used.take().as_deref(),
+                        selectable,
+                        read_only,
+                        suppress_clicks,
+                        cmd_down,
+                        search_needles,
+                        whole_word,
+                        &mut hitboxes,
+                        tracker,
+                    )
+                } else {
+                    let logical_chunk = if show_inline_markup {
+                        None
+                    } else {
+                        logical_text_if_rtl(chunk)
+                    };
+                    let (mut job, link_spans) = build_runs_layout_job(
+                        chunk,
+                        font_size,
+                        line_height_mult,
+                        force_bold,
+                        base_color,
+                        direction,
+                        theme,
+                        show_inline_markup,
+                        prefix_used.take().as_deref(),
+                        search_needles,
+                        whole_word,
+                    );
+                    job.halign = egui_align;
+                    job.wrap.max_width = content_w;
+                    job.justify = alignment == BlockAlignment::Justify;
+                    let galley = ui.fonts(|f| f.layout_job(job));
+                    present_galley_text_chunk(
+                        ui,
+                        galley,
+                        Arc::new(link_spans),
+                        logical_chunk.as_deref(),
+                        src_lines,
+                        selectable,
+                        read_only,
+                        suppress_clicks,
+                        cmd_down,
+                        theme,
+                        &mut hitboxes,
+                        tracker,
+                    )
+                };
+                if res != RunsClickOutcome::None {
+                    outcome = res;
+                }
             };
-            if res != RunsClickOutcome::None {
-                outcome = res;
-            }
-        };
 
         let mut img_action: Option<ReaderAction> = None;
         let mut idx = 0;
         while idx < runs.len() {
             if let Some(ref url) = runs[idx].image_url {
                 if !text_chunk.is_empty() {
-                    flush_text_chunk(ui, &text_chunk);
+                    flush_text_chunk(ui, &text_chunk, tracker);
                     text_chunk.clear();
                 }
 
@@ -6431,6 +7152,9 @@ fn render_runs_with_images(
                                         read_only,
                                         suppress_clicks,
                                         cmd_down,
+                                        base_dir,
+                                        buf.file_path.as_deref(),
+                                        tracker,
                                     ) {
                                         img_action = Some(act);
                                     }
@@ -6460,6 +7184,7 @@ fn render_runs_with_images(
                     cmd_down,
                     image_label_editor,
                     image_lightbox,
+                    tracker,
                 );
                 if ui_used {
                     handled_ui = true;
@@ -6476,7 +7201,7 @@ fn render_runs_with_images(
             idx += 1;
         }
 
-        flush_text_chunk(ui, &text_chunk);
+        flush_text_chunk(ui, &text_chunk, tracker);
         drop(flush_text_chunk);
         if let Some(act) = img_action {
             outcome = RunsClickOutcome::Action(act);
@@ -6524,6 +7249,9 @@ fn render_remote_badge_pill(
     read_only: bool,
     suppress_clicks: bool,
     cmd_down: bool,
+    base_dir: Option<&Path>,
+    doc_path: Option<&Path>,
+    tracker: &mut ReaderFrameTracker,
 ) -> Option<ReaderAction> {
     let nav_target = image_run_nav_target(run.link_url.as_deref(), Some(url));
     let resp = if let ImageLoadState::Loaded(tex) = load_cached_image_state(ui.ctx(), url, None, None) {
@@ -6580,6 +7308,21 @@ fn render_remote_badge_pill(
         }
         if !suppress_clicks && (read_only || cmd_down) && resp.clicked() {
             action = Some(nav_target_action(target));
+        }
+    }
+    if tracker
+        .secondary_pos
+        .is_some_and(|p| resp.rect.contains(p))
+    {
+        tracker.hit_image = Some(ReaderImageContext {
+            url: url.to_string(),
+            alt: run.text.clone(),
+            link_url: run.link_url.clone(),
+            base_dir: base_dir.map(Path::to_path_buf),
+            doc_path: doc_path.map(Path::to_path_buf),
+        });
+        if let Some(NavTarget::Link(raw, _)) = nav_target {
+            tracker.hit_link_url = Some(raw);
         }
     }
 
@@ -6732,9 +7475,24 @@ fn render_image_run(
     cmd_down: bool,
     image_label_editor: &mut Option<ImageLabelEditorState>,
     image_lightbox: &mut Option<ImageLightboxState>,
+    tracker: &mut ReaderFrameTracker,
 ) -> (Option<ReaderAction>, bool, Option<egui::Rect>) {
     let mut action = None;
     let doc_path = buf.file_path.clone();
+    let record_image_hit = |tracker: &mut ReaderFrameTracker, rect: egui::Rect| {
+        if tracker.secondary_pos.is_some_and(|p| rect.contains(p)) {
+            tracker.hit_image = Some(ReaderImageContext {
+                url: url.to_string(),
+                alt: run.text.clone(),
+                link_url: run.link_url.clone(),
+                base_dir: base_dir.map(Path::to_path_buf),
+                doc_path: doc_path.clone(),
+            });
+            if let Some(NavTarget::Link(raw, _)) = image_run_nav_target(run.link_url.as_deref(), None) {
+                tracker.hit_link_url = Some(raw);
+            }
+        }
+    };
     match load_cached_image_state(ui.ctx(), url, base_dir, doc_path.as_deref()) {
         ImageLoadState::Loaded(tex) => {
             let [tw, th] = tex.size();
@@ -6756,6 +7514,7 @@ fn render_image_run(
                 .corner_radius(CornerRadius::same(6))
                 .inner_margin(egui::Margin::same(4))
                 .show(ui, |ui| ui.image((tex.id(), Vec2::new(draw_w, draw_h))));
+            record_image_hit(tracker, frame_resp.response.rect);
 
             if read_only && !suppress_clicks {
                 let click_resp = frame_resp.inner.interact(Sense::click());
@@ -6848,7 +7607,7 @@ fn render_image_run(
             return (action, label_ui_used, label_rect);
         }
         ImageLoadState::Loading => {
-            egui::Frame::new()
+            let resp = egui::Frame::new()
                 .fill(theme.code_bg)
                 .stroke(Stroke::new(1.0_f32, theme.border))
                 .corner_radius(CornerRadius::same(6))
@@ -6861,9 +7620,10 @@ fn render_image_run(
                     };
                     ui.label(RichText::new(label).size(12.0).color(theme.text_muted));
                 });
+            record_image_hit(tracker, resp.response.rect);
         }
         ImageLoadState::Unavailable => {
-            egui::Frame::new()
+            let resp = egui::Frame::new()
                 .fill(theme.code_bg)
                 .stroke(Stroke::new(1.0_f32, theme.border))
                 .corner_radius(CornerRadius::same(6))
@@ -6876,6 +7636,7 @@ fn render_image_run(
                     };
                     ui.label(RichText::new(caption).size(12.5).color(theme.text_muted));
                 });
+            record_image_hit(tracker, resp.response.rect);
         }
     }
     let (label_ui_used, label_rect) = render_image_label_controls(
@@ -6907,6 +7668,7 @@ fn render_table_cell(
     theme: &WordTheme,
     show_inline_markup: bool,
     read_only: bool,
+    label_selectable: bool,
     suppress_clicks: bool,
     base_dir: Option<&Path>,
     search_needles: &[(String, bool)],
@@ -6914,6 +7676,7 @@ fn render_table_cell(
     galley_cache: &mut ReaderGalleyCache,
     image_label_editor: &mut Option<ImageLabelEditorState>,
     image_lightbox: &mut Option<ImageLightboxState>,
+    tracker: &mut ReaderFrameTracker,
 ) -> Option<ReaderAction> {
     let cell_dir = if let Some(eval_s) = eval_text {
         detect_paragraph_direction(eval_s)
@@ -6947,45 +7710,50 @@ fn render_table_cell(
         if eval_text.is_none() && runs.iter().any(|r| r.image_url.is_some()) {
             let max_img_w = (col_w - 8.0).max(40.0);
             let mut text_chunk: Vec<InlineRun> = Vec::new();
-            let flush_cell_text = |ui: &mut egui::Ui, chunk: &[InlineRun]| -> Option<ReaderAction> {
-                if chunk.is_empty() || chunk.iter().all(|r| r.text.trim().is_empty()) {
-                    return None;
-                }
-                let (mut job, link_spans) = build_runs_layout_job(
-                    chunk,
-                    13.5,
-                    1.32,
-                    is_header,
-                    color,
-                    cell_dir,
-                    theme,
-                    show_inline_markup,
-                    None,
-                    search_needles,
-                    whole_word,
-                );
-                job.halign = egui_align;
-                job.wrap.max_width = col_w;
-                let galley = ui.fonts(|f| f.layout_job(job));
-                let mut dummy_hitboxes = Vec::new();
-                match present_galley_text_chunk(
-                    ui,
-                    galley,
-                    Arc::new(link_spans),
-                    src_lines,
-                    true,
-                    read_only,
-                    suppress_clicks,
-                    cmd_down,
-                    &mut dummy_hitboxes,
-                ) {
-                    RunsClickOutcome::Action(a) => Some(a),
-                    RunsClickOutcome::None => None,
-                }
-            };
+            let flush_cell_text =
+                |ui: &mut egui::Ui, chunk: &[InlineRun], tracker: &mut ReaderFrameTracker| -> Option<ReaderAction> {
+                    if chunk.is_empty() || chunk.iter().all(|r| r.text.trim().is_empty()) {
+                        return None;
+                    }
+                    let logical_chunk = logical_text_if_rtl(chunk);
+                    let (mut job, link_spans) = build_runs_layout_job(
+                        chunk,
+                        13.5,
+                        1.32,
+                        is_header,
+                        color,
+                        cell_dir,
+                        theme,
+                        show_inline_markup,
+                        None,
+                        search_needles,
+                        whole_word,
+                    );
+                    job.halign = egui_align;
+                    job.wrap.max_width = col_w;
+                    let galley = ui.fonts(|f| f.layout_job(job));
+                    let mut dummy_hitboxes = Vec::new();
+                    match present_galley_text_chunk(
+                        ui,
+                        galley,
+                        Arc::new(link_spans),
+                        logical_chunk.as_deref(),
+                        src_lines,
+                        label_selectable,
+                        read_only,
+                        suppress_clicks,
+                        cmd_down,
+                        theme,
+                        &mut dummy_hitboxes,
+                        tracker,
+                    ) {
+                        RunsClickOutcome::Action(a) => Some(a),
+                        RunsClickOutcome::None => None,
+                    }
+                };
             for (idx, run) in runs.iter().enumerate() {
                 if let Some(ref url) = run.image_url {
-                    if let Some(a) = flush_cell_text(ui, &text_chunk) {
+                    if let Some(a) = flush_cell_text(ui, &text_chunk, tracker) {
                         cell_action = Some(a);
                     }
                     text_chunk.clear();
@@ -7007,6 +7775,7 @@ fn render_table_cell(
                         cmd_down,
                         image_label_editor,
                         image_lightbox,
+                        tracker,
                     );
                     if let Some(a) = act {
                         cell_action = Some(a);
@@ -7015,7 +7784,7 @@ fn render_table_cell(
                     text_chunk.push(run.clone());
                 }
             }
-            if let Some(a) = flush_cell_text(ui, &text_chunk) {
+            if let Some(a) = flush_cell_text(ui, &text_chunk, tracker) {
                 cell_action = Some(a);
             }
             return;
@@ -7035,13 +7804,14 @@ fn render_table_cell(
                 theme,
                 show_inline_markup,
                 None,
-                true,
+                label_selectable,
                 read_only,
                 suppress_clicks,
                 cmd_down,
                 search_needles,
                 whole_word,
                 &mut dummy_hitboxes,
+                tracker,
             );
             if let RunsClickOutcome::Action(a) = outcome {
                 cell_action = Some(a);
@@ -7072,6 +7842,11 @@ fn render_table_cell(
         } else {
             let synth = eval_text.map(|s| [InlineRun::plain(s)]);
             let effective_runs = synth.as_ref().map(|a| a.as_slice()).unwrap_or(runs);
+            let logical_cell = if show_inline_markup {
+                None
+            } else {
+                logical_text_if_rtl(effective_runs)
+            };
             let (mut job, link_spans) = build_runs_layout_job(
                 effective_runs,
                 13.5,
@@ -7091,39 +7866,25 @@ fn render_table_cell(
                 cache_key,
                 ui.fonts(|f| f.layout_job(job)),
                 Arc::new(link_spans),
+                logical_cell,
             )
         };
-        let sense = if !cached.link_spans.is_empty() && !suppress_clicks {
-            Sense::click()
-        } else {
-            Sense::hover()
-        };
-        let resp = ui.add(egui::Label::new(Arc::clone(&cached.galley)).sense(sense));
-        if !cached.link_spans.is_empty() && !suppress_clicks {
-            let galley_pos = label_galley_pos(resp.rect, &cached.galley);
-            if resp.hovered() {
-                let hover_pos =
-                    ui.input(|i| i.pointer.hover_pos().or_else(|| i.pointer.interact_pos()));
-                if let Some(target) = hover_pos.and_then(|pos| {
-                    hit_test_galley_link(&cached.galley, galley_pos, pos, &cached.link_spans)
-                }) {
-                    let tip = nav_target_tooltip(target, read_only);
-                    show_link_hover_tooltip(ui, resp.id.with("tbl_link_tip"), &tip);
-                    if read_only || cmd_down {
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                    }
-                }
-            }
-            if (read_only || cmd_down) && resp.clicked() {
-                let click_pos = resp
-                    .interact_pointer_pos()
-                    .or_else(|| ui.input(|i| i.pointer.interact_pos()));
-                if let Some(target) = click_pos.and_then(|pos| {
-                    hit_test_galley_link(&cached.galley, galley_pos, pos, &cached.link_spans)
-                }) {
-                    cell_action = Some(nav_target_action(target));
-                }
-            }
+        let mut cell_hitboxes = Vec::new();
+        if let RunsClickOutcome::Action(a) = present_galley_text_chunk(
+            ui,
+            cached.galley,
+            cached.link_spans,
+            cached.logical_text.as_deref(),
+            src_lines,
+            label_selectable,
+            read_only,
+            suppress_clicks,
+            cmd_down,
+            theme,
+            &mut cell_hitboxes,
+            tracker,
+        ) {
+            cell_action = Some(a);
         }
     });
     cell_action
@@ -7803,7 +8564,7 @@ mod tests {
         let mut cache = ReaderGalleyCache::default();
         let cap = ReaderGalleyCache::max_entries();
         for i in 0..cap {
-            cache.insert_bounded((i, i + 1, i as u64), Arc::clone(&galley), Arc::new(Vec::new()));
+            cache.insert_bounded((i, i + 1, i as u64), Arc::clone(&galley), Arc::new(Vec::new()), None);
         }
         assert_eq!(cache.entries.len(), cap);
 
@@ -7812,7 +8573,7 @@ mod tests {
 
         // Inserting beyond capacity triggers bounded half-eviction
         let extra_key = (9999, 10000, 9999);
-        cache.insert_bounded(extra_key, Arc::clone(&galley), Arc::new(Vec::new()));
+        cache.insert_bounded(extra_key, Arc::clone(&galley), Arc::new(Vec::new()), None);
         assert!(cache.entries.len() < cap);
         assert!(cache.entries.len() >= cap / 2);
         assert!(cache.get(&(0, 1, 0)).is_some());
@@ -7869,7 +8630,7 @@ mod tests {
                 );
                 state
                     .galley_cache
-                    .insert_bounded(key_a, Arc::clone(&galley), Arc::new(Vec::new()));
+                    .insert_bounded(key_a, Arc::clone(&galley), Arc::new(Vec::new()), None);
                 assert_eq!(state.galley_cache.entries.len(), 1);
 
                 // Re-preparing with same doc_id and theme (even after simulated AST re-parse) retains cache!
@@ -7895,7 +8656,7 @@ mod tests {
                 // Changing doc_id invalidates cache
                 state
                     .galley_cache
-                    .insert_bounded(key_a, Arc::clone(&galley), Arc::new(Vec::new()));
+                    .insert_bounded(key_a, Arc::clone(&galley), Arc::new(Vec::new()), None);
                 state.prepare_galley_cache(
                     ui,
                     2,

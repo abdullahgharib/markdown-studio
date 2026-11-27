@@ -5,6 +5,18 @@ For architecture, features, shortcuts, and build instructions, see [README.md](R
 
 ---
 
+### `v0.8.2` (2026-11-27) — Professional Context-Aware Right-Click Menus
+- **Modular Right-Click Menu System (`src/ui/context_menu.rs`, `src/ui/mod.rs`)**:
+  - Built `ContextMenuState`, semantic `ContextMenuTarget` snapshots, `ContextMenuAction`, nested cascading submenus (`Formatting ▸` / `Headings ▸`), screen-edge flipping (`compute_root_menu_pos`, `compute_submenu_pos`), keyboard navigation (`ArrowUp`/`ArrowDown`/`ArrowRight`/`ArrowLeft`/`Enter`/`Space`/`Escape`), outside-click dismissal, shortcut hints, disabled states, and theme-matched Light/Sepia/Dark panels.
+- **Editor Context Menus (`src/ui/editor.rs`, `src/ui/reader/mod.rs`, `src/ui/dialogs.rs`)**:
+  - Added Source, WYSIWYG, and Split editor right-click menus with selection preservation when right-clicking inside an existing selection and accurate caret placement outside selections, Undo/Redo, Cut/Copy/`Copy as Plain Text`/Paste/`Paste as Plain Text`/Select All, `Find Selected Text`/`Find and Replace...`, link actions, and full nested formatting & block-insertion submenus.
+- **Reader & Preview Context Menus (`src/ui/reader/mod.rs`, `src/ui/reader/caches.rs`, `src/document/clipboard.rs`)**:
+  - Added custom primary-pointer drag selection in Reader mode with logical UTF-8 Arabic/BiDi mapping (`CachedGalley::logical_text`) and preserved right-click selection; exposed read-only selection/link/image/code/Math/Mermaid/Markdown+TSV table copy actions in Reader mode with strict editing-action exclusion, plus `Edit Table...` and `Recalculate Table` in non-read-only Split/WYSIWYG preview mode.
+  - Hardened `html_matches_plain_text` (`src/document/clipboard.rs`) with multi-token verification so unrelated `CF_HTML` clipboard payloads cannot hijack plain or TSV pastes on common single words.
+- **Tab Bar & File Explorer Context Menus (`src/ui/tabs.rs`, `src/ui/explorer.rs`, `src/ui/dialogs.rs`)**:
+  - Added Tab strip menus (`Close Tab`, `Close Other Tabs`, `Close Tabs to the Right` with queued dirty-tab prompt support via `PendingDiscardAction::CloseTabs`, `Save`, `Copy File Path`, `Reveal File in Explorer`) and File Explorer row/folder menus (`Open File`, `Open in New Tab`, `Copy File Path`, `Copy Relative Path`, `Reveal in OS File Manager`, `Rename...`, `Delete...` with modal confirmation, `Refresh Folder`) enforcing canonical workspace containment.
+- **Tests (`tests/ui_integration_tests.rs`, `src/ui/context_menu.rs`)**: Added unit tests and 5 end-to-end headless UI integration tests covering Editor, Reader/Preview elements, Tab/Explorer actions & workspace security, Light/Sepia/Dark themes, Arabic/RTL text, keyboard navigation, and menu dismissal.
+
 ### `v0.8.1` (2026-11-27) — Cross-Platform Linux & macOS CI Test & Clippy Fixes
 - **Cross-Platform Path & Handoff Validation (`src/ui/os_integration.rs`, `src/ui/instance.rs`)**:
   - Updated `validate_exe_path` to recognize Windows drive-letter absolute paths (`[A-Za-z]:\` / `/`) across Linux and macOS test runners where `std::path::Path::is_absolute` only checks POSIX leading `/`.

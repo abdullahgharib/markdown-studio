@@ -34,6 +34,7 @@ pub(super) struct CachedMathPreview {
 pub(super) struct CachedGalley {
     pub galley: Arc<egui::Galley>,
     pub link_spans: Arc<Vec<GalleyLinkSpan>>,
+    pub logical_text: Option<Arc<str>>,
     pub last_tick: u64,
 }
 
@@ -157,6 +158,7 @@ impl ReaderGalleyCache {
         key: (usize, usize, u64),
         galley: Arc<egui::Galley>,
         link_spans: Arc<Vec<GalleyLinkSpan>>,
+        logical_text: Option<Arc<str>>,
     ) -> CachedGalley {
         if !self.entries.contains_key(&key) {
             evict_oldest_half(&mut self.entries, Self::max_entries(), |e| e.last_tick);
@@ -165,6 +167,7 @@ impl ReaderGalleyCache {
         let entry = CachedGalley {
             galley,
             link_spans,
+            logical_text,
             last_tick: self.tick,
         };
         self.entries.insert(key, entry.clone());

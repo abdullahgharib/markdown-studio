@@ -7,7 +7,7 @@
 [![Platforms](https://img.shields.io/badge/Platforms-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#installation)
 [![CI](https://github.com/abdullahgharib/markdown-studio/actions/workflows/ci.yml/badge.svg)](https://github.com/abdullahgharib/markdown-studio/actions/workflows/ci.yml)
 
-**Current Version:** `0.8.1` (`markdown_studio`)
+**Current Version:** `0.8.2` (`markdown_studio`)
 
 ---
 
@@ -46,6 +46,7 @@ Most modern Markdown editors bundle a full Chromium browser via Electron, consum
 - **Single-Instance File Forwarding**: Opening files from your OS file manager or CLI forwards them as new tabs in the active window (`--new-window` / `-n` opens a separate window).
 - **File Explorer & Live Outline Sidebars**: Lazy cached directory tree with search and file-type filters (`All`, `MD`, `Text`, `Code`), plus a collapsible, searchable heading Outline with live scroll-spy.
 - **Smart Rich-Text & Image Paste (`Ctrl+V`)**: Paste formatted content from websites, Word, Google Docs, or Excel/Sheets directly as clean GFM Markdown, or paste clipboard screenshots straight into `assets/` (`Ctrl+Shift+V` pastes verbatim plain text).
+- **Context-Aware Right-Click Menus**: Full right-click menus with keyboard navigation (`Arrow` keys/`Enter`/`Esc`), nested `Formatting ▸` / `Headings ▸` submenus, and Light/Sepia/Dark theming across **Source/WYSIWYG/Split**, **Reader/Preview** (strictly read-only in Reader, supporting links, images, code/Math/Mermaid blocks, and Markdown/TSV table copy/recalc/edit), **Tab Bar**, and **File Explorer** (rename, confirmed delete, reveal, and path copy within workspace boundaries).
 - **Crash-Safe Auto-Recovery & External Diff Detection**: Automatic session snapshots (`session.json` + streaming `recovery/` drafts) and clean auto-reload / visual diff modal when files change on disk.
 - **Writing Goals & Reading Time**: Status bar word/character counts, estimated reading time, and configurable writing goal tracker.
 - **Three Paper Themes & Comfort Controls**: **Light** (*Classic Paper*), **Sepia** (*Warm Paper*), and **Dark** (*Midnight Studio*), configurable page width and line spacing, `F11` Focus Mode, `Ctrl+Scroll`/Pinch zoom (`60%–200%`), and middle-click two-arrow auto-scroll.

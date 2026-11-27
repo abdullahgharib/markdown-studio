@@ -6475,3 +6475,951 @@ fn test_reader_mode_image_lightbox_opens_from_inline_and_table_and_closes() {
         );
     }
 }
+
+fn right_click_at(
+    ctx: &egui::Context,
+    app: &mut MarkdownApp,
+    t: &mut f64,
+    pos: Pos2,
+) -> egui::FullOutput {
+    *t += 0.02;
+    let _ = ui_step_with_mods(
+        ctx,
+        app,
+        *t,
+        vec![
+            Event::PointerMoved(pos),
+            Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Secondary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+        ],
+        Modifiers::NONE,
+    );
+    *t += 0.02;
+    let _ = ui_step_with_mods(
+        ctx,
+        app,
+        *t,
+        vec![Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        }],
+        Modifiers::NONE,
+    );
+    // Run one settle frame so egui::Area completes its first-frame sizing pass and paints menu text.
+    *t += 0.02;
+    ui_step(ctx, app, *t, vec![])
+}
+
+fn drag_select(
+    ctx: &egui::Context,
+    app: &mut MarkdownApp,
+    t: &mut f64,
+    from: Pos2,
+    to: Pos2,
+) -> egui::FullOutput {
+    *t += 0.02;
+    let _ = ui_step(
+        ctx,
+        app,
+        *t,
+        vec![
+            Event::PointerMoved(from),
+            Event::PointerButton {
+                pos: from,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+        ],
+    );
+    *t += 0.02;
+    let mid = Pos2::new((from.x + to.x) * 0.5, (from.y + to.y) * 0.5);
+    let _ = ui_step(ctx, app, *t, vec![Event::PointerMoved(mid)]);
+    *t += 0.02;
+    let _ = ui_step(ctx, app, *t, vec![Event::PointerMoved(to)]);
+    *t += 0.02;
+    ui_step(
+        ctx,
+        app,
+        *t,
+        vec![Event::PointerButton {
+            pos: to,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        }],
+    )
+}
+
+fn press_key(
+    ctx: &egui::Context,
+    app: &mut MarkdownApp,
+    t: &mut f64,
+    key: Key,
+    modifiers: Modifiers,
+) -> egui::FullOutput {
+    *t += 0.02;
+    ui_step_with_mods(
+        ctx,
+        app,
+        *t,
+        vec![Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }],
+        modifiers,
+    )
+}
+
+fn menu_contains_label(
+    items: &[markdown_studio::ui::context_menu::ContextMenuItem<
+        markdown_studio::ui::context_menu::ContextMenuAction,
+    >],
+    target: &str,
+) -> bool {
+    use markdown_studio::ui::context_menu::ContextMenuItem;
+    items.iter().any(|item| match item {
+        ContextMenuItem::Action { label, .. } => label == target,
+        ContextMenuItem::Submenu { label, items, .. } => {
+            label == target || menu_contains_label(items, target)
+        }
+        ContextMenuItem::Separator => false,
+    })
+}
+
+fn menu_item_enabled(
+    items: &[markdown_studio::ui::context_menu::ContextMenuItem<
+        markdown_studio::ui::context_menu::ContextMenuAction,
+    >],
+    target: &str,
+) -> Option<bool> {
+    use markdown_studio::ui::context_menu::ContextMenuItem;
+    for item in items {
+        match item {
+            ContextMenuItem::Action { label, enabled, .. } if label == target => {
+                return Some(*enabled);
+            }
+            ContextMenuItem::Submenu { label, enabled, items, .. } => {
+                if label == target {
+                    return Some(*enabled);
+                }
+                if let Some(found) = menu_item_enabled(items, target) {
+                    return Some(found);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+#[test]
+fn test_editor_context_menu_selection_clipboard_undo_redo_and_modes() {
+    use markdown_studio::ui::context_menu::{ContextMenuAction, ContextMenuTarget};
+
+    let ctx = egui::Context::default();
+    let (_dir, mut app) = new_isolated_app(&ctx);
+    app.buffer = DocumentBuffer::from_str("Hello **world** today\nSecond line here\n");
+    app.dispatch_action(&ctx, ToolbarAction::SetViewMode(ViewMode::Source));
+
+    let mut t = 1.0_f64;
+    let _out = ui_step(&ctx, &mut app, t, vec![]);
+
+    // Select "**world**" on line 0 (chars 6..15)
+    app.buffer.selection_anchor = Some(6);
+    app.buffer.cursor_char = 15;
+    app.buffer.cache_current_selection();
+    t += 0.02;
+    let out = ui_step(&ctx, &mut app, t, vec![]);
+
+    let word_pos = find_rendered_text_shapes(&out, "world")
+        .into_iter()
+        .find_map(|(_, ts)| (ts.pos.y > 110.0).then_some(ts.pos + egui::vec2(72.0, 8.0)))
+        .expect("line 0 text must render in Source editor");
+
+    // 1. Right-click inside existing selection -> preserves selection and opens Editor menu
+    let menu_out = right_click_at(&ctx, &mut app, &mut t, word_pos);
+    assert!(app.context_menu.is_open(), "right-click in Source mode must open context menu");
+    assert!(
+        matches!(
+            app.context_menu.target,
+            Some(ContextMenuTarget::Editor {
+                from_wysiwyg: false,
+                has_selection: true,
+                ..
+            })
+        ),
+        "expected Source editor target with selection"
+    );
+    assert_eq!(app.buffer.selection_range(), Some(6..15));
+
+    let items = app.build_active_context_menu_items();
+    assert_eq!(menu_item_enabled(&items, "Undo"), Some(false));
+    assert_eq!(menu_item_enabled(&items, "Redo"), Some(false));
+    assert_eq!(menu_item_enabled(&items, "Cut"), Some(true));
+    assert_eq!(menu_item_enabled(&items, "Copy"), Some(true));
+    assert_eq!(menu_item_enabled(&items, "Copy as Plain Text"), Some(true));
+    assert_eq!(menu_item_enabled(&items, "Find Selected Text"), Some(true));
+    assert!(!find_rendered_text_shapes(&menu_out, "Copy as Plain Text").is_empty());
+
+    // Click "Copy as Plain Text" from rendered menu
+    let copy_plain_pos = find_rendered_text_shapes(&menu_out, "Copy as Plain Text")
+        .into_iter()
+        .find_map(|(_, ts)| (ts.pos.y > 110.0).then_some(ts.pos + egui::vec2(20.0, 6.0)))
+        .expect("Copy as Plain Text row must be painted");
+    let _ = click_at(&ctx, &mut app, &mut t, copy_plain_pos, Modifiers::NONE);
+    assert!(!app.context_menu.is_open(), "executing action must dismiss menu");
+    assert_eq!(app.last_copied_text.as_deref(), Some("world"));
+
+    // 2. Right-click outside existing selection -> moves caret and disables selection actions
+    app.buffer.selection_anchor = Some(6);
+    app.buffer.cursor_char = 15;
+    app.buffer.cache_current_selection();
+    let out2 = ui_step(&ctx, &mut app, t + 0.02, vec![]);
+    t += 0.02;
+    let line2_pos = find_rendered_text_shapes(&out2, "Second line")
+        .into_iter()
+        .find_map(|(_, ts)| (ts.pos.y > 110.0).then_some(ts.pos + egui::vec2(18.0, 8.0)))
+        .expect("Second line must render");
+    let _ = right_click_at(&ctx, &mut app, &mut t, line2_pos);
+    assert!(app.context_menu.is_open());
+    assert!(
+        app.buffer.selection_range().is_none(),
+        "right-clicking outside selection must clear selection and position caret"
+    );
+    assert_eq!(app.buffer.char_to_line(app.buffer.cursor_char), 1);
+    let items2 = app.build_active_context_menu_items();
+    assert_eq!(menu_item_enabled(&items2, "Cut"), Some(false));
+    assert_eq!(menu_item_enabled(&items2, "Copy"), Some(false));
+    assert_eq!(menu_item_enabled(&items2, "Find Selected Text"), Some(false));
+    app.context_menu.close();
+
+    // 3. Cut, Paste (smart HTML), Paste as Plain Text, Undo, Redo, Select All, Find Selected Text
+    let second_start = app.buffer.line_to_char(1);
+    app.buffer.selection_anchor = Some(second_start);
+    app.buffer.cursor_char = second_start + 6; // "Second"
+    app.buffer.cache_current_selection();
+    app.execute_context_menu_action(&ctx, ContextMenuAction::Cut);
+    assert_eq!(app.last_copied_text.as_deref(), Some("Second"));
+    assert!(app.buffer.as_string().contains("\n line here\n"));
+    assert!(app.buffer.dirty);
+    assert!(app.buffer.undo_depth() >= 1);
+
+    app.test_clipboard_text = Some("Alpha".to_string());
+    app.test_clipboard_html = Some("<b>Alpha</b>".to_string());
+    app.execute_context_menu_action(&ctx, ContextMenuAction::Paste);
+    assert!(app.buffer.as_string().contains("**Alpha** line here"));
+
+    app.test_clipboard_text = Some("Beta".to_string());
+    app.test_clipboard_html = Some("<b>Beta</b>".to_string());
+    app.execute_context_menu_action(&ctx, ContextMenuAction::PasteAsPlainText);
+    assert!(app.buffer.as_string().contains("**Alpha**Beta line here"));
+
+    app.execute_context_menu_action(&ctx, ContextMenuAction::Undo);
+    assert!(!app.buffer.as_string().contains("Beta"));
+    app.execute_context_menu_action(&ctx, ContextMenuAction::Redo);
+    assert!(app.buffer.as_string().contains("Beta"));
+
+    app.execute_context_menu_action(&ctx, ContextMenuAction::SelectAll);
+    assert_eq!(app.buffer.selection_range(), Some(0..app.buffer.len_chars()));
+
+    app.execute_context_menu_action(&ctx, ContextMenuAction::FindSelectedText("Alpha".to_string()));
+    assert!(app.find_bar.open);
+    assert!(!app.find_bar.show_replace);
+    assert_eq!(app.find_bar.query, "Alpha");
+    assert!(!app.find_bar.matches.is_empty());
+
+    app.execute_context_menu_action(&ctx, ContextMenuAction::FindAndReplace);
+    assert!(app.find_bar.open);
+    assert!(app.find_bar.show_replace);
+    app.find_bar.open = false;
+
+    // 4. WYSIWYG right-click opens Editor context menu and preserves selection
+    app.buffer = DocumentBuffer::from_str("Hello world WYSIWYG\n");
+    app.dispatch_action(&ctx, ToolbarAction::SetViewMode(ViewMode::Wysiwyg));
+    let w_out = ui_step(&ctx, &mut app, t + 0.02, vec![]);
+    t += 0.02;
+    let w_pos = find_rendered_text_shapes(&w_out, "Hello world WYSIWYG")
+        .into_iter()
+        .find_map(|(_, ts)| (ts.pos.y > 110.0).then_some(ts.pos + egui::vec2(24.0, 8.0)))
+        .expect("WYSIWYG text must render");
+    let _ = right_click_at(&ctx, &mut app, &mut t, w_pos);
+    assert!(app.context_menu.is_open());
+    assert!(matches!(
+        app.context_menu.target,
+        Some(ContextMenuTarget::Editor {
+            from_wysiwyg: true,
+            ..
+        })
+    ));
+    app.context_menu.close();
+
+    // 5. Split mode: right-click right preview pane opens Reader { read_only: false }
+    app.dispatch_action(&ctx, ToolbarAction::SetViewMode(ViewMode::Split));
+    let s_out = ui_step(&ctx, &mut app, t + 0.02, vec![]);
+    t += 0.02;
+    let split_preview_pos = find_rendered_text_shapes(&s_out, "Hello world WYSIWYG")
+        .into_iter()
+        .find_map(|(_, ts)| {
+            (ts.pos.x > 640.0 && ts.pos.y > 110.0).then_some(ts.pos + egui::vec2(20.0, 8.0))
+        })
+        .expect("Split preview text must render on right half");
+    let _ = right_click_at(&ctx, &mut app, &mut t, split_preview_pos);
+    assert!(app.context_menu.is_open());
+    assert!(matches!(
+        app.context_menu.target,
+        Some(ContextMenuTarget::Reader {
+            read_only: false,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn test_editor_context_menu_formatting_submenu_operations() {
+    use markdown_studio::document::editing::LineBlockKind;
+    use markdown_studio::ui::context_menu::ContextMenuAction;
+
+    let ctx = egui::Context::default();
+    let (_dir, mut app) = new_isolated_app(&ctx);
+    app.buffer = DocumentBuffer::from_str("Sample text\n");
+    app.buffer.selection_anchor = Some(0);
+    app.buffer.cursor_char = 6; // "Sample"
+    app.buffer.cache_current_selection();
+
+    for (tb, needle) in [
+        (ToolbarAction::ToggleBold, "**Sample**"),
+        (ToolbarAction::ToggleItalic, "***Sample***"),
+        (ToolbarAction::ToggleUnderline, "<u>"),
+        (ToolbarAction::ToggleStrike, "~~"),
+        (ToolbarAction::ToggleInlineCode, "`"),
+        (ToolbarAction::InsertInlineMath, "$"),
+    ] {
+        app.execute_context_menu_action(&ctx, ContextMenuAction::Dispatch(tb));
+        assert!(
+            app.buffer.as_string().contains(needle),
+            "expected '{needle}' in '{}'",
+            app.buffer.as_string()
+        );
+    }
+
+    // Headings H1..H6 & Normal Text
+    app.buffer = DocumentBuffer::from_str("Heading test\n");
+    app.buffer.set_cursor(0, false);
+    for level in 1u8..=6 {
+        app.execute_context_menu_action(
+            &ctx,
+            ContextMenuAction::Dispatch(ToolbarAction::SetHeading(Some(level))),
+        );
+        let expected_prefix = format!("{} ", "#".repeat(level as usize));
+        assert!(app.buffer.as_string().starts_with(&expected_prefix));
+    }
+    app.execute_context_menu_action(
+        &ctx,
+        ContextMenuAction::Dispatch(ToolbarAction::SetHeading(None)),
+    );
+    assert_eq!(app.buffer.as_string(), "Heading test\n");
+
+    // Lists, Blockquote, Indent, Outdent
+    for (kind, prefix) in [
+        (LineBlockKind::BulletList, "- "),
+        (LineBlockKind::NumberedList, "1. "),
+        (LineBlockKind::TaskList, "- [ ] "),
+        (LineBlockKind::BlockQuote, "> "),
+    ] {
+        app.buffer = DocumentBuffer::from_str("Item\n");
+        app.buffer.set_cursor(0, false);
+        app.execute_context_menu_action(
+            &ctx,
+            ContextMenuAction::Dispatch(ToolbarAction::ToggleBlock(kind)),
+        );
+        assert!(
+            app.buffer.as_string().starts_with(prefix),
+            "expected '{prefix}' for {kind:?}, got '{}'",
+            app.buffer.as_string()
+        );
+    }
+    app.execute_context_menu_action(&ctx, ContextMenuAction::Dispatch(ToolbarAction::Indent));
+    assert!(app.buffer.as_string().starts_with("<!-- indent:1 -->"));
+    app.execute_context_menu_action(&ctx, ContextMenuAction::Dispatch(ToolbarAction::Outdent));
+    assert!(!app.buffer.as_string().contains("indent:1"));
+
+    // Insert Code Block, Math, Mermaid, Table, Horizontal Rule, Link dialog
+    app.buffer = DocumentBuffer::from_str("Base\n");
+    app.buffer.set_cursor(5, false);
+    app.execute_context_menu_action(
+        &ctx,
+        ContextMenuAction::Dispatch(ToolbarAction::InsertCodeBlock),
+    );
+    assert!(app.buffer.as_string().contains("```rust"));
+
+    app.execute_context_menu_action(&ctx, ContextMenuAction::Dispatch(ToolbarAction::InsertMath));
+    assert!(app.buffer.as_string().contains("$$"));
+
+    app.execute_context_menu_action(
+        &ctx,
+        ContextMenuAction::Dispatch(ToolbarAction::InsertMermaid),
+    );
+    assert!(app.buffer.as_string().contains("```mermaid"));
+
+    app.execute_context_menu_action(
+        &ctx,
+        ContextMenuAction::Dispatch(ToolbarAction::InsertTable { rows: 3, cols: 3 }),
+    );
+    assert!(app.buffer.as_string().contains("| Column 1 |"));
+
+    app.execute_context_menu_action(
+        &ctx,
+        ContextMenuAction::Dispatch(ToolbarAction::InsertHorizontalRule),
+    );
+    assert!(app.buffer.as_string().contains("---"));
+
+    app.execute_context_menu_action(
+        &ctx,
+        ContextMenuAction::Dispatch(ToolbarAction::OpenLinkDialog),
+    );
+    assert!(app.insert_link_modal.open);
+}
+
+#[test]
+fn test_reader_context_menu_read_only_and_element_actions() {
+    use markdown_studio::ui::context_menu::{ContextMenuAction, ContextMenuTarget};
+
+    let ctx = egui::Context::default();
+    let (dir, mut app) = new_isolated_app(&ctx);
+
+    let img_path = dir.path().join("diagram.png");
+    image::RgbaImage::from_pixel(64, 48, image::Rgba([40, 140, 210, 255]))
+        .save(&img_path)
+        .unwrap();
+
+    let md = concat!(
+        "Paragraph alpha beta gamma with [Docs](https://example.com/docs).\n\n",
+        "![Diagram](diagram.png)\n\n",
+        "```rust\nfn demo() -> i32 { 42 }\n```\n\n",
+        "```math\nx^2 + 1\n```\n\n",
+        "```mermaid\ngraph TD;\n  A-->B;\n```\n\n",
+        "| Item | Price |\n| --- | --- |\n| Pen | 10 |\n| Total | =B1*2 |\n",
+    );
+    let doc_path = dir.path().join("reader_ctx.md");
+    std::fs::write(&doc_path, md).unwrap();
+    app.open_specific_file(&doc_path);
+    app.dispatch_action(&ctx, ToolbarAction::SetViewMode(ViewMode::Reader));
+
+    let mut t = 1.0_f64;
+    let out = ui_step(&ctx, &mut app, t, vec![]);
+
+    // 1. Drag-select text in Reader mode and right-click inside selection -> preserves selection
+    let para_shape = find_rendered_text_shapes(&out, "alpha beta gamma")
+        .into_iter()
+        .find(|(_, ts)| ts.pos.y > 110.0)
+        .expect("paragraph must render in Reader mode")
+        .1;
+    let drag_from = para_shape.pos + egui::vec2(4.0, 8.0);
+    let drag_to = para_shape.pos + egui::vec2(130.0, 8.0);
+    let _ = drag_select(&ctx, &mut app, &mut t, drag_from, drag_to);
+    let selected_before = app
+        .reader_state
+        .reader_selected_text
+        .clone()
+        .expect("dragging in Reader mode must select text");
+    assert!(!selected_before.is_empty());
+
+    let _ = right_click_at(&ctx, &mut app, &mut t, para_shape.pos + egui::vec2(55.0, 8.0));
+    assert!(app.context_menu.is_open());
+    assert_eq!(
+        app.reader_state.reader_selected_text.as_deref(),
+        Some(selected_before.as_str()),
+        "right-clicking inside Reader selection must preserve selection"
+    );
+
+    let reader_items = app.build_active_context_menu_items();
+    assert!(menu_contains_label(&reader_items, "Copy"));
+    assert!(menu_contains_label(&reader_items, "Copy as Plain Text"));
+    assert!(menu_contains_label(&reader_items, "Select All"));
+    assert!(menu_contains_label(&reader_items, "Find Selected Text"));
+    assert!(!menu_contains_label(&reader_items, "Cut"));
+    assert!(!menu_contains_label(&reader_items, "Paste"));
+    assert!(!menu_contains_label(&reader_items, "Formatting"));
+    assert!(!menu_contains_label(&reader_items, "Edit Table..."));
+    assert!(!menu_contains_label(&reader_items, "Recalculate Table"));
+
+    app.execute_context_menu_action(&ctx, ContextMenuAction::Copy);
+    assert_eq!(
+        app.last_copied_text.as_deref(),
+        Some(selected_before.as_str())
+    );
+    app.context_menu.close();
+
+    // 2. Link right-click -> Open Link & Copy Link Address
+    let link_pos = find_rendered_text(&out, "Docs", 0.0, 1280.0, 110.0);
+    let _ = right_click_at(&ctx, &mut app, &mut t, link_pos);
+    let link_items = app.build_active_context_menu_items();
+    assert!(menu_contains_label(&link_items, "Open Link"));
+    assert!(menu_contains_label(&link_items, "Copy Link Address"));
+    app.execute_context_menu_action(
+        &ctx,
+        ContextMenuAction::OpenLink("https://example.com/docs".to_string()),
+    );
+    assert_eq!(
+        app.last_opened_link.as_deref(),
+        Some("https://example.com/docs")
+    );
+    app.context_menu.close();
+
+    // 3. Image right-click -> View Image opens lightbox, Copy Image Address copies URL
+    let mut img_rect_opt = None;
+    for s in &out.shapes {
+        if let egui::Shape::Rect(r) = &s.shape
+            && r.fill_texture_id() != egui::TextureId::default()
+            && r.rect.min.y > 110.0
+            && r.rect.width() >= 40.0
+        {
+            img_rect_opt = Some(r.rect);
+            break;
+        }
+        if let egui::Shape::Vec(v) = &s.shape {
+            for sub in v {
+                if let egui::Shape::Rect(r) = sub
+                    && r.fill_texture_id() != egui::TextureId::default()
+                    && r.rect.min.y > 110.0
+                    && r.rect.width() >= 40.0
+                {
+                    img_rect_opt = Some(r.rect);
+                    break;
+                }
+            }
+        }
+    }
+    let img_rect = img_rect_opt.expect("Reader image must render");
+    let _ = right_click_at(&ctx, &mut app, &mut t, img_rect.center());
+    let img_items = app.build_active_context_menu_items();
+    assert!(menu_contains_label(&img_items, "View Image"));
+    assert!(menu_contains_label(&img_items, "Copy Image Address"));
+    if let Some(ContextMenuTarget::Reader {
+        image: Some(img_ctx),
+        ..
+    }) = app.context_menu.target.clone()
+    {
+        app.execute_context_menu_action(&ctx, ContextMenuAction::ViewImage(*img_ctx));
+        assert!(app.reader_state.image_lightbox.is_some());
+        app.reader_state.image_lightbox = None;
+    } else {
+        panic!("expected Reader image context");
+    }
+    app.context_menu.close();
+
+    // 4. Code block right-click -> Copy Code, Copy Code with Markdown Fences, Select Code Block
+    let code_pos = find_rendered_text_shapes(&out, "fn demo")
+        .into_iter()
+        .find_map(|(_, ts)| (ts.pos.y > 110.0).then_some(ts.pos + egui::vec2(20.0, 8.0)))
+        .expect("Rust code block must render");
+    let _ = right_click_at(&ctx, &mut app, &mut t, code_pos);
+    let code_items = app.build_active_context_menu_items();
+    assert!(menu_contains_label(&code_items, "Copy Code"));
+    assert!(menu_contains_label(&code_items, "Copy Code with Markdown Fences"));
+    assert!(menu_contains_label(&code_items, "Select Code Block"));
+    if let Some(ContextMenuTarget::Reader {
+        code_block: Some(cb),
+        ..
+    }) = app.context_menu.target.clone()
+    {
+        app.execute_context_menu_action(&ctx, ContextMenuAction::SelectCodeBlock(cb.source_lines));
+        assert_eq!(
+            app.reader_state.reader_selected_text.as_deref(),
+            Some("fn demo() -> i32 { 42 }")
+        );
+    } else {
+        panic!("expected Reader code block context");
+    }
+    app.context_menu.close();
+
+    // 5. Math and Mermaid blocks -> Copy Math Source & Copy Mermaid Source
+    let math_pos = find_rendered_text_shapes(&out, "MATH")
+        .into_iter()
+        .find_map(|(_, ts)| (ts.pos.y > 110.0).then_some(ts.pos + egui::vec2(10.0, 32.0)))
+        .expect("Math block must render");
+    let _ = right_click_at(&ctx, &mut app, &mut t, math_pos);
+    let math_items = app.build_active_context_menu_items();
+    assert!(menu_contains_label(&math_items, "Copy Math Source"));
+    app.context_menu.close();
+
+    let mmd_pos = find_rendered_text_shapes(&out, "MERMAID")
+        .into_iter()
+        .find_map(|(_, ts)| (ts.pos.y > 110.0).then_some(ts.pos + egui::vec2(10.0, 32.0)))
+        .expect("Mermaid block must render");
+    let _ = right_click_at(&ctx, &mut app, &mut t, mmd_pos);
+    let mmd_items = app.build_active_context_menu_items();
+    assert!(menu_contains_label(&mmd_items, "Copy Mermaid Source"));
+    app.context_menu.close();
+
+    // 6. Table right-click in Reader (read-only) vs Split (editable + recalculable)
+    app.reader_state.scroll_to_y = Some(420.0);
+    t += 0.02;
+    let _ = ui_step(&ctx, &mut app, t, vec![]);
+    t += 0.02;
+    let tbl_out_view = ui_step(&ctx, &mut app, t, vec![]);
+    let tbl_pos = find_rendered_text_shapes(&tbl_out_view, "Pen")
+        .into_iter()
+        .find_map(|(_, ts)| {
+            (ts.pos.y > 110.0 && ts.pos.y < 740.0).then_some(ts.pos + egui::vec2(8.0, 6.0))
+        })
+        .expect("Table must render");
+    let _ = right_click_at(&ctx, &mut app, &mut t, tbl_pos);
+    let tbl_reader_items = app.build_active_context_menu_items();
+    assert!(menu_contains_label(&tbl_reader_items, "Copy Table as Markdown"));
+    assert!(menu_contains_label(&tbl_reader_items, "Copy Table as TSV"));
+    assert!(!menu_contains_label(&tbl_reader_items, "Edit Table..."));
+    assert!(!menu_contains_label(&tbl_reader_items, "Recalculate Table"));
+    app.context_menu.close();
+
+    app.dispatch_action(&ctx, ToolbarAction::SetViewMode(ViewMode::Split));
+    app.reader_state.scroll_to_y = Some(420.0);
+    let _ = ui_step(&ctx, &mut app, t + 0.02, vec![]);
+    t += 0.02;
+    let split_out = ui_step(&ctx, &mut app, t + 0.02, vec![]);
+    t += 0.02;
+    let split_tbl_pos = find_rendered_text_shapes(&split_out, "Pen")
+        .into_iter()
+        .find_map(|(_, ts)| {
+            (ts.pos.x > 640.0 && ts.pos.y > 110.0 && ts.pos.y < 740.0)
+                .then_some(ts.pos + egui::vec2(8.0, 6.0))
+        })
+        .expect("Table must render in Split preview");
+    let _ = right_click_at(&ctx, &mut app, &mut t, split_tbl_pos);
+    let tbl_split_items = app.build_active_context_menu_items();
+    assert!(menu_contains_label(&tbl_split_items, "Edit Table..."));
+    assert!(menu_contains_label(&tbl_split_items, "Recalculate Table"));
+    if let Some(ContextMenuTarget::Reader {
+        table: Some(tbl_ctx),
+        ..
+    }) = app.context_menu.target.clone()
+    {
+        app.execute_context_menu_action(
+            &ctx,
+            ContextMenuAction::RecalculateTable(tbl_ctx.source_lines.clone()),
+        );
+        assert!(app.buffer.as_string().contains("20 <!-- =B1*2 -->"));
+        app.execute_context_menu_action(&ctx, ContextMenuAction::EditTable(tbl_ctx.source_lines));
+        assert!(app.table_modal.open);
+    } else {
+        panic!("expected Split preview table context");
+    }
+}
+
+#[test]
+fn test_tab_and_file_explorer_context_menus_and_workspace_security() {
+    use markdown_studio::ui::context_menu::{ContextMenuAction, ContextMenuTarget};
+
+    let ctx = egui::Context::default();
+    let (dir, mut app) = new_isolated_app(&ctx);
+
+    let file_a = dir.path().join("alpha.md");
+    let sub_dir = dir.path().join("sub");
+    std::fs::create_dir_all(&sub_dir).unwrap();
+    let file_b = sub_dir.join("beta.md");
+    let file_c = dir.path().join("gamma.md");
+    std::fs::write(&file_a, "# Alpha\n").unwrap();
+    std::fs::write(&file_b, "# Beta\n").unwrap();
+    std::fs::write(&file_c, "# Gamma\n").unwrap();
+
+    // Outside workspace file for boundary security test
+    let outside_dir = tempfile::tempdir().unwrap();
+    let outside_file = outside_dir.path().join("outside.md");
+    std::fs::write(&outside_file, "# Outside\n").unwrap();
+
+    app.open_specific_file(&file_a);
+    app.open_specific_file(&file_b);
+    app.open_specific_file(&file_c);
+    assert_eq!(app.tab_count(), 3);
+    app.explorer_state.set_root(dir.path().to_path_buf());
+    app.dispatch_action(&ctx, ToolbarAction::ToggleExplorer);
+
+    let mut t = 1.0_f64;
+    let out = ui_step(&ctx, &mut app, t, vec![]);
+
+    // 1. Right-click Tab 0 ("alpha.md") in tab strip (50 < y < 140)
+    let tab0_pos = find_rendered_text_shapes(&out, "alpha.md")
+        .into_iter()
+        .find_map(|(_, ts)| {
+            (ts.pos.y > 50.0 && ts.pos.y < 140.0).then_some(ts.pos + egui::vec2(14.0, 6.0))
+        })
+        .expect("alpha.md tab must render in tab bar");
+    let _ = right_click_at(&ctx, &mut app, &mut t, tab0_pos);
+    assert!(app.context_menu.is_open());
+    assert!(matches!(
+        app.context_menu.target,
+        Some(ContextMenuTarget::Tab { tab_idx: 0, .. })
+    ));
+    let tab_items = app.build_active_context_menu_items();
+    for required in [
+        "Close Tab",
+        "Close Other Tabs",
+        "Close Tabs to the Right",
+        "Save",
+        "Copy File Path",
+        "Reveal File in Explorer",
+    ] {
+        assert!(menu_contains_label(&tab_items, required), "missing {required}");
+    }
+
+    app.execute_context_menu_action(&ctx, ContextMenuAction::CopyFilePath(file_a.clone()));
+    assert_eq!(
+        app.last_copied_text.as_deref(),
+        Some(file_a.to_string_lossy().as_ref())
+    );
+    app.execute_context_menu_action(&ctx, ContextMenuAction::RevealInFileManager(file_a.clone()));
+    assert_eq!(app.last_revealed_path.as_deref(), Some(file_a.as_path()));
+    app.context_menu.close();
+
+    // Close Tabs to the Right of tab 1 -> closes tab 2 cleanly; Close Other Tabs leaves 1 tab
+    app.execute_context_menu_action(&ctx, ContextMenuAction::CloseTabsToRight(1));
+    assert_eq!(app.tab_count(), 2);
+    app.execute_context_menu_action(&ctx, ContextMenuAction::CloseOtherTabs(0));
+    assert_eq!(app.tab_count(), 1);
+
+    // 2. Right-click File Explorer item ("alpha.md") in left sidebar (y > 140)
+    let out_exp = ui_step(&ctx, &mut app, t + 0.02, vec![]);
+    t += 0.02;
+    let exp_alpha_pos = find_rendered_text_shapes(&out_exp, "alpha.md")
+        .into_iter()
+        .find_map(|(_, ts)| {
+            (ts.galley.text() == "alpha.md"
+                && ts.pos.y > 160.0
+                && ts.pos.y < 700.0
+                && ts.pos.x < 260.0)
+                .then_some(ts.pos + egui::vec2(12.0, 6.0))
+        })
+        .expect("alpha.md row must render in Explorer");
+    let _ = right_click_at(&ctx, &mut app, &mut t, exp_alpha_pos);
+    assert!(app.context_menu.is_open());
+    assert!(matches!(
+        app.context_menu.target,
+        Some(ContextMenuTarget::Explorer { is_dir: false, .. })
+    ));
+    let exp_items = app.build_active_context_menu_items();
+    for required in [
+        "Open File",
+        "Open in New Tab",
+        "Copy File Path",
+        "Copy Relative Path",
+        "Reveal in OS File Manager",
+        "Rename...",
+        "Delete...",
+        "Refresh Folder",
+    ] {
+        assert!(menu_contains_label(&exp_items, required), "missing {required}");
+    }
+    app.context_menu.close();
+
+    // Open in New Tab + Copy Relative Path
+    app.execute_context_menu_action(&ctx, ContextMenuAction::ExplorerOpenInNewTab(file_b.clone()));
+    assert_eq!(app.tab_count(), 2);
+    app.execute_context_menu_action(
+        &ctx,
+        ContextMenuAction::ExplorerCopyRelativePath(file_b.clone()),
+    );
+    assert_eq!(app.last_copied_text.as_deref(), Some("sub/beta.md"));
+
+    // Workspace security: reject rename/delete outside root
+    app.execute_context_menu_action(
+        &ctx,
+        ContextMenuAction::ExplorerStartRename(outside_file.clone()),
+    );
+    assert!(!app.explorer_rename_modal.open);
+    app.execute_context_menu_action(
+        &ctx,
+        ContextMenuAction::ExplorerRequestDelete(outside_file.clone()),
+    );
+    assert!(!app.explorer_delete_modal.open);
+    assert!(outside_file.exists());
+
+    // Rename beta.md -> delta.md via modal and verify disk + active tab updated
+    app.execute_context_menu_action(&ctx, ContextMenuAction::ExplorerStartRename(file_b.clone()));
+    assert!(app.explorer_rename_modal.open);
+    app.explorer_rename_modal.draft = "delta.md".to_string();
+    let _ = press_key(&ctx, &mut app, &mut t, Key::Enter, Modifiers::NONE);
+    let rename_out = ui_step(&ctx, &mut app, t + 0.02, vec![]);
+    t += 0.02;
+    let rename_btn = find_rendered_text_shapes(&rename_out, "Rename")
+        .into_iter()
+        .find_map(|(_, ts)| (ts.pos.y > 200.0).then_some(ts.pos + egui::vec2(12.0, 6.0)))
+        .expect("Rename modal button must render");
+    let _ = click_at(&ctx, &mut app, &mut t, rename_btn, Modifiers::NONE);
+    let renamed_file = sub_dir.join("delta.md");
+    assert!(renamed_file.exists(), "renamed file must exist on disk");
+    assert!(!file_b.exists(), "old file name must be gone");
+    assert_eq!(
+        app.buffer.file_path.as_deref(),
+        Some(renamed_file.as_path())
+    );
+
+    // Delete with confirmation: Cancel keeps file, Delete removes file
+    app.execute_context_menu_action(
+        &ctx,
+        ContextMenuAction::ExplorerRequestDelete(renamed_file.clone()),
+    );
+    assert!(app.explorer_delete_modal.open);
+    let _ = press_key(&ctx, &mut app, &mut t, Key::Escape, Modifiers::NONE);
+    assert!(!app.explorer_delete_modal.open);
+    assert!(renamed_file.exists(), "Cancel/Esc must keep file intact");
+
+    app.execute_context_menu_action(
+        &ctx,
+        ContextMenuAction::ExplorerRequestDelete(renamed_file.clone()),
+    );
+    let del_out = ui_step(&ctx, &mut app, t + 0.02, vec![]);
+    t += 0.02;
+    let del_btn = find_rendered_text_shapes(&del_out, "Delete")
+        .into_iter()
+        .rfind(|(_, ts)| ts.pos.y > 200.0 && ts.galley.text().trim() == "Delete")
+        .map(|(_, ts)| ts.pos + egui::vec2(12.0, 6.0))
+        .expect("Delete confirmation button must render");
+    let _ = click_at(&ctx, &mut app, &mut t, del_btn, Modifiers::NONE);
+    assert!(!renamed_file.exists(), "Confirming delete must remove file");
+}
+
+#[test]
+fn test_context_menu_themes_arabic_rtl_keyboard_nav_dismissal_and_shortcuts() {
+    use markdown_studio::ui::theme::ThemeMode;
+
+    let ctx = egui::Context::default();
+    let (_dir, mut app) = new_isolated_app(&ctx);
+    app.buffer = DocumentBuffer::from_str("مرحبا بالعالم الجميل\nسطر ثاني للمعاينة\n");
+    app.dispatch_action(&ctx, ToolbarAction::SetViewMode(ViewMode::Source));
+
+    let mut t = 1.0_f64;
+    let _ = ui_step(&ctx, &mut app, t, vec![]);
+
+    // Select Arabic word "بالعالم" (chars 6..13) and right-click near bottom-right edge
+    app.buffer.selection_anchor = Some(6);
+    app.buffer.cursor_char = 13;
+    app.buffer.cache_current_selection();
+
+    for mode in [ThemeMode::Light, ThemeMode::Sepia, ThemeMode::Dark] {
+        app.dispatch_action(&ctx, ToolbarAction::SetThemeMode(mode));
+        app.context_menu.open_at(
+            Pos2::new(1240.0, 760.0),
+            markdown_studio::ui::context_menu::ContextMenuTarget::Editor {
+                from_wysiwyg: false,
+                has_selection: true,
+                selected_text: Some(app.buffer.selected_text()),
+                link_url: None,
+                cursor_line: 0,
+            },
+            ctx.cumulative_pass_nr(),
+        );
+        let _ = ui_step(&ctx, &mut app, t + 0.02, vec![]);
+        t += 0.02;
+        let theme_out = ui_step(&ctx, &mut app, t + 0.02, vec![]);
+        t += 0.02;
+        assert!(app.context_menu.is_open());
+        assert!(!find_rendered_text_shapes(&theme_out, "Undo").is_empty());
+        assert!(!find_rendered_text_shapes(&theme_out, "Formatting").is_empty());
+        for rect in &app.context_menu.panel_rects {
+            assert!(
+                rect.right() <= 1280.0 && rect.bottom() <= 800.0 && rect.left() >= 0.0 && rect.top() >= 0.0,
+                "menu panel must stay inside viewport bounds for {mode:?}: {rect:?}"
+            );
+        }
+        app.context_menu.close();
+    }
+
+    // Arabic Find Selected Text
+    app.execute_context_menu_action(
+        &ctx,
+        markdown_studio::ui::context_menu::ContextMenuAction::FindSelectedText(
+            "بالعالم".to_string(),
+        ),
+    );
+    assert!(app.find_bar.open);
+    assert_eq!(app.find_bar.query, "بالعالم");
+    assert_eq!(app.find_bar.matches.len(), 1);
+    app.find_bar.open = false;
+
+    // Keyboard navigation: ArrowUp wraps to "Formatting", ArrowRight opens submenu,
+    // ArrowLeft closes submenu, ArrowDown/Enter executes, Escape closes root menu
+    app.context_menu.open_at(
+        Pos2::new(300.0, 200.0),
+        markdown_studio::ui::context_menu::ContextMenuTarget::Editor {
+            from_wysiwyg: false,
+            has_selection: true,
+            selected_text: Some("بالعالم".to_string()),
+            link_url: None,
+            cursor_line: 0,
+        },
+        ctx.cumulative_pass_nr(),
+    );
+    let _ = ui_step(&ctx, &mut app, t + 0.02, vec![]);
+    t += 0.02;
+
+    // ArrowUp selects last enabled item ("Formatting" submenu)
+    let _ = press_key(&ctx, &mut app, &mut t, Key::ArrowUp, Modifiers::NONE);
+    assert_eq!(app.context_menu.focus_path.len(), 1);
+    // ArrowRight opens "Formatting" submenu and focuses "Bold"
+    let _ = press_key(&ctx, &mut app, &mut t, Key::ArrowRight, Modifiers::NONE);
+    assert_eq!(app.context_menu.open_submenu_path.len(), 1);
+    // ArrowLeft closes "Formatting" submenu
+    let _ = press_key(&ctx, &mut app, &mut t, Key::ArrowLeft, Modifiers::NONE);
+    assert!(app.context_menu.open_submenu_path.is_empty());
+    // Re-open "Formatting" and press Enter on Bold -> wraps Arabic selection in **...**
+    let _ = press_key(&ctx, &mut app, &mut t, Key::ArrowRight, Modifiers::NONE);
+    let _ = press_key(&ctx, &mut app, &mut t, Key::Enter, Modifiers::NONE);
+    assert!(!app.context_menu.is_open(), "Enter must close menu after executing action");
+    assert!(
+        app.buffer.as_string().contains("**بالعالم**"),
+        "expected bold Arabic text via keyboard submenu navigation, got: {}",
+        app.buffer.as_string()
+    );
+
+    // Escape & outside-click dismissal
+    app.context_menu.open_at(
+        Pos2::new(300.0, 200.0),
+        markdown_studio::ui::context_menu::ContextMenuTarget::Editor {
+            from_wysiwyg: false,
+            has_selection: false,
+            selected_text: None,
+            link_url: None,
+            cursor_line: 0,
+        },
+        ctx.cumulative_pass_nr(),
+    );
+    let _ = ui_step(&ctx, &mut app, t + 0.02, vec![]);
+    t += 0.02;
+    let _ = press_key(&ctx, &mut app, &mut t, Key::Escape, Modifiers::NONE);
+    assert!(!app.context_menu.is_open(), "Escape must dismiss context menu");
+
+    app.context_menu.open_at(
+        Pos2::new(300.0, 200.0),
+        markdown_studio::ui::context_menu::ContextMenuTarget::Editor {
+            from_wysiwyg: false,
+            has_selection: false,
+            selected_text: None,
+            link_url: None,
+            cursor_line: 0,
+        },
+        ctx.cumulative_pass_nr(),
+    );
+    let _ = ui_step(&ctx, &mut app, t + 0.02, vec![]);
+    t += 0.02;
+    let _ = click_at(&ctx, &mut app, &mut t, Pos2::new(50.0, 750.0), Modifiers::NONE);
+    assert!(
+        !app.context_menu.is_open(),
+        "clicking outside menu panel must dismiss context menu"
+    );
+
+    // Existing keyboard shortcuts (Ctrl+Z undo, Ctrl+F find) still work after dismissal
+    let _ = press_key(&ctx, &mut app, &mut t, Key::Z, Modifiers::COMMAND);
+    assert!(!app.buffer.as_string().contains("**بالعالم**"));
+    let _ = press_key(&ctx, &mut app, &mut t, Key::F, Modifiers::COMMAND);
+    assert!(app.find_bar.open);
+}

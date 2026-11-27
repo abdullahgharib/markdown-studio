@@ -1,4 +1,5 @@
 pub mod autoscroll;
+pub mod context_menu;
 pub mod dialogs;
 pub mod editor;
 pub mod explorer;
@@ -35,10 +36,15 @@ use crate::document::{DiskFileStamp, DocumentBuffer, UndoRedoOutcome};
 use crate::export::ir::{runs_to_plain_text, DocBlock};
 use crate::export::{BackgroundExporter, ExportTarget};
 use crate::ui::autoscroll::{AutoScrollState, AutoScrollTarget};
+use crate::ui::context_menu::{
+    build_editor_menu, build_explorer_menu, build_reader_menu, build_tab_menu,
+    is_path_within_workspace, markdown_to_plain_text, path_relative_to, reveal_in_file_manager,
+    ContextMenuAction, ContextMenuItem, ContextMenuState, ContextMenuTarget,
+};
 use crate::ui::dialogs::{
-    render_status_bar, ExternalDiffChoice, ExternalDiffModal, FindReplaceBar, InsertLinkModal,
-    PendingDiscardAction, PrintDialogModal, StatusBarGoalState, TableEditorModal,
-    UnsavedChangesModal, UnsavedPromptChoice,
+    render_status_bar, ExplorerDeleteConfirmModal, ExplorerRenameModal, ExternalDiffChoice,
+    ExternalDiffModal, FindReplaceBar, InsertLinkModal, PendingDiscardAction, PrintDialogModal,
+    StatusBarGoalState, TableEditorModal, UnsavedChangesModal, UnsavedPromptChoice,
 };
 use crate::ui::editor::{render_virtual_editor, EditorAction, VirtualEditorState};
 use crate::ui::explorer::{render_explorer_panel, ExplorerAction, FileExplorerState};
@@ -46,7 +52,7 @@ use crate::ui::os_integration::OsIntegrationModal;
 use crate::ui::reader::{
     activate_wysiwyg_at_line, activate_wysiwyg_code_block_range,
     activate_wysiwyg_preserving_selection, classify_link_url, heading_slug, render_virtual_reader,
-    LinkTarget, ReaderAction, VirtualReaderState,
+    ImageLightboxState, LinkTarget, ReaderAction, ReaderTextPos, VirtualReaderState,
 };
 use crate::ui::settings::AppSettings;
 use crate::ui::tabs::{
@@ -157,6 +163,13 @@ pub struct MarkdownApp {
     pub print_modal: PrintDialogModal,
     pub os_modal: OsIntegrationModal,
     pub external_diff_modal: ExternalDiffModal,
+    pub explorer_rename_modal: ExplorerRenameModal,
+    pub explorer_delete_modal: ExplorerDeleteConfirmModal,
+    pub context_menu: ContextMenuState,
+    pub last_copied_text: Option<String>,
+    pub last_revealed_path: Option<PathBuf>,
+    pub test_clipboard_text: Option<String>,
+    pub test_clipboard_html: Option<String>,
     pub goal_state: StatusBarGoalState,
     pub allow_close_now: bool,
     pub outline_open: bool,
@@ -488,6 +501,13 @@ impl MarkdownApp {
             print_modal: PrintDialogModal::default(),
             os_modal: OsIntegrationModal::default(),
             external_diff_modal: ExternalDiffModal::default(),
+            explorer_rename_modal: ExplorerRenameModal::default(),
+            explorer_delete_modal: ExplorerDeleteConfirmModal::default(),
+            context_menu: ContextMenuState::default(),
+            last_copied_text: None,
+            last_revealed_path: None,
+            test_clipboard_text: None,
+            test_clipboard_html: None,
             goal_state: StatusBarGoalState::default(),
             allow_close_now: false,
         }
@@ -756,6 +776,7 @@ impl MarkdownApp {
             return;
         };
         self.toolbar_state.renaming_file = false;
+        self.context_menu.close();
         self.reader_state.image_lightbox = None;
         let old_idx = self.active_tab;
         let outgoing = self.swap_active_with_state(*incoming);
@@ -1193,7 +1214,9 @@ impl MarkdownApp {
         self.reader_state.scroll_to_y = Some(0.0);
         self.reader_state.smooth_scroll_target_y = None;
         self.reader_state.highlight_block_lines = None;
+        self.reader_state.clear_reader_selection();
         self.reader_state.base_dir = self.current_base_dir();
+        self.context_menu.close();
         self.last_split_top_row = 0;
         self.find_bar.reset_for_new_document();
         self.last_parsed_version = 0;
@@ -1641,6 +1664,13 @@ impl MarkdownApp {
             PendingDiscardAction::OpenFile => self.execute_open_file(),
             PendingDiscardAction::OpenSpecificFile(path) => self.open_specific_file(&path),
             PendingDiscardAction::CloseTab(idx) => self.close_tab_discard(ctx, idx),
+            PendingDiscardAction::CloseTabs(ids) => {
+                for id in ids {
+                    if let Some(idx) = self.tabs.iter().position(|t| t.id == id) {
+                        self.close_tab_discard(ctx, idx);
+                    }
+                }
+            }
             PendingDiscardAction::CloseWindow => {
                 if self.pending_zoom_save_at.take().is_some() {
                     self.persist_settings();
@@ -1654,12 +1684,15 @@ impl MarkdownApp {
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) -> ToolbarAction {
         if self.toolbar_state.renaming_file
+            || self.context_menu.is_open()
             || self.table_modal.open
             || self.unsaved_modal.is_open()
             || self.print_modal.open
             || self.insert_link_modal.open
             || self.os_modal.open
             || self.external_diff_modal.open
+            || self.explorer_rename_modal.open
+            || self.explorer_delete_modal.open
         {
             return ToolbarAction::None;
         }
@@ -2260,6 +2293,7 @@ impl MarkdownApp {
             }
             ToolbarAction::SetViewMode(mode) => {
                 self.autoscroll.cancel();
+                self.context_menu.close();
                 self.reader_state.smooth_scroll_target_y = None;
                 self.view_mode = mode;
                 self.settings.view_mode = mode;
@@ -2317,6 +2351,7 @@ impl MarkdownApp {
         let mut pending_open: Option<PathBuf> = None;
         let mut pending_root: Option<PathBuf> = None;
         let mut pick_folder = false;
+        let mut pending_ctx_menu: Option<(egui::Pos2, ContextMenuTarget)> = None;
 
         egui::SidePanel::left("document_outline_panel")
             .resizable(true)
@@ -2399,6 +2434,21 @@ impl MarkdownApp {
                             ExplorerAction::OpenFile(path) => pending_open = Some(path),
                             ExplorerAction::SetRoot(root) => pending_root = Some(root),
                             ExplorerAction::OpenFolderDialog => pick_folder = true,
+                            ExplorerAction::ContextMenu {
+                                path,
+                                is_dir,
+                                is_root_empty_area,
+                                pos,
+                            } => {
+                                pending_ctx_menu = Some((
+                                    pos,
+                                    ContextMenuTarget::Explorer {
+                                        path,
+                                        is_dir,
+                                        is_root_empty_area,
+                                    },
+                                ));
+                            }
                         }
                     }
                     SidebarTab::Outline => {
@@ -2420,6 +2470,10 @@ impl MarkdownApp {
         if let Some(path) = pending_open {
             self.open_specific_file(&path);
             ctx.request_repaint();
+        }
+        if let Some((pos, target)) = pending_ctx_menu {
+            self.context_menu
+                .open_at(pos, target, ctx.cumulative_pass_nr());
         }
     }
 
@@ -2786,6 +2840,12 @@ impl MarkdownApp {
 
     pub fn update_ui(&mut self, ctx: &egui::Context) {
         self.buffer.poll_dirty_check();
+        if self.context_menu.is_open() {
+            let items = self.build_active_context_menu_items();
+            if let Some(act) = self.context_menu.process_open_input(ctx, &items) {
+                self.execute_context_menu_action(ctx, act);
+            }
+        }
         let mut incoming_msgs = Vec::new();
         if let Some(rx) = &self.instance_rx {
             while let Ok(msg) = rx.try_recv() {
@@ -3067,7 +3127,9 @@ impl MarkdownApp {
             || self.print_modal.open
             || self.insert_link_modal.open
             || self.os_modal.open
-            || self.external_diff_modal.open;
+            || self.external_diff_modal.open
+            || self.explorer_rename_modal.open
+            || self.explorer_delete_modal.open;
         if !modal_before_toolbar {
             let mut zoom_delta = 0.0_f32;
             let mut pinch_factor = 1.0_f32;
@@ -3131,6 +3193,7 @@ impl MarkdownApp {
         }
 
         let paste_image_hotkey = !modal_before_toolbar
+            && !self.context_menu.is_open()
             && self.view_mode != ViewMode::Reader
             && !self.toolbar_state.renaming_file
             && !self.find_bar.has_input_focus(ctx)
@@ -3336,6 +3399,27 @@ impl MarkdownApp {
                     self.reorder_tab(from, to);
                     ctx.request_repaint();
                 }
+                TabBarAction::ContextMenu { idx, pos } => {
+                    if idx < self.tabs.len() {
+                        let (file_path, dirty) = if idx == self.active_tab {
+                            (self.buffer.file_path.clone(), self.buffer.dirty)
+                        } else if let Some(ref st) = self.tabs[idx].state {
+                            (st.buffer.file_path.clone(), st.buffer.dirty)
+                        } else {
+                            (None, false)
+                        };
+                        self.context_menu.open_at(
+                            pos,
+                            ContextMenuTarget::Tab {
+                                tab_idx: idx,
+                                tab_count: self.tabs.len(),
+                                file_path,
+                                dirty,
+                            },
+                            ctx.cumulative_pass_nr(),
+                        );
+                    }
+                }
             }
             if self.tab_bar_state.dragging_tab_idx.is_none() {
                 self.cached_peer_windows = None;
@@ -3367,13 +3451,20 @@ impl MarkdownApp {
             || self.print_modal.open
             || self.insert_link_modal.open
             || self.os_modal.open
-            || self.external_diff_modal.open;
-        if self.reader_state.image_lightbox.is_some()
+            || self.external_diff_modal.open
+            || self.explorer_rename_modal.open
+            || self.explorer_delete_modal.open;
+        if !self.context_menu.is_open()
+            && self.reader_state.image_lightbox.is_some()
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape))
         {
             self.reader_state.image_lightbox = None;
             ctx.request_repaint();
-        } else if !modal_open_now && !self.autoscroll.active && self.find_bar.open {
+        } else if !self.context_menu.is_open()
+            && !modal_open_now
+            && !self.autoscroll.active
+            && self.find_bar.open
+        {
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
                 self.find_bar.open = false;
                 self.refocus_active_editor();
@@ -3617,7 +3708,7 @@ impl MarkdownApp {
         self.render_left_sidebar(ctx);
 
         // Propagate live Find & Replace highlight ranges into editor & reader states in O(1) Arc clone
-        self.reader_state.modal_open = modal_open_now;
+        self.reader_state.modal_open = modal_open_now || self.context_menu.is_open();
         self.reader_state.search_whole_word = self.find_bar.whole_word;
         self.reader_state.base_dir = self.current_base_dir();
         self.reader_state.auto_calc_math = self.settings.auto_calc_math;
@@ -3674,7 +3765,7 @@ impl MarkdownApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(self.theme.desk_bg))
             .show(ctx, |ui| {
-                let block_shortcuts = modal_open_now;
+                let block_shortcuts = modal_open_now || self.context_menu.is_open();
                 match self.view_mode {
                     ViewMode::Source => {
                         let ed_action = render_virtual_editor(
@@ -3684,9 +3775,7 @@ impl MarkdownApp {
                             &mut self.editor_state,
                             block_shortcuts,
                         );
-                        if let EditorAction::OpenLink(url) = ed_action {
-                            self.open_link_target(ctx, &url);
-                        }
+                        self.handle_editor_action(ctx, ed_action);
                     }
                     ViewMode::Reader => {
                         let action = render_virtual_reader(
@@ -3736,9 +3825,7 @@ impl MarkdownApp {
                                         &mut self.editor_state,
                                         block_shortcuts,
                                     );
-                                    if let EditorAction::OpenLink(url) = ed_action {
-                                        self.open_link_target(ctx, &url);
-                                    }
+                                    self.handle_editor_action(ctx, ed_action);
                                     self.sync_ast_if_needed();
                                     let top_row = self.editor_state.last_visible_rows.start;
                                     if self.settings.sync_scroll
@@ -3855,34 +3942,65 @@ impl MarkdownApp {
             match choice {
                 UnsavedPromptChoice::Save => {
                     if self.save_current_document() {
-                        if matches!(pending, PendingDiscardAction::CloseWindow) {
+                        match pending {
+                            PendingDiscardAction::CloseWindow => {
+                                if let Some(dirty_idx) = self.first_dirty_tab_index() {
+                                    self.switch_to_tab(dirty_idx);
+                                    self.unsaved_modal.open(PendingDiscardAction::CloseWindow);
+                                } else {
+                                    self.apply_pending_discard_action(ctx, pending);
+                                }
+                            }
+                            PendingDiscardAction::CloseTabs(mut ids) => {
+                                let cur_id = self.tabs.get(self.active_tab).map(|t| t.id);
+                                if let Some(cid) = cur_id {
+                                    ids.retain(|&id| id != cid);
+                                }
+                                let cur_idx = self.active_tab;
+                                self.close_tab_discard(ctx, cur_idx);
+                                self.continue_close_tabs_queue(ctx, ids);
+                            }
+                            other => {
+                                self.apply_pending_discard_action(ctx, other);
+                            }
+                        }
+                    }
+                }
+                UnsavedPromptChoice::DontSave => {
+                    match pending {
+                        PendingDiscardAction::CloseWindow if self.tabs.len() > 1 => {
+                            let cur = self.active_tab;
+                            self.close_tab_discard(ctx, cur);
                             if let Some(dirty_idx) = self.first_dirty_tab_index() {
                                 self.switch_to_tab(dirty_idx);
                                 self.unsaved_modal.open(PendingDiscardAction::CloseWindow);
                             } else {
                                 self.apply_pending_discard_action(ctx, pending);
                             }
-                        } else {
-                            self.apply_pending_discard_action(ctx, pending);
                         }
-                    }
-                }
-                UnsavedPromptChoice::DontSave => {
-                    if matches!(pending, PendingDiscardAction::CloseWindow) && self.tabs.len() > 1 {
-                        let cur = self.active_tab;
-                        self.close_tab_discard(ctx, cur);
-                        if let Some(dirty_idx) = self.first_dirty_tab_index() {
-                            self.switch_to_tab(dirty_idx);
-                            self.unsaved_modal.open(PendingDiscardAction::CloseWindow);
-                        } else {
-                            self.apply_pending_discard_action(ctx, pending);
+                        PendingDiscardAction::CloseTabs(mut ids) => {
+                            let cur_id = self.tabs.get(self.active_tab).map(|t| t.id);
+                            if let Some(cid) = cur_id {
+                                ids.retain(|&id| id != cid);
+                            }
+                            let cur_idx = self.active_tab;
+                            self.close_tab_discard(ctx, cur_idx);
+                            self.continue_close_tabs_queue(ctx, ids);
                         }
-                    } else {
-                        self.apply_pending_discard_action(ctx, pending);
+                        other => {
+                            self.apply_pending_discard_action(ctx, other);
+                        }
                     }
                 }
                 UnsavedPromptChoice::Cancel => {}
             }
+        }
+
+        if let Some((old_path, new_name)) = self.explorer_rename_modal.show(ctx, &self.theme) {
+            self.execute_explorer_rename(&old_path, &new_name);
+        }
+        if let Some(target_path) = self.explorer_delete_modal.show(ctx, &self.theme) {
+            self.execute_explorer_delete(&target_path);
         }
 
         if let Some(print_opts) = self.print_modal.show(ctx, &self.theme) {
@@ -3912,6 +4030,13 @@ impl MarkdownApp {
                     self.refresh_disk_stamp();
                     self.exporter.status_text = "Kept local unsaved edits".to_string();
                 }
+            }
+        }
+
+        if self.context_menu.is_open() {
+            let items = self.build_active_context_menu_items();
+            if let Some(act) = self.context_menu.render_panels(ctx, &self.theme, &items) {
+                self.execute_context_menu_action(ctx, act);
             }
         }
     }
@@ -4153,6 +4278,655 @@ impl MarkdownApp {
             }
             ReaderAction::OpenLink(url) => {
                 self.open_link_target(ctx, &url);
+            }
+            ReaderAction::OpenContextMenu { pos, target } => {
+                self.context_menu
+                    .open_at(pos, target, ctx.cumulative_pass_nr());
+            }
+        }
+    }
+
+    fn handle_editor_action(&mut self, ctx: &egui::Context, action: EditorAction) {
+        match action {
+            EditorAction::None => {}
+            EditorAction::OpenLink(url) => {
+                self.open_link_target(ctx, &url);
+            }
+            EditorAction::OpenContextMenu {
+                pos,
+                link_url,
+                cursor_line,
+            } => {
+                let sel = self
+                    .buffer
+                    .selection_range()
+                    .map(|_| self.buffer.selected_text());
+                self.context_menu.open_at(
+                    pos,
+                    ContextMenuTarget::Editor {
+                        from_wysiwyg: false,
+                        has_selection: sel.is_some(),
+                        selected_text: sel,
+                        link_url,
+                        cursor_line,
+                    },
+                    ctx.cumulative_pass_nr(),
+                );
+            }
+        }
+    }
+
+    /// Builds the context menu item hierarchy for the currently open `ContextMenuTarget`.
+    pub fn build_active_context_menu_items(&self) -> Vec<ContextMenuItem<ContextMenuAction>> {
+        let Some(ref target) = self.context_menu.target else {
+            return Vec::new();
+        };
+        match target {
+            ContextMenuTarget::Editor {
+                has_selection,
+                selected_text,
+                link_url,
+                ..
+            } => {
+                let active_fmt = query_active_format(&self.buffer);
+                build_editor_menu(
+                    self.buffer.undo_depth() > 0,
+                    self.buffer.redo_depth() > 0,
+                    *has_selection || self.buffer.selection_range().is_some(),
+                    selected_text.as_deref(),
+                    !self.buffer.is_empty(),
+                    &active_fmt,
+                    link_url.as_deref(),
+                )
+            }
+            ContextMenuTarget::Reader { .. } => build_reader_menu(target, !self.buffer.is_empty()),
+            ContextMenuTarget::Tab {
+                tab_idx,
+                tab_count,
+                file_path,
+                dirty,
+            } => build_tab_menu(*tab_idx, *tab_count, file_path.as_deref(), *dirty),
+            ContextMenuTarget::Explorer {
+                path,
+                is_dir,
+                is_root_empty_area,
+            } => build_explorer_menu(
+                path,
+                self.explorer_state.root_dir.as_deref(),
+                *is_dir,
+                *is_root_empty_area,
+            ),
+        }
+    }
+
+    /// Executes a chosen context menu action cleanly through existing document/app handlers.
+    pub fn execute_context_menu_action(
+        &mut self,
+        ctx: &egui::Context,
+        action: ContextMenuAction,
+    ) {
+        let read_only = self.view_mode == ViewMode::Reader;
+        match action {
+            ContextMenuAction::Undo => {
+                self.dispatch_action(ctx, ToolbarAction::Undo);
+            }
+            ContextMenuAction::Redo => {
+                self.dispatch_action(ctx, ToolbarAction::Redo);
+            }
+            ContextMenuAction::Dispatch(tb_action) => {
+                self.dispatch_action(ctx, tb_action);
+            }
+            ContextMenuAction::Cut => {
+                if read_only {
+                    self.exporter.status_text = "Reader mode is read-only".to_string();
+                    return;
+                }
+                self.buffer.restore_cached_selection();
+                if let Some(sel) = self.buffer.selection_range() {
+                    let selected = self.buffer.selected_text();
+                    ctx.copy_text(selected.clone());
+                    self.last_copied_text = Some(selected);
+                    self.buffer.remove(sel.clone());
+                    self.buffer.set_cursor(sel.start, false);
+                    self.sync_ast_if_needed();
+                    self.sync_wysiwyg_after_buffer_edit();
+                    self.exporter.status_text = "Cut selection".to_string();
+                }
+            }
+            ContextMenuAction::Copy => {
+                if read_only {
+                    if let Some(txt) = self.reader_state.reader_selected_text.clone()
+                        && !txt.is_empty()
+                    {
+                        ctx.copy_text(txt.clone());
+                        self.last_copied_text = Some(txt);
+                        self.exporter.status_text = "Copied selection".to_string();
+                    }
+                } else {
+                    self.buffer.restore_cached_selection();
+                    if self.buffer.selection_range().is_some() {
+                        let txt = self.buffer.selected_text();
+                        ctx.copy_text(txt.clone());
+                        self.last_copied_text = Some(txt);
+                        self.exporter.status_text = "Copied selection".to_string();
+                    } else if let Some(txt) = self.reader_state.reader_selected_text.clone()
+                        && !txt.is_empty()
+                    {
+                        ctx.copy_text(txt.clone());
+                        self.last_copied_text = Some(txt);
+                        self.exporter.status_text = "Copied selection".to_string();
+                    }
+                }
+            }
+            ContextMenuAction::CopyAsPlainText => {
+                let raw_sel = if read_only {
+                    self.reader_state.reader_selected_text.clone()
+                } else {
+                    self.buffer.restore_cached_selection();
+                    if self.buffer.selection_range().is_some() {
+                        Some(self.buffer.selected_text())
+                    } else {
+                        self.reader_state.reader_selected_text.clone()
+                    }
+                };
+                if let Some(raw) = raw_sel
+                    && !raw.is_empty()
+                {
+                    let plain = markdown_to_plain_text(&raw);
+                    ctx.copy_text(plain.clone());
+                    self.last_copied_text = Some(plain);
+                    self.exporter.status_text = "Copied as plain text".to_string();
+                }
+            }
+            ContextMenuAction::Paste | ContextMenuAction::PasteAsPlainText => {
+                if read_only {
+                    self.exporter.status_text = "Reader mode is read-only".to_string();
+                    return;
+                }
+                let plain_paste = matches!(action, ContextMenuAction::PasteAsPlainText);
+                let text_opt = self
+                    .test_clipboard_text
+                    .clone()
+                    .or_else(crate::document::clipboard::read_os_clipboard_plain_text);
+                if let Some(raw) = text_opt {
+                    if !raw.is_empty() {
+                        let converted = if plain_paste {
+                            raw
+                        } else {
+                            let html = self.test_clipboard_html.clone().or_else(|| {
+                                crate::document::clipboard::read_os_clipboard_html_matching(&raw)
+                            });
+                            crate::document::clipboard::smart_paste_markdown(&raw, html.as_deref())
+                        };
+                        self.buffer.restore_cached_selection();
+                        if let Some(sel) = self.buffer.selection_range() {
+                            let start = sel.start;
+                            self.buffer.replace_range(sel, &converted);
+                            self.buffer
+                                .set_cursor(start + converted.chars().count(), false);
+                        } else {
+                            let pos = self.buffer.cursor_char;
+                            self.buffer.insert(pos, &converted);
+                            self.buffer
+                                .set_cursor(pos + converted.chars().count(), false);
+                        }
+                        self.sync_ast_if_needed();
+                        self.sync_wysiwyg_after_buffer_edit();
+                        self.exporter.status_text = if plain_paste {
+                            "Pasted as plain text".to_string()
+                        } else {
+                            "Pasted from clipboard".to_string()
+                        };
+                    }
+                } else if !plain_paste
+                    && let Some(png_bytes) =
+                        crate::document::clipboard::read_os_clipboard_image_png()
+                {
+                    let _ = self.paste_image_png_bytes(&png_bytes);
+                    self.sync_ast_if_needed();
+                    self.sync_wysiwyg_after_buffer_edit();
+                }
+            }
+            ContextMenuAction::SelectAll => {
+                let from_reader = read_only
+                    || matches!(self.context_menu.target, Some(ContextMenuTarget::Reader { .. }));
+                if from_reader {
+                    let plain = markdown_to_plain_text(&self.buffer.as_string());
+                    self.reader_state.reader_sel_all = true;
+                    self.reader_state.reader_sel_anchor = None;
+                    self.reader_state.reader_sel_focus = None;
+                    self.reader_state.reader_selected_text = (!plain.is_empty()).then_some(plain);
+                } else {
+                    let total = self.buffer.len_chars();
+                    if total > 0 {
+                        self.buffer.selection_anchor = Some(0);
+                        self.buffer.cursor_char = total;
+                        self.buffer.cache_current_selection();
+                    } else {
+                        self.buffer.set_cursor(0, false);
+                    }
+                    if self.view_mode == ViewMode::Wysiwyg {
+                        self.reader_state.sync_cursor_from_buf = true;
+                        self.reader_state.focus_inline_editor = true;
+                    }
+                    self.refocus_active_editor();
+                }
+            }
+            ContextMenuAction::FindSelectedText(query) => {
+                let eff_query = if query.trim().is_empty() {
+                    if read_only {
+                        self.reader_state
+                            .reader_selected_text
+                            .clone()
+                            .unwrap_or_default()
+                    } else {
+                        self.buffer.selected_text()
+                    }
+                } else {
+                    query
+                };
+                if !eff_query.trim().is_empty() {
+                    self.editor_state.request_focus = false;
+                    self.reader_state.focus_inline_editor = false;
+                    self.find_bar.open_find_with_query(&self.buffer, &eff_query);
+                }
+            }
+            ContextMenuAction::FindAndReplace => {
+                self.dispatch_action(ctx, ToolbarAction::OpenReplaceBar);
+            }
+            ContextMenuAction::OpenLink(url) => {
+                self.open_link_target(ctx, &url);
+            }
+            ContextMenuAction::CopyText { text, status } => {
+                ctx.copy_text(text.clone());
+                self.last_copied_text = Some(text);
+                self.exporter.status_text = status;
+            }
+            ContextMenuAction::ViewImage(img) => {
+                self.reader_state.image_lightbox = Some(ImageLightboxState {
+                    url: img.url,
+                    alt: img.alt,
+                    link_url: img.link_url,
+                    base_dir: img.base_dir,
+                    doc_path: img.doc_path,
+                    zoom: 1.0,
+                });
+                ctx.request_repaint();
+            }
+            ContextMenuAction::SelectCodeBlock(lines) => {
+                if lines.is_empty() || lines.end > self.buffer.len_lines() {
+                    return;
+                }
+                if read_only {
+                    let body_start = if parse_code_fence_line(&self.buffer.line_text(lines.start))
+                        .is_some()
+                        && lines.start + 1 < lines.end
+                    {
+                        lines.start + 1
+                    } else {
+                        lines.start
+                    };
+                    let body_end = if lines.end > body_start
+                        && parse_code_fence_line(&self.buffer.line_text(lines.end - 1)).is_some()
+                    {
+                        lines.end - 1
+                    } else {
+                        lines.end
+                    };
+                    let mut code_body = String::new();
+                    for l in body_start..body_end {
+                        if l > body_start {
+                            code_body.push('\n');
+                        }
+                        code_body.push_str(&self.buffer.line_text(l));
+                    }
+                    self.reader_state.reader_sel_all = false;
+                    self.reader_state.reader_sel_anchor = Some(ReaderTextPos {
+                        doc_line: lines.start,
+                        chunk_idx: 0,
+                        char_idx: 0,
+                    });
+                    self.reader_state.reader_sel_focus = Some(ReaderTextPos {
+                        doc_line: lines.start,
+                        chunk_idx: 0,
+                        char_idx: usize::MAX,
+                    });
+                    self.reader_state.reader_selected_text = Some(code_body);
+                    let now = ctx.input(|i| i.time);
+                    self.reader_state.highlight_block_lines = Some((lines, now + 1.5));
+                    ctx.request_repaint();
+                } else {
+                    let range = self
+                        .buffer
+                        .line_range_chars(lines.start, lines.end.saturating_sub(1));
+                    self.buffer.selection_anchor = Some(range.start);
+                    self.buffer.cursor_char = range.end;
+                    self.buffer.cache_current_selection();
+                    if self.view_mode == ViewMode::Wysiwyg {
+                        let _ = activate_wysiwyg_code_block_range(
+                            &mut self.buffer,
+                            lines,
+                            self.show_markup,
+                            &mut self.reader_state,
+                        );
+                    }
+                    self.refocus_active_editor();
+                }
+            }
+            ContextMenuAction::EditTable(lines) => {
+                self.handle_reader_action(ctx, ReaderAction::EditTable(lines));
+            }
+            ContextMenuAction::RecalculateTable(lines) => {
+                self.handle_reader_action(ctx, ReaderAction::RecalculateTable(lines));
+            }
+            ContextMenuAction::CloseTab(idx) => {
+                self.request_close_tab(ctx, idx);
+            }
+            ContextMenuAction::CloseOtherTabs(keep_idx) => {
+                let indices: Vec<usize> = (0..self.tabs.len())
+                    .filter(|&i| i != keep_idx)
+                    .collect();
+                self.close_tabs_by_indices(ctx, indices);
+            }
+            ContextMenuAction::CloseTabsToRight(anchor_idx) => {
+                let indices: Vec<usize> = ((anchor_idx + 1)..self.tabs.len()).collect();
+                self.close_tabs_by_indices(ctx, indices);
+            }
+            ContextMenuAction::SaveTab(idx) => {
+                let _ = self.save_tab_by_index(idx);
+            }
+            ContextMenuAction::CopyFilePath(path) | ContextMenuAction::ExplorerCopyPath(path) => {
+                let s = path.display().to_string();
+                ctx.copy_text(s.clone());
+                self.last_copied_text = Some(s);
+                self.exporter.status_text = format!("Copied path {}", path.display());
+            }
+            ContextMenuAction::RevealInFileManager(path)
+            | ContextMenuAction::ExplorerReveal(path) => {
+                self.last_revealed_path = Some(path.clone());
+                if self.open_external_links_with_os {
+                    match reveal_in_file_manager(&path) {
+                        Ok(()) => {
+                            self.exporter.status_text = format!("Revealed {}", path.display());
+                        }
+                        Err(e) => {
+                            self.exporter.status_text = format!("Reveal failed: {e}");
+                        }
+                    }
+                } else {
+                    self.exporter.status_text = format!("Revealed {}", path.display());
+                }
+            }
+            ContextMenuAction::ExplorerOpenFile(path) => {
+                self.open_specific_file(&path);
+            }
+            ContextMenuAction::ExplorerOpenInNewTab(path) => {
+                if let Some(existing_idx) = self.find_open_tab_by_path(&path) {
+                    self.switch_to_tab(existing_idx);
+                    self.exporter.status_text = format!("Switched to {}", path.display());
+                } else {
+                    match DocumentBuffer::open_file(&path) {
+                        Ok(new_buf) => {
+                            self.open_buffer_in_new_tab(new_buf, 0);
+                            self.settings.record_recent_file(&path);
+                            self.persist_settings();
+                            self.sync_ast_if_needed();
+                            self.refocus_active_editor();
+                            self.exporter.status_text =
+                                format!("Opened {} in new tab", path.display());
+                        }
+                        Err(e) => {
+                            self.exporter.status_text = format!("Open failed: {e}");
+                        }
+                    }
+                }
+            }
+            ContextMenuAction::ExplorerCopyRelativePath(path) => {
+                let rel = self
+                    .explorer_state
+                    .root_dir
+                    .as_deref()
+                    .and_then(|root| path_relative_to(root, &path))
+                    .unwrap_or_else(|| path.display().to_string());
+                ctx.copy_text(rel.clone());
+                self.last_copied_text = Some(rel.clone());
+                self.exporter.status_text = format!("Copied relative path {rel}");
+            }
+            ContextMenuAction::ExplorerStartRename(path) => {
+                let allowed = self
+                    .explorer_state
+                    .root_dir
+                    .as_deref()
+                    .is_some_and(|root| is_path_within_workspace(root, &path));
+                if allowed {
+                    self.explorer_rename_modal.open_for(path.clone(), path.is_dir());
+                } else {
+                    self.exporter.status_text =
+                        "Cannot rename entries outside the workspace root".to_string();
+                }
+            }
+            ContextMenuAction::ExplorerRequestDelete(path) => {
+                let allowed = self
+                    .explorer_state
+                    .root_dir
+                    .as_deref()
+                    .is_some_and(|root| is_path_within_workspace(root, &path));
+                if allowed {
+                    self.explorer_delete_modal.open_for(path.clone(), path.is_dir());
+                } else {
+                    self.exporter.status_text =
+                        "Cannot delete entries outside the workspace root".to_string();
+                }
+            }
+            ContextMenuAction::ExplorerRefresh => {
+                self.explorer_state.refresh();
+                self.exporter.status_text = "Refreshed File Explorer".to_string();
+            }
+        }
+    }
+
+    fn sync_wysiwyg_after_buffer_edit(&mut self) {
+        if self.view_mode == ViewMode::Wysiwyg {
+            let target_line = self.buffer.char_to_line(self.buffer.cursor_char);
+            if !activate_wysiwyg_preserving_selection(
+                &self.buffer,
+                &self.block_index,
+                target_line,
+                self.show_markup,
+                &mut self.reader_state,
+            ) {
+                self.reader_state.active_block_lines = None;
+            }
+            self.reader_state.focus_inline_editor = true;
+        }
+        self.refocus_active_editor();
+    }
+
+    fn close_tabs_by_indices(&mut self, ctx: &egui::Context, mut indices: Vec<usize>) {
+        if indices.is_empty() {
+            return;
+        }
+        indices.sort_unstable();
+        indices.dedup();
+        let mut dirty_ids: Vec<u64> = Vec::new();
+        let mut clean_ids: Vec<u64> = Vec::new();
+        for &idx in &indices {
+            if let Some(slot) = self.tabs.get(idx) {
+                if self.tab_is_dirty(idx) {
+                    dirty_ids.push(slot.id);
+                } else {
+                    clean_ids.push(slot.id);
+                }
+            }
+        }
+        for id in clean_ids {
+            if let Some(idx) = self.tabs.iter().position(|t| t.id == id) {
+                self.close_tab_discard(ctx, idx);
+            }
+        }
+        self.continue_close_tabs_queue(ctx, dirty_ids);
+    }
+
+    fn continue_close_tabs_queue(&mut self, ctx: &egui::Context, mut ids: Vec<u64>) {
+        while let Some(&next_id) = ids.first() {
+            let Some(idx) = self.tabs.iter().position(|t| t.id == next_id) else {
+                ids.remove(0);
+                continue;
+            };
+            if self.tab_is_dirty(idx) {
+                self.switch_to_tab(idx);
+                self.unsaved_modal
+                    .open(PendingDiscardAction::CloseTabs(ids));
+                ctx.request_repaint();
+                return;
+            }
+            ids.remove(0);
+            self.close_tab_discard(ctx, idx);
+        }
+    }
+
+    fn save_tab_by_index(&mut self, idx: usize) -> bool {
+        if idx >= self.tabs.len() {
+            return false;
+        }
+        if idx == self.active_tab {
+            return self.save_current_document();
+        }
+        let prev_active = self.active_tab;
+        self.switch_to_tab(idx);
+        let ok = self.save_current_document();
+        if prev_active < self.tabs.len() {
+            self.switch_to_tab(prev_active);
+        }
+        ok
+    }
+
+    fn execute_explorer_rename(&mut self, old_path: &Path, new_name: &str) {
+        let Some(root) = self.explorer_state.root_dir.as_deref() else {
+            self.exporter.status_text = "No workspace folder open".to_string();
+            return;
+        };
+        if !is_path_within_workspace(root, old_path) {
+            self.exporter.status_text =
+                "Blocked rename outside the active workspace folder".to_string();
+            return;
+        }
+        let valid_name = match crate::ui::context_menu::validate_explorer_entry_name(new_name) {
+            Ok(v) => v,
+            Err(err) => {
+                self.exporter.status_text = err.to_string();
+                return;
+            }
+        };
+        let new_path = old_path.with_file_name(&valid_name);
+        if new_path == old_path {
+            return;
+        }
+        let is_case_only = paths_match(old_path, &new_path) && old_path != new_path;
+        if !is_case_only && new_path.exists() {
+            self.exporter.status_text = format!("Cannot rename: \"{valid_name}\" already exists");
+            return;
+        }
+        match std::fs::rename(old_path, &new_path) {
+            Ok(()) => {
+                let remap_path = |p: &PathBuf| -> Option<PathBuf> {
+                    if paths_match(p, old_path) {
+                        Some(new_path.clone())
+                    } else if let Ok(rel) = p.strip_prefix(old_path) {
+                        Some(new_path.join(rel))
+                    } else {
+                        None
+                    }
+                };
+                if let Some(ref cur) = self.buffer.file_path.clone()
+                    && let Some(updated) = remap_path(cur)
+                {
+                    self.buffer.file_path = Some(updated.clone());
+                    if cur == old_path {
+                        self.buffer
+                            .record_file_rename(old_path.to_path_buf(), updated);
+                    }
+                    self.refresh_disk_stamp();
+                    self.reader_state.base_dir = self.current_base_dir();
+                }
+                for slot in &mut self.tabs {
+                    if let Some(ref mut st) = slot.state
+                        && let Some(ref p) = st.buffer.file_path.clone()
+                        && let Some(updated) = remap_path(p)
+                    {
+                        st.buffer.file_path = Some(updated.clone());
+                        if p == old_path {
+                            st.buffer
+                                .record_file_rename(old_path.to_path_buf(), updated.clone());
+                        }
+                        st.disk_stamp = DiskFileStamp::from_path(&updated);
+                        st.reader_state.base_dir = updated.parent().map(Path::to_path_buf);
+                    }
+                }
+                self.settings
+                    .recent_files
+                    .retain(|p| !paths_match(p, old_path));
+                self.settings.record_recent_file(&new_path);
+                self.persist_settings();
+                self.explorer_state.refresh();
+                self.exporter.status_text = format!("Renamed to {valid_name}");
+            }
+            Err(e) => {
+                self.exporter.status_text = format!("Rename failed: {e}");
+            }
+        }
+    }
+
+    fn execute_explorer_delete(&mut self, target_path: &Path) {
+        let Some(root) = self.explorer_state.root_dir.as_deref() else {
+            self.exporter.status_text = "No workspace folder open".to_string();
+            return;
+        };
+        if !is_path_within_workspace(root, target_path) {
+            self.exporter.status_text =
+                "Blocked delete outside the active workspace folder".to_string();
+            return;
+        }
+        let res = if target_path.is_dir() {
+            std::fs::remove_dir_all(target_path)
+        } else {
+            std::fs::remove_file(target_path)
+        };
+        match res {
+            Ok(()) => {
+                let matches_deleted = |p: &Path| {
+                    paths_match(p, target_path) || p.starts_with(target_path)
+                };
+                if self
+                    .buffer
+                    .file_path
+                    .as_deref()
+                    .is_some_and(matches_deleted)
+                {
+                    self.disk_stamp = None;
+                    self.buffer.dirty = true;
+                }
+                for slot in &mut self.tabs {
+                    if let Some(ref mut st) = slot.state
+                        && st
+                            .buffer
+                            .file_path
+                            .as_deref()
+                            .is_some_and(matches_deleted)
+                    {
+                        st.disk_stamp = None;
+                        st.buffer.dirty = true;
+                    }
+                }
+                self.settings
+                    .recent_files
+                    .retain(|p| !matches_deleted(p));
+                self.persist_settings();
+                self.explorer_state.refresh();
+                self.exporter.status_text = format!("Deleted {}", target_path.display());
+            }
+            Err(e) => {
+                self.exporter.status_text = format!("Delete failed: {e}");
             }
         }
     }

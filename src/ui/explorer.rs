@@ -87,12 +87,18 @@ impl ExplorerFileFilter {
 }
 
 /// Action returned from rendering the File Explorer panel.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ExplorerAction {
     None,
     OpenFile(PathBuf),
     OpenFolderDialog,
     SetRoot(PathBuf),
+    ContextMenu {
+        path: PathBuf,
+        is_dir: bool,
+        is_root_empty_area: bool,
+        pos: egui::Pos2,
+    },
 }
 
 /// Cached directory entry metadata for fast tree browsing and search/filtering.
@@ -919,6 +925,13 @@ pub fn render_explorer_panel(
                             );
                             if row_resp.clicked() {
                                 clicked_dir = Some(entry.path.clone());
+                            } else if let Some(pos) = secondary_click_pos_for(ui, &row_resp) {
+                                action = ExplorerAction::ContextMenu {
+                                    path: entry.path.clone(),
+                                    is_dir: true,
+                                    is_root_empty_area: false,
+                                    pos,
+                                };
                             }
                         } else {
                             let is_active =
@@ -942,6 +955,13 @@ pub fn render_explorer_panel(
                             .on_hover_text(entry.path.display().to_string());
                             if row_resp.clicked() {
                                 action = ExplorerAction::OpenFile(entry.path.clone());
+                            } else if let Some(pos) = secondary_click_pos_for(ui, &row_resp) {
+                                action = ExplorerAction::ContextMenu {
+                                    path: entry.path.clone(),
+                                    is_dir: false,
+                                    is_root_empty_area: false,
+                                    pos,
+                                };
                             }
                         }
                     }
@@ -969,7 +989,7 @@ pub fn render_explorer_panel(
             .map(|(_, _, _, r)| r.len())
             .unwrap_or(0);
         let mut toggle_dir: Option<PathBuf> = None;
-        egui::ScrollArea::vertical()
+        let tree_scroll_resp = egui::ScrollArea::vertical()
             .id_salt("file_explorer_tree_scroll")
             .show_rows(ui, 22.0, row_count, |ui, row_range| {
                 let rows = match state.flat_tree_cache.as_ref() {
@@ -999,6 +1019,13 @@ pub fn render_explorer_panel(
                         .on_hover_text(row.path.display().to_string());
                         if resp.clicked() {
                             toggle_dir = Some(row.path.clone());
+                        } else if let Some(pos) = secondary_click_pos_for(ui, &resp) {
+                            action = ExplorerAction::ContextMenu {
+                                path: row.path.clone(),
+                                is_dir: true,
+                                is_root_empty_area: false,
+                                pos,
+                            };
                         }
                     } else {
                         let is_active =
@@ -1017,16 +1044,52 @@ pub fn render_explorer_panel(
                         .on_hover_text(row.path.display().to_string());
                         if resp.clicked() {
                             action = ExplorerAction::OpenFile(row.path.clone());
+                        } else if let Some(pos) = secondary_click_pos_for(ui, &resp) {
+                            action = ExplorerAction::ContextMenu {
+                                path: row.path.clone(),
+                                is_dir: false,
+                                is_root_empty_area: false,
+                                pos,
+                            };
                         }
                     }
                 }
             });
+        if action == ExplorerAction::None
+            && ui.input(|i| i.pointer.secondary_clicked())
+            && let Some(pos) = ui.input(|i| i.pointer.interact_pos().or(i.pointer.latest_pos()))
+            && tree_scroll_resp.inner_rect.contains(pos)
+        {
+            action = ExplorerAction::ContextMenu {
+                path: root_dir,
+                is_dir: true,
+                is_root_empty_area: true,
+                pos,
+            };
+        }
         if let Some(dir_path) = toggle_dir {
             state.toggle_dir(&dir_path);
         }
     }
 
     action
+}
+
+fn secondary_click_pos_for(ui: &egui::Ui, resp: &egui::Response) -> Option<egui::Pos2> {
+    if resp.secondary_clicked() {
+        return Some(
+            resp.interact_pointer_pos()
+                .or_else(|| ui.input(|i| i.pointer.interact_pos().or(i.pointer.latest_pos())))
+                .unwrap_or_else(|| resp.rect.center()),
+        );
+    }
+    if ui.input(|i| i.pointer.secondary_clicked())
+        && let Some(pos) = ui.input(|i| i.pointer.interact_pos().or(i.pointer.latest_pos()))
+        && resp.rect.contains(pos)
+    {
+        return Some(pos);
+    }
+    None
 }
 
 #[allow(clippy::too_many_arguments)]

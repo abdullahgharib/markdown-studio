@@ -517,6 +517,7 @@ pub enum PendingDiscardAction {
     OpenFile,
     OpenSpecificFile(PathBuf),
     CloseTab(usize),
+    CloseTabs(Vec<u64>),
     CloseWindow,
 }
 
@@ -557,7 +558,9 @@ impl UnsavedChangesModal {
             PendingDiscardAction::OpenFile | PendingDiscardAction::OpenSpecificFile(_) => {
                 "opening another file"
             }
-            PendingDiscardAction::CloseTab(_) => "closing this tab",
+            PendingDiscardAction::CloseTab(_) | PendingDiscardAction::CloseTabs(_) => {
+                "closing this tab"
+            }
             PendingDiscardAction::CloseWindow => "closing Markdown Studio",
         };
 
@@ -632,6 +635,218 @@ impl UnsavedChangesModal {
         } else {
             None
         }
+    }
+}
+
+/// Modal dialog for renaming a file or folder from the File Explorer context menu.
+#[derive(Debug, Default)]
+pub struct ExplorerRenameModal {
+    pub open: bool,
+    pub target_path: Option<PathBuf>,
+    pub is_dir: bool,
+    pub draft: String,
+    pub focus_requested: bool,
+    pub error_message: Option<String>,
+}
+
+impl ExplorerRenameModal {
+    pub fn open_for(&mut self, path: PathBuf, is_dir: bool) {
+        self.open = true;
+        self.draft = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        self.target_path = Some(path);
+        self.is_dir = is_dir;
+        self.focus_requested = true;
+        self.error_message = None;
+    }
+
+    pub fn close(&mut self) {
+        self.open = false;
+        self.target_path = None;
+        self.draft.clear();
+        self.focus_requested = false;
+        self.error_message = None;
+    }
+
+    pub fn show(&mut self, ctx: &egui::Context, theme: &WordTheme) -> Option<(PathBuf, String)> {
+        if !self.open {
+            return None;
+        }
+        let target_path = self.target_path.clone()?;
+        let mut keep_open = true;
+        let mut submit = false;
+        let mut cancel = false;
+        let kind_label = if self.is_dir { "Folder" } else { "File" };
+
+        egui::Window::new(format!("Rename {kind_label}"))
+            .open(&mut keep_open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .default_width(380.0)
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(format!("Enter a new name for {}:", target_path.display()))
+                        .size(12.5)
+                        .color(theme.text_muted),
+                );
+                ui.add_space(6.0);
+                let resp = ui.add_sized(
+                    Vec2::new(350.0, 26.0),
+                    egui::TextEdit::singleline(&mut self.draft).hint_text("New name..."),
+                );
+                if self.focus_requested {
+                    resp.request_focus();
+                    self.focus_requested = false;
+                }
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                    submit = true;
+                }
+                if let Some(ref err) = self.error_message {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(err).size(12.0).color(theme.warning_amber));
+                }
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let ok_btn = egui::Button::new(
+                        RichText::new("Rename").strong().color(Color32::WHITE),
+                    )
+                    .fill(theme.accent)
+                    .stroke(Stroke::NONE);
+                    if ui.add(ok_btn).clicked() {
+                        submit = true;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape))
+                        {
+                            cancel = true;
+                        }
+                    });
+                });
+            });
+
+        if cancel || !keep_open {
+            self.close();
+            return None;
+        }
+        if submit {
+            match crate::ui::context_menu::validate_explorer_entry_name(&self.draft) {
+                Ok(valid) => {
+                    self.close();
+                    return Some((target_path, valid));
+                }
+                Err(msg) => {
+                    self.error_message = Some(msg.to_string());
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Confirmation dialog shown before deleting a file or folder from the File Explorer.
+#[derive(Debug, Default)]
+pub struct ExplorerDeleteConfirmModal {
+    pub open: bool,
+    pub target_path: Option<PathBuf>,
+    pub is_dir: bool,
+}
+
+impl ExplorerDeleteConfirmModal {
+    pub fn open_for(&mut self, path: PathBuf, is_dir: bool) {
+        self.open = true;
+        self.target_path = Some(path);
+        self.is_dir = is_dir;
+    }
+
+    pub fn close(&mut self) {
+        self.open = false;
+        self.target_path = None;
+    }
+
+    pub fn show(&mut self, ctx: &egui::Context, theme: &WordTheme) -> Option<PathBuf> {
+        if !self.open {
+            return None;
+        }
+        let target_path = self.target_path.clone()?;
+        let mut keep_open = true;
+        let mut confirm = false;
+        let mut cancel = false;
+        let kind_label = if self.is_dir { "Folder" } else { "File" };
+        let name = target_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| target_path.display().to_string());
+
+        egui::Window::new(format!("Delete {kind_label}"))
+            .open(&mut keep_open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .default_width(400.0)
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(format!("Delete \"{name}\"?"))
+                        .strong()
+                        .size(14.5)
+                        .color(theme.text_primary),
+                );
+                ui.add_space(4.0);
+                let detail = if self.is_dir {
+                    format!(
+                        "This will permanently delete the folder and its contents:\n{}",
+                        target_path.display()
+                    )
+                } else {
+                    format!(
+                        "This will permanently delete from disk:\n{}",
+                        target_path.display()
+                    )
+                };
+                ui.label(RichText::new(detail).size(12.0).color(theme.text_muted));
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let del_btn = egui::Button::new(
+                        RichText::new("Delete")
+                            .strong()
+                            .color(theme.warning_amber),
+                    )
+                    .fill(Color32::from_rgba_unmultiplied(
+                        theme.warning_amber.r(),
+                        theme.warning_amber.g(),
+                        theme.warning_amber.b(),
+                        24,
+                    ))
+                    .stroke(Stroke::new(1.0_f32, theme.warning_amber));
+                    if ui.add(del_btn).clicked() {
+                        confirm = true;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape))
+                        {
+                            cancel = true;
+                        }
+                    });
+                });
+            });
+
+        if cancel || !keep_open {
+            self.close();
+            return None;
+        }
+        if confirm {
+            self.close();
+            return Some(target_path);
+        }
+        None
     }
 }
 
@@ -1772,6 +1987,28 @@ impl FindReplaceBar {
         self.show_replace = false;
         self.focus_query = true;
         self.sync_selection_context(buf);
+        self.ensure_matches_fresh_with_ctx(buf, None);
+    }
+
+    pub fn open_find_with_query(&mut self, buf: &DocumentBuffer, query: &str) {
+        self.open = true;
+        self.show_replace = false;
+        self.focus_query = true;
+        self.in_selection = false;
+        self.selection_scope = None;
+        let first_line = query
+            .lines()
+            .next()
+            .unwrap_or(query)
+            .trim()
+            .chars()
+            .take(160)
+            .collect::<String>();
+        self.query = first_line;
+        let q_len = self.query.chars().count();
+        self.query_input_state.selection_anchor = if q_len > 0 { Some(0) } else { None };
+        self.query_input_state.cursor_char = q_len;
+        self.status.clear();
         self.ensure_matches_fresh_with_ctx(buf, None);
     }
 

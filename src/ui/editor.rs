@@ -17,10 +17,15 @@ use crate::document::DocumentBuffer;
 use crate::ui::reader::{classify_link_url, extract_markdown_link_at_char};
 use crate::ui::theme::{ThemeMode, WordTheme};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum EditorAction {
     None,
     OpenLink(String),
+    OpenContextMenu {
+        pos: egui::Pos2,
+        link_url: Option<String>,
+        cursor_line: usize,
+    },
 }
 
 const MAX_EDITOR_LAYOUT_CHARS: usize = 8_192;
@@ -445,7 +450,7 @@ pub fn render_virtual_editor(
         }
 
         if !state.autoscroll_active {
-            if response.clicked() || response.drag_started() {
+            if response.clicked() || response.drag_started_by(egui::PointerButton::Primary) {
                 ui.memory_mut(|m| m.request_focus(editor_id));
             }
 
@@ -494,8 +499,14 @@ pub fn render_virtual_editor(
                             }
                     }
 
-            // Mouse click / double-click / triple-click / drag positioning mapped directly via exact Galley font metrics + BiDi/Grapheme snapping.
-            if let Some(pointer_pos) = response.interact_pointer_pos() {
+            // Mouse click / double-click / triple-click / right-click / drag positioning mapped directly via exact Galley font metrics + BiDi/Grapheme snapping.
+            let pointer_pos_opt = response.interact_pointer_pos().or_else(|| {
+                response
+                    .secondary_clicked()
+                    .then(|| ui.input(|i| i.pointer.interact_pos().or(i.pointer.latest_pos())))
+                    .flatten()
+            });
+            if let Some(pointer_pos) = pointer_pos_opt {
                 let rel_y = (pointer_pos.y - rect.top()).max(0.0);
                 let line_offset = (rel_y / row_height).floor() as usize;
                 let clicked_line = (row_range.start + line_offset).min(total_lines - 1);
@@ -546,6 +557,40 @@ pub fn render_virtual_editor(
                 if let Some(raw_url) = clicked_ctrl_link {
                     editor_action = EditorAction::OpenLink(raw_url);
                     state.dragging = false;
+                } else if response.secondary_clicked() {
+                    ui.memory_mut(|m| m.request_focus(editor_id));
+                    let preserve_selection = buf.selection_range().is_some_and(|sel| {
+                        sel.start < sel.end
+                            && if in_gutter {
+                                sel.start <= line_end_char && sel.end >= line_start_char
+                            } else if in_text_span {
+                                target_char >= sel.start && target_char <= sel.end
+                            } else {
+                                sel.start < line_start_char && sel.end > line_end_char
+                            }
+                    });
+                    if !preserve_selection {
+                        let new_pos = if in_gutter {
+                            line_start_char
+                        } else {
+                            target_char
+                        };
+                        buf.set_cursor(new_pos, false);
+                        state.desired_col = Some(if in_gutter { 0 } else { clicked_col });
+                    }
+                    let link_url = if in_text_span {
+                        let line_str = &state.line_cache.entries[&clicked_line].text;
+                        extract_markdown_link_at_char(line_str, clicked_col)
+                            .filter(|u| classify_link_url(u).is_some())
+                    } else {
+                        None
+                    };
+                    editor_action = EditorAction::OpenContextMenu {
+                        pos: pointer_pos,
+                        link_url,
+                        cursor_line: clicked_line,
+                    };
+                    state.dragging = false;
                 } else if response.triple_clicked() {
                     if line_end_char > line_start_char {
                         buf.selection_anchor = Some(line_start_char);
@@ -576,7 +621,7 @@ pub fn render_virtual_editor(
                     }
                     state.dragging = false;
                     state.desired_col = None;
-                } else if response.drag_started() {
+                } else if response.drag_started_by(egui::PointerButton::Primary) {
                     let shift = ui.input(|i| i.modifiers.shift);
                     buf.set_cursor(target_char, shift);
                     state.dragging = true;

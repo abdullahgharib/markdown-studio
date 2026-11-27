@@ -60,7 +60,7 @@ pub struct TabVisualInfo<'a> {
 }
 
 /// User interaction returned by `render_tab_bar`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TabBarAction {
     None,
     Select(usize),
@@ -68,6 +68,7 @@ pub enum TabBarAction {
     NewTab,
     DetachToNewWindow(usize),
     Reorder { from: usize, to: usize },
+    ContextMenu { idx: usize, pos: Pos2 },
 }
 
 /// Persistent drag tracking state across frames for Chrome-style tab tear-off & reordering.
@@ -246,6 +247,15 @@ pub fn render_tab_bar(
                             tab_rects.push(card_rect);
                             let (lbl_hov, cls_hov) = inner_resp.inner;
                             let hovered = lbl_hov || cls_hov || inner_resp.response.hovered();
+                            if state.dragging_tab_idx.is_none()
+                                && action == TabBarAction::None
+                                && ui.input(|i| i.pointer.secondary_clicked())
+                                && let Some(sec_pos) = ui
+                                    .input(|i| i.pointer.interact_pos().or(i.pointer.latest_pos()))
+                                && card_rect.contains(sec_pos)
+                            {
+                                action = TabBarAction::ContextMenu { idx, pos: sec_pos };
+                            }
 
                             let fill = if is_active {
                                 theme.paper_bg
