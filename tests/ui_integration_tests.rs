@@ -7423,3 +7423,266 @@ fn test_context_menu_themes_arabic_rtl_keyboard_nav_dismissal_and_shortcuts() {
     let _ = press_key(&ctx, &mut app, &mut t, Key::F, Modifiers::COMMAND);
     assert!(app.find_bar.open);
 }
+
+fn collect_filled_rects_matching_color(
+    shape: &egui::Shape,
+    target: egui::Color32,
+    y_min: f32,
+    out: &mut Vec<Rect>,
+) {
+    match shape {
+        egui::Shape::Rect(r) if r.fill == target && r.rect.min.y >= y_min => {
+            out.push(r.rect);
+        }
+        egui::Shape::Vec(v) => {
+            for inner in v {
+                collect_filled_rects_matching_color(inner, target, y_min, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[test]
+fn test_submenu_hover_no_panic_wysiwyg_selection_reader_ctrl_a_and_rich_copy() {
+    use markdown_studio::ui::context_menu::{ContextMenuAction, ContextMenuTarget};
+
+    let ctx = egui::Context::default();
+    let (_dir, mut app) = new_isolated_app(&ctx);
+    let mut t = 1.0_f64;
+
+    // 1. Hovering Formatting -> Headings -> moving back onto root non-submenu item -> re-entering Formatting never panics
+    app.buffer = DocumentBuffer::from_str("Hello **world** today\n");
+    app.dispatch_action(&ctx, ToolbarAction::SetViewMode(ViewMode::Source));
+    let _ = ui_step(&ctx, &mut app, t, vec![]);
+    app.context_menu.open_at(
+        Pos2::new(300.0, 200.0),
+        ContextMenuTarget::Editor {
+            from_wysiwyg: false,
+            has_selection: true,
+            selected_text: Some("**world**".to_string()),
+            link_url: None,
+            cursor_line: 0,
+        },
+        ctx.cumulative_pass_nr(),
+    );
+    t += 0.02;
+    let _ = ui_step(&ctx, &mut app, t, vec![]);
+    t += 0.02;
+    let menu_out = ui_step(&ctx, &mut app, t, vec![]);
+    let fmt_pos = find_rendered_text_shapes(&menu_out, "Formatting")
+        .into_iter()
+        .find_map(|(_, ts)| (ts.pos.y > 190.0).then_some(ts.pos + egui::vec2(20.0, 6.0)))
+        .expect("Formatting item must render");
+    let copy_pos = find_rendered_text_shapes(&menu_out, "Copy")
+        .into_iter()
+        .find_map(|(_, ts)| {
+            (ts.galley.text() == "Copy" && ts.pos.y > 190.0)
+                .then_some(ts.pos + egui::vec2(20.0, 6.0))
+        })
+        .expect("Copy menu item must render");
+
+    t += 0.02;
+    let _ = ui_step(&ctx, &mut app, t, vec![Event::PointerMoved(fmt_pos)]);
+    t += 0.02;
+    let _ = ui_step(&ctx, &mut app, t, vec![]);
+    t += 0.02;
+    let sub1_out = ui_step(&ctx, &mut app, t, vec![]);
+    assert_eq!(app.context_menu.open_submenu_path.len(), 1);
+    let head_pos = find_rendered_text_shapes(&sub1_out, "Headings")
+        .into_iter()
+        .find_map(|(_, ts)| (ts.pos.x > 400.0).then_some(ts.pos + egui::vec2(20.0, 6.0)))
+        .expect("Headings submenu item must render");
+    t += 0.02;
+    let _ = ui_step(&ctx, &mut app, t, vec![Event::PointerMoved(head_pos)]);
+    t += 0.02;
+    let _ = ui_step(&ctx, &mut app, t, vec![]);
+    t += 0.02;
+    let _ = ui_step(&ctx, &mut app, t, vec![]);
+    assert_eq!(app.context_menu.open_submenu_path.len(), 2);
+
+    // Regression check: moving pointer from open nested submenu onto a root non-submenu row (Copy) must not panic
+    t += 0.02;
+    let _ = ui_step(&ctx, &mut app, t, vec![Event::PointerMoved(copy_pos)]);
+    t += 0.02;
+    let _ = ui_step(&ctx, &mut app, t, vec![]);
+    assert!(app.context_menu.is_open());
+    assert!(app.context_menu.open_submenu_path.is_empty());
+
+    // Re-entering Formatting still works cleanly
+    t += 0.02;
+    let _ = ui_step(&ctx, &mut app, t, vec![Event::PointerMoved(fmt_pos)]);
+    t += 0.02;
+    let _ = ui_step(&ctx, &mut app, t, vec![]);
+    assert_eq!(app.context_menu.open_submenu_path.len(), 1);
+    app.context_menu.close();
+
+    // 2. WYSIWYG right-click inside selected text preserves both buffer selection & visual highlight while menu opens/hovers
+    app.dispatch_action(&ctx, ToolbarAction::SetViewMode(ViewMode::Wysiwyg));
+    app.buffer = DocumentBuffer::from_str("Hello world today\n");
+    t += 0.02;
+    let w_out = ui_step(&ctx, &mut app, t, vec![]);
+    let click_p = find_rendered_text(&w_out, "world", 0.0, 1280.0, 110.0);
+    let _ = click_at(&ctx, &mut app, &mut t, click_p, Modifiers::NONE);
+    app.buffer.selection_anchor = Some(6);
+    app.buffer.cursor_char = 11; // "world"
+    app.buffer.cache_current_selection();
+    app.reader_state.sync_cursor_from_buf = true;
+    app.reader_state.focus_inline_editor = true;
+    t += 0.02;
+    let sel_out = ui_step(&ctx, &mut app, t, vec![]);
+    let world_rclick = find_rendered_text(&sel_out, "world", 0.0, 1280.0, 110.0);
+
+    // Secondary button press frame
+    t += 0.02;
+    let _ = ui_step(
+        &ctx,
+        &mut app,
+        t,
+        vec![
+            Event::PointerMoved(world_rclick),
+            Event::PointerButton {
+                pos: world_rclick,
+                button: egui::PointerButton::Secondary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+        ],
+    );
+    assert_eq!(
+        app.buffer.selection_range(),
+        Some(6..11),
+        "WYSIWYG secondary press inside selection must keep selection"
+    );
+
+    // Secondary release + settle frame
+    t += 0.02;
+    let _ = ui_step(
+        &ctx,
+        &mut app,
+        t,
+        vec![Event::PointerButton {
+            pos: world_rclick,
+            button: egui::PointerButton::Secondary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        }],
+    );
+    t += 0.02;
+    let open_out = ui_step(&ctx, &mut app, t, vec![]);
+    assert!(app.context_menu.is_open());
+    assert!(matches!(
+        app.context_menu.target,
+        Some(ContextMenuTarget::Editor {
+            from_wysiwyg: true,
+            has_selection: true,
+            ..
+        })
+    ));
+    assert_eq!(
+        app.buffer.selection_range(),
+        Some(6..11),
+        "WYSIWYG right-click inside selection must preserve buffer selection"
+    );
+    let mut sel_rects = Vec::new();
+    for s in &open_out.shapes {
+        collect_filled_rects_matching_color(&s.shape, app.theme.selection_bg, 110.0, &mut sel_rects);
+    }
+    assert!(
+        !sel_rects.is_empty(),
+        "WYSIWYG selection highlight must remain visibly painted while context menu is open"
+    );
+
+    // Hovering Formatting inside WYSIWYG context menu preserves selection and formats cleanly
+    let w_fmt_pos = find_rendered_text_shapes(&open_out, "Formatting")
+        .into_iter()
+        .find_map(|(_, ts)| (ts.pos.y > 110.0).then_some(ts.pos + egui::vec2(20.0, 6.0)))
+        .expect("Formatting item must render in WYSIWYG context menu");
+    t += 0.02;
+    let _ = ui_step(&ctx, &mut app, t, vec![Event::PointerMoved(w_fmt_pos)]);
+    t += 0.02;
+    let _ = ui_step(&ctx, &mut app, t, vec![]);
+    assert_eq!(app.buffer.selection_range(), Some(6..11));
+    app.context_menu.close();
+
+    // Rich copy via Event::Copy inside active WYSIWYG block preserves formatting in HTML clipboard
+    app.buffer = DocumentBuffer::from_str("**bold** and *em*\n");
+    app.reader_state.active_block_lines = Some(0..1);
+    app.reader_state.active_block_text = "**bold** and *em*".to_string();
+    app.buffer.selection_anchor = Some(0);
+    app.buffer.cursor_char = 17;
+    app.buffer.cache_current_selection();
+    app.reader_state.sync_cursor_from_buf = true;
+    app.reader_state.focus_inline_editor = true;
+    t += 0.02;
+    let _ = ui_step(&ctx, &mut app, t, vec![]);
+    t += 0.02;
+    let _ = ui_step(&ctx, &mut app, t, vec![Event::Copy]);
+    assert!(
+        app.last_copied_html
+            .as_deref()
+            .is_some_and(|h| h.contains("<strong>bold</strong>") && h.contains("<em>em</em>")),
+        "WYSIWYG Copy must produce styled HTML, got: {:?}",
+        app.last_copied_html
+    );
+
+    // 3. Reader Ctrl+A selects all document text & Event::Copy copies rich formatted HTML
+    let rich_doc = "# Main Heading\n\nText with **bold** and [Docs](https://example.com).\n\n| Item | Qty |\n| --- | --- |\n| Pen | 3 |\n";
+    app.buffer = DocumentBuffer::from_str(rich_doc);
+    app.dispatch_action(&ctx, ToolbarAction::SetViewMode(ViewMode::Reader));
+    t += 0.02;
+    let _ = ui_step(&ctx, &mut app, t, vec![]);
+
+    let _ = press_key(&ctx, &mut app, &mut t, Key::A, Modifiers::COMMAND);
+    assert!(
+        app.reader_state.reader_sel_all,
+        "Ctrl+A in Reader mode must select all document text"
+    );
+    assert!(
+        app.reader_state
+            .reader_selected_text
+            .as_deref()
+            .is_some_and(|s| s.contains("Main Heading") && s.contains("bold")),
+        "Reader Ctrl+A must populate reader_selected_text, got: {:?}",
+        app.reader_state.reader_selected_text
+    );
+
+    t += 0.02;
+    let _ = ui_step(&ctx, &mut app, t, vec![Event::Copy]);
+    let r_html = app
+        .last_copied_html
+        .as_deref()
+        .expect("Reader Copy must generate styled CF_HTML fragment");
+    assert!(r_html.contains("<h1"), "got: {r_html}");
+    assert!(r_html.contains("<strong>bold</strong>"), "got: {r_html}");
+    assert!(r_html.contains("https://example.com"), "got: {r_html}");
+    assert!(r_html.contains("<table"), "got: {r_html}");
+
+    // Copy as Plain Text intentionally omits CF_HTML
+    app.execute_context_menu_action(&ctx, ContextMenuAction::CopyAsPlainText);
+    assert!(app.last_copied_html.is_none());
+    assert!(
+        app.last_copied_text
+            .as_deref()
+            .is_some_and(|s| s.contains("Main Heading") && !s.contains("**bold**"))
+    );
+
+    // 4. Source mode Ctrl+C also produces rich HTML for pasting into external rich editors
+    app.dispatch_action(&ctx, ToolbarAction::SetViewMode(ViewMode::Source));
+    app.buffer = DocumentBuffer::from_str("# Source Title\n\n`code` & **strong**\n");
+    app.buffer.selection_anchor = Some(0);
+    app.buffer.cursor_char = app.buffer.len_chars();
+    app.buffer.cache_current_selection();
+    app.editor_state.request_focus = true;
+    t += 0.02;
+    let _ = ui_step(&ctx, &mut app, t, vec![]);
+    t += 0.02;
+    let _ = ui_step(&ctx, &mut app, t, vec![Event::Copy]);
+    assert!(
+        app.last_copied_html
+            .as_deref()
+            .is_some_and(|h| h.contains("<h1") && h.contains("<strong>strong</strong>") && h.contains("<code")),
+        "Source Copy must produce rich styled HTML, got: {:?}",
+        app.last_copied_html
+    );
+}

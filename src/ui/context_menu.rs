@@ -279,10 +279,10 @@ impl ContextMenuState {
         let mut new_panel_sizes: Vec<Vec2> = Vec::new();
         let mut next_submenu_ys: Vec<f32> = Vec::new();
 
-        // Depth 0 ..= open_submenu_path.len()
-        let max_depth = self.open_submenu_path.len();
-        for depth in 0..=max_depth {
-            let Some(slice) = items_at_submenu_path(items, &self.open_submenu_path[..depth]) else {
+        let prev_open_path = self.open_submenu_path.clone();
+        let render_path = prev_open_path.clone();
+        for depth in 0..=render_path.len() {
+            let Some(slice) = items_at_submenu_path(items, &render_path[..depth]) else {
                 break;
             };
             if slice.is_empty() {
@@ -365,11 +365,19 @@ impl ContextMenuState {
             if let Some(act) = panel_out.clicked_action {
                 chosen_action = Some(act);
             }
+            if depth < render_path.len()
+                && self.open_submenu_path.get(..=depth) != render_path.get(..=depth)
+            {
+                break;
+            }
         }
 
         self.panel_rects = new_panel_rects;
         self.panel_sizes = new_panel_sizes;
         self.submenu_anchor_ys = next_submenu_ys;
+        if self.open_submenu_path != prev_open_path {
+            ctx.request_repaint();
+        }
 
         if chosen_action.is_some() {
             self.close();

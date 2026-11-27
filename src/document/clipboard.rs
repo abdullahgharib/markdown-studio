@@ -184,21 +184,26 @@ mod win_clip {
     use std::os::windows::ffi::OsStrExt;
     use std::ptr::null_mut;
 
-    use super::{dib_to_png_bytes, extract_cf_html_fragment, html_matches_plain_text};
+    use super::{build_cf_html_payload, dib_to_png_bytes, extract_cf_html_fragment, html_matches_plain_text};
 
     const CF_DIB: u32 = 8;
     const CF_UNICODETEXT: u32 = 13;
+    const GMEM_MOVEABLE: u32 = 0x0002;
 
     #[link(name = "user32")]
     unsafe extern "system" {
         fn OpenClipboard(h_wnd_new_owner: *mut c_void) -> i32;
         fn CloseClipboard() -> i32;
+        fn EmptyClipboard() -> i32;
+        fn SetClipboardData(u_format: u32, h_mem: *mut c_void) -> *mut c_void;
         fn RegisterClipboardFormatW(lpsz_format: *const u16) -> u32;
         fn GetClipboardData(u_format: u32) -> *mut c_void;
     }
 
     #[link(name = "kernel32")]
     unsafe extern "system" {
+        fn GlobalAlloc(u_flags: u32, dw_bytes: usize) -> *mut c_void;
+        fn GlobalFree(h_mem: *mut c_void) -> *mut c_void;
         fn GlobalLock(h_mem: *mut c_void) -> *const u8;
         fn GlobalUnlock(h_mem: *mut c_void) -> i32;
         fn GlobalSize(h_mem: *mut c_void) -> usize;
@@ -353,6 +358,112 @@ mod win_clip {
         }
         let dib = read_global_clipboard_bytes(CF_DIB, super::MAX_CLIPBOARD_IMAGE_BYTES)?;
         dib_to_png_bytes(&dib)
+    }
+
+    fn alloc_clipboard_mem(bytes: &[u8]) -> Option<*mut c_void> {
+        // SAFETY: Allocating `bytes.len()` moveable bytes for `SetClipboardData`.
+        let h_mem = unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes.len()) };
+        if h_mem.is_null() {
+            return None;
+        }
+        // SAFETY: Locking freshly allocated handle before copying `bytes`.
+        let ptr = unsafe { GlobalLock(h_mem) } as *mut u8;
+        if ptr.is_null() {
+            // SAFETY: Failed lock leaves ownership with us, so free before returning.
+            unsafe {
+                GlobalFree(h_mem);
+            }
+            return None;
+        }
+        // SAFETY: `bytes.len()` fits inside `h_mem` allocation and does not overlap.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
+            GlobalUnlock(h_mem);
+        }
+        Some(h_mem)
+    }
+
+    pub fn write_rich_html(plain_text: &str, html_fragment: &str) -> bool {
+        let _clip = match open_clipboard_guard() {
+            Some(g) => g,
+            None => return false,
+        };
+        // SAFETY: Clipboard is open and guarded by `_clip`.
+        if unsafe { EmptyClipboard() } == 0 {
+            return false;
+        }
+        let crlf_plain = plain_text.replace("\r\n", "\n").replace('\n', "\r\n");
+        let utf16: Vec<u16> = crlf_plain.encode_utf16().chain(once(0)).collect();
+        let text_bytes: Vec<u8> = utf16.iter().flat_map(|u| u.to_le_bytes()).collect();
+        let Some(h_text) = alloc_clipboard_mem(&text_bytes) else {
+            return false;
+        };
+        // SAFETY: Clipboard is open & emptied; `SetClipboardData` takes ownership on non-null return.
+        let set_text = unsafe { SetClipboardData(CF_UNICODETEXT, h_text) };
+        if set_text.is_null() {
+            // SAFETY: Ownership stayed with us on failure.
+            unsafe {
+                GlobalFree(h_text);
+            }
+            return false;
+        }
+        if !html_fragment.is_empty() {
+            let cf_html_payload = build_cf_html_payload(html_fragment);
+            let mut html_bytes = cf_html_payload.into_bytes();
+            html_bytes.push(0);
+            let fmt_name: Vec<u16> = OsStr::new("HTML Format")
+                .encode_wide()
+                .chain(once(0))
+                .collect();
+            // SAFETY: `fmt_name` is a NUL-terminated UTF-16 string.
+            let cf_html = unsafe { RegisterClipboardFormatW(fmt_name.as_ptr()) };
+            if cf_html != 0
+                && let Some(h_html) = alloc_clipboard_mem(&html_bytes)
+            {
+                // SAFETY: Clipboard is open; `SetClipboardData` takes ownership on non-null return.
+                let set_html = unsafe { SetClipboardData(cf_html, h_html) };
+                if set_html.is_null() {
+                    // SAFETY: Ownership stayed with us on failure.
+                    unsafe {
+                        GlobalFree(h_html);
+                    }
+                }
+            }
+        }
+        true
+    }
+}
+
+/// Builds a `Version:0.9` Windows `CF_HTML` clipboard payload with exact UTF-8 byte offsets.
+pub fn build_cf_html_payload(html_fragment: &str) -> String {
+    const HEADER_TEMPLATE_LEN: usize = "Version:0.9\r\nStartHTML:0000000000\r\nEndHTML:0000000000\r\nStartFragment:0000000000\r\nEndFragment:0000000000\r\n".len();
+    const BODY_PREFIX: &str =
+        "<!DOCTYPE html>\r\n<html>\r\n<head><meta charset=\"utf-8\"></head>\r\n<body>\r\n<!--StartFragment-->";
+    const BODY_SUFFIX: &str = "<!--EndFragment-->\r\n</body>\r\n</html>";
+    let start_html = HEADER_TEMPLATE_LEN;
+    let start_fragment = start_html + BODY_PREFIX.len();
+    let end_fragment = start_fragment + html_fragment.len();
+    let end_html = end_fragment + BODY_SUFFIX.len();
+    let mut out = String::with_capacity(end_html);
+    out.push_str(&format!(
+        "Version:0.9\r\nStartHTML:{start_html:010}\r\nEndHTML:{end_html:010}\r\nStartFragment:{start_fragment:010}\r\nEndFragment:{end_fragment:010}\r\n"
+    ));
+    out.push_str(BODY_PREFIX);
+    out.push_str(html_fragment);
+    out.push_str(BODY_SUFFIX);
+    out
+}
+
+/// Writes both plain text (`CF_UNICODETEXT`) and styled HTML (`CF_HTML`) to the OS clipboard on Windows.
+pub fn write_os_clipboard_rich(plain_text: &str, html_fragment: &str) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        win_clip::write_rich_html(plain_text, html_fragment)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (plain_text, html_fragment);
+        false
     }
 }
 
@@ -2299,5 +2410,13 @@ mod tests {
 
         let preview = extract_plain_preview_from_html("<p><b>عربي 🚀</b> test</p>");
         assert!(preview.contains("عربي 🚀"));
+    }
+
+    #[test]
+    fn build_cf_html_payload_roundtrips_multibyte_utf8_offsets() {
+        let frag = "<p><strong>Bold</strong> — مرحبا</p>";
+        let payload = super::build_cf_html_payload(frag);
+        assert!(payload.starts_with("Version:0.9\r\nStartHTML:"));
+        assert_eq!(extract_cf_html_fragment(&payload), frag);
     }
 }

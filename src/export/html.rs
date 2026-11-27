@@ -638,6 +638,396 @@ fn write_escaped_html<W: Write>(w: &mut W, text: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Renders `markdown` into an inline-styled HTML fragment suitable for Windows `CF_HTML`
+/// rich clipboard copy (preserving headings, formatting, tables, lists, code, links, & BiDi in Word/Docs).
+pub fn render_clipboard_html_fragment(markdown: &str) -> String {
+    if markdown.is_empty() {
+        return String::new();
+    }
+    let blocks = crate::document::ast::parse_to_ir(markdown);
+    if blocks.is_empty() {
+        let mut out = Vec::with_capacity(markdown.len() + 64);
+        let _ = write!(
+            &mut out,
+            "<span style=\"font-family:'Segoe UI',Calibri,Arial,sans-serif;font-size:11pt;color:#1b2230;\">"
+        );
+        let _ = write_escaped_html(&mut out, markdown);
+        let _ = out.write_all(b"</span>");
+        return String::from_utf8(out).unwrap_or_default();
+    }
+
+    // Inline single-line phrase copies emit a `<span>` so pasting mid-sentence into Word avoids unwanted paragraph breaks.
+    if blocks.len() == 1
+        && !markdown.contains('\n')
+        && let DocBlock::Paragraph {
+            runs,
+            alignment: BlockAlignment::Start,
+            direction: TextDirection::Ltr,
+            indent_level: 0,
+            ..
+        } = &blocks[0]
+    {
+        let mut out = Vec::with_capacity(markdown.len() * 2 + 96);
+        let _ = write!(
+            &mut out,
+            "<span style=\"font-family:'Segoe UI',Calibri,Arial,sans-serif;font-size:11pt;color:#1b2230;\">"
+        );
+        let mut img_cache = FxHashMap::default();
+        let known_slugs = HashSet::new();
+        let _ = write_clipboard_runs_html(&mut out, runs, &known_slugs, &mut img_cache);
+        let _ = out.write_all(b"</span>");
+        return String::from_utf8(out).unwrap_or_default();
+    }
+
+    let mut known_slugs = HashSet::new();
+    let mut slug_tracker = SlugTracker::new();
+    let mut outline = Vec::new();
+    collect_outline_headings(&blocks, &mut slug_tracker, &mut outline);
+    for h in outline {
+        known_slugs.insert(h.slug);
+    }
+
+    let mut out = Vec::with_capacity(markdown.len() * 2 + 256);
+    let _ = write!(
+        &mut out,
+        "<div style=\"font-family:'Segoe UI',Calibri,Arial,sans-serif;font-size:11pt;color:#1b2230;line-height:1.5;\">"
+    );
+    let mut img_cache = FxHashMap::default();
+    for block in &blocks {
+        let _ = write_clipboard_block_html(&mut out, block, &known_slugs, &mut img_cache);
+    }
+    let _ = out.write_all(b"</div>");
+    String::from_utf8(out).unwrap_or_default()
+}
+
+fn clipboard_align_css(alignment: BlockAlignment, direction: TextDirection) -> Option<&'static str> {
+    match alignment {
+        BlockAlignment::Center => Some("text-align:center;"),
+        BlockAlignment::Right => Some("text-align:right;"),
+        BlockAlignment::Left => Some("text-align:left;"),
+        BlockAlignment::Justify => Some("text-align:justify;"),
+        BlockAlignment::End => Some(if direction == TextDirection::Rtl {
+            "text-align:left;"
+        } else {
+            "text-align:right;"
+        }),
+        BlockAlignment::Start => None,
+    }
+}
+
+fn write_clipboard_block_html<W: Write>(
+    w: &mut W,
+    block: &DocBlock,
+    known_slugs: &HashSet<String>,
+    image_cache: &mut FxHashMap<String, String>,
+) -> io::Result<()> {
+    match block {
+        DocBlock::Heading {
+            level,
+            runs,
+            alignment,
+            direction,
+            indent_level,
+            ..
+        } => {
+            let lvl = (*level).clamp(1, 6);
+            let pt = match lvl {
+                1 => 22,
+                2 => 17,
+                3 => 14,
+                4 => 12,
+                5 => 11,
+                _ => 10,
+            };
+            let dir_attr = if *direction == TextDirection::Rtl {
+                " dir=\"rtl\""
+            } else {
+                ""
+            };
+            let align_css = clipboard_align_css(*alignment, *direction).unwrap_or("");
+            let indent_css = if *indent_level > 0 {
+                format!("margin-left:{}pt;", (*indent_level as usize) * 18)
+            } else {
+                String::new()
+            };
+            write!(
+                w,
+                "<h{lvl}{dir_attr} style=\"font-family:'Segoe UI',Calibri,Arial,sans-serif;font-weight:700;color:#111827;font-size:{pt}pt;margin:12pt 0 6pt 0;line-height:1.25;{align_css}{indent_css}\">"
+            )?;
+            write_clipboard_runs_html(w, runs, known_slugs, image_cache)?;
+            writeln!(w, "</h{lvl}>")
+        }
+        DocBlock::Paragraph {
+            runs,
+            alignment,
+            direction,
+            indent_level,
+            ..
+        } => {
+            let dir_attr = if *direction == TextDirection::Rtl {
+                " dir=\"rtl\""
+            } else {
+                ""
+            };
+            let align_css = clipboard_align_css(*alignment, *direction).unwrap_or("");
+            let indent_css = if *indent_level > 0 {
+                format!("margin-left:{}pt;", (*indent_level as usize) * 18)
+            } else {
+                String::new()
+            };
+            write!(
+                w,
+                "<p{dir_attr} style=\"margin:0 0 8pt 0;line-height:1.5;{align_css}{indent_css}\">"
+            )?;
+            write_clipboard_runs_html(w, runs, known_slugs, image_cache)?;
+            w.write_all(b"</p>")
+        }
+        DocBlock::BlockQuote {
+            blocks,
+            direction,
+            indent_level,
+            ..
+        } => {
+            let dir_attr = if *direction == TextDirection::Rtl {
+                " dir=\"rtl\""
+            } else {
+                ""
+            };
+            let indent_css = if *indent_level > 0 {
+                format!("margin-left:{}pt;", (*indent_level as usize) * 18)
+            } else {
+                String::new()
+            };
+            write!(
+                w,
+                "<blockquote{dir_attr} style=\"margin:8pt 0;padding:4pt 0 4pt 12pt;border-left:3pt solid #1d5fc4;color:#4b5563;{indent_css}\">"
+            )?;
+            for inner in blocks {
+                write_clipboard_block_html(w, inner, known_slugs, image_cache)?;
+            }
+            w.write_all(b"</blockquote>")
+        }
+        DocBlock::CodeBlock { info, code, .. } => {
+            if is_mermaid_code_info(info)
+                && code.len() <= 32_768
+                && !code.trim().is_empty()
+                && let Some((png_bytes, _, _)) = mermaid::render_mermaid_to_png_bytes(code, 2.0)
+            {
+                let b64 = encode_base64(&png_bytes);
+                return write!(
+                    w,
+                    "<p style=\"margin:8pt 0;\"><img src=\"data:image/png;base64,{b64}\" alt=\"Mermaid diagram\"></p>"
+                );
+            }
+            if is_math_code_info(info) && code.len() <= 32_768 {
+                let trimmed = code.trim();
+                if !trimmed.is_empty()
+                    && let Some((png_bytes, _, _)) = math::render_math_to_png_bytes(
+                        trimmed,
+                        18.0,
+                        true,
+                        [20, 24, 32, 255],
+                        [255, 255, 255, 255],
+                    )
+                {
+                    let b64 = encode_base64(&png_bytes);
+                    w.write_all(b"<p style=\"margin:8pt 0;\"><img src=\"data:image/png;base64,")?;
+                    w.write_all(b64.as_bytes())?;
+                    w.write_all(b"\" alt=\"")?;
+                    write_escaped_html(w, trimmed)?;
+                    return w.write_all(b"\"></p>");
+                }
+            }
+            w.write_all(
+                b"<pre style=\"background-color:#f3f5f8;border:1px solid #dfe4ec;padding:8pt 10pt;font-family:'Cascadia Mono',Consolas,'Courier New',monospace;font-size:9.5pt;white-space:pre-wrap;margin:8pt 0;\"><code>",
+            )?;
+            write_escaped_html(w, code)?;
+            w.write_all(b"</code></pre>")
+        }
+        DocBlock::List {
+            ordered,
+            start,
+            items,
+            direction,
+            indent_level,
+            ..
+        } => {
+            let tag = if *ordered { "ol" } else { "ul" };
+            let start_attr = if *ordered && *start != 1 {
+                format!(" start=\"{start}\"")
+            } else {
+                String::new()
+            };
+            let dir_attr = if *direction == TextDirection::Rtl {
+                " dir=\"rtl\""
+            } else {
+                ""
+            };
+            let indent_pt = 20 + (*indent_level as usize) * 16;
+            write!(
+                w,
+                "<{tag}{start_attr}{dir_attr} style=\"margin:6pt 0 8pt 0;padding-left:{indent_pt}pt;\">"
+            )?;
+            for item in items {
+                w.write_all(b"<li style=\"margin:2pt 0;\">")?;
+                if let Some(checked) = item.checked {
+                    w.write_all(if checked { "☑ ".as_bytes() } else { "☐ ".as_bytes() })?;
+                }
+                if item.blocks.len() == 1
+                    && let DocBlock::Paragraph { runs, .. } = &item.blocks[0]
+                {
+                    write_clipboard_runs_html(w, runs, known_slugs, image_cache)?;
+                } else {
+                    for b in &item.blocks {
+                        write_clipboard_block_html(w, b, known_slugs, image_cache)?;
+                    }
+                }
+                w.write_all(b"</li>")?;
+            }
+            write!(w, "</{tag}>")
+        }
+        DocBlock::Table {
+            alignments,
+            header,
+            rows,
+            ..
+        } => {
+            w.write_all(
+                b"<table border=\"1\" cellspacing=\"0\" cellpadding=\"6\" style=\"border-collapse:collapse;width:100%;margin:8pt 0;font-size:10.5pt;border:1px solid #cbd5e1;\">",
+            )?;
+            let cell_align = |c: usize| -> &'static str {
+                match alignments.get(c).copied().unwrap_or_default() {
+                    TableAlign::Left => "text-align:left;",
+                    TableAlign::Center => "text-align:center;",
+                    TableAlign::Right => "text-align:right;",
+                    TableAlign::None => "text-align:left;",
+                }
+            };
+            if !header.is_empty() {
+                w.write_all(b"<thead><tr>")?;
+                for (c, cell) in header.iter().enumerate() {
+                    let a = cell_align(c);
+                    write!(
+                        w,
+                        "<th style=\"border:1px solid #cbd5e1;background-color:#f1f5f9;font-weight:700;padding:5pt 8pt;{a}\">"
+                    )?;
+                    write_clipboard_runs_html(w, cell, known_slugs, image_cache)?;
+                    w.write_all(b"</th>")?;
+                }
+                w.write_all(b"</tr></thead>")?;
+            }
+            w.write_all(b"<tbody>")?;
+            for row in rows {
+                w.write_all(b"<tr>")?;
+                for (c, cell) in row.iter().enumerate() {
+                    let a = cell_align(c);
+                    write!(
+                        w,
+                        "<td style=\"border:1px solid #cbd5e1;padding:5pt 8pt;{a}\">"
+                    )?;
+                    write_clipboard_runs_html(w, cell, known_slugs, image_cache)?;
+                    w.write_all(b"</td>")?;
+                }
+                w.write_all(b"</tr>")?;
+            }
+            w.write_all(b"</tbody></table>")
+        }
+        DocBlock::ThematicBreak { .. } => {
+            w.write_all(b"<hr style=\"border:none;border-top:1px solid #cbd5e1;margin:10pt 0;\">")
+        }
+        DocBlock::FootnoteDefinition { name, blocks, .. } => {
+            w.write_all(b"<div style=\"margin-top:8pt;padding-top:4pt;border-top:1px dashed #cbd5e1;font-size:9.5pt;color:#4b5563;\"><strong>[^")?;
+            write_escaped_html(w, name)?;
+            w.write_all(b"]:</strong> ")?;
+            for inner in blocks {
+                write_clipboard_block_html(w, inner, known_slugs, image_cache)?;
+            }
+            w.write_all(b"</div>")
+        }
+    }
+}
+
+fn write_clipboard_runs_html<W: Write>(
+    w: &mut W,
+    runs: &[InlineRun],
+    known_slugs: &HashSet<String>,
+    image_cache: &mut FxHashMap<String, String>,
+) -> io::Result<()> {
+    for run in runs {
+        if let Some(ref img_url) = run.image_url {
+            if let Some(src) = resolve_safe_html_image_src(img_url, None, image_cache) {
+                w.write_all(b"<img src=\"")?;
+                write_escaped_html(w, &src)?;
+                w.write_all(b"\" alt=\"")?;
+                write_escaped_html(w, &run.text)?;
+                w.write_all(b"\">")?;
+            } else {
+                write_escaped_html(w, &run.text)?;
+            }
+            continue;
+        }
+        if run.is_footnote_ref {
+            w.write_all(b"<sup style=\"color:#1d5fc4;\">")?;
+            write_escaped_html(w, &run.text)?;
+            w.write_all(b"</sup>")?;
+            continue;
+        }
+        let link_info = run
+            .link_url
+            .as_deref()
+            .and_then(|raw_url| classify_html_href(raw_url, known_slugs));
+        if let Some((ref href, _)) = link_info {
+            w.write_all(b"<a href=\"")?;
+            write_escaped_html(w, href)?;
+            w.write_all(b"\" style=\"color:#1d5fc4;text-decoration:underline;\">")?;
+        }
+        if run.strikethrough {
+            w.write_all(b"<del>")?;
+        }
+        if run.underline {
+            w.write_all(b"<u>")?;
+        }
+        if run.italic {
+            w.write_all(b"<em>")?;
+        }
+        if run.bold {
+            w.write_all(b"<strong>")?;
+        }
+        if run.is_math {
+            let plain = math::math_to_plain_text(&run.text);
+            w.write_all(
+                b"<span style=\"font-family:'Cambria Math','Times New Roman',serif;\">",
+            )?;
+            write_escaped_html(w, &plain)?;
+            w.write_all(b"</span>")?;
+        } else if run.code {
+            w.write_all(
+                b"<code style=\"font-family:'Cascadia Mono',Consolas,'Courier New',monospace;font-size:0.9em;background-color:#f1f5f9;padding:1pt 3pt;\">",
+            )?;
+            write_escaped_html(w, &run.text)?;
+            w.write_all(b"</code>")?;
+        } else {
+            write_escaped_html(w, &run.text)?;
+        }
+        if run.bold {
+            w.write_all(b"</strong>")?;
+        }
+        if run.italic {
+            w.write_all(b"</em>")?;
+        }
+        if run.underline {
+            w.write_all(b"</u>")?;
+        }
+        if run.strikethrough {
+            w.write_all(b"</del>")?;
+        }
+        if link_info.is_some() {
+            w.write_all(b"</a>")?;
+        }
+    }
+    Ok(())
+}
+
 const HTML_STYLESHEET: &str = r#"
 :root {
   --bg: #f6f8fb;
@@ -789,3 +1179,37 @@ hr { border: 0; border-top: 1px solid var(--border); margin: 1.8em 0; }
   .document { width: 100%; padding: 24px 20px; }
 }
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::render_clipboard_html_fragment;
+
+    #[test]
+    fn clipboard_html_preserves_formatting_tables_code_and_rtl() {
+        let md = concat!(
+            "# Report Title\n\n",
+            "Text with **bold**, *italic*, <u>under</u>, ~~old~~, `code`, and [Link](https://example.com).\n\n",
+            "- [x] Done task\n\n",
+            "| Item | Price |\n| --- | ---: |\n| Pen | 10 |\n\n",
+            "```rust\nlet x = 1;\n```\n\n",
+            "مرحبا بالعالم\n",
+        );
+        let html = render_clipboard_html_fragment(md);
+        assert!(html.contains("<h1"));
+        assert!(html.contains("<strong>bold</strong>"));
+        assert!(html.contains("<em>italic</em>"));
+        assert!(html.contains("<u>under</u>"));
+        assert!(html.contains("<del>old</del>"));
+        assert!(html.contains("<code"));
+        assert!(html.contains("https://example.com"));
+        assert!(html.contains("<table"));
+        assert!(html.contains("background-color:#f1f5f9"));
+        assert!(html.contains("<pre"));
+        assert!(html.contains("dir=\"rtl\""));
+
+        let inline_html = render_clipboard_html_fragment("**bold** and *em*");
+        assert!(inline_html.starts_with("<span "));
+        assert!(inline_html.contains("<strong>bold</strong>"));
+        assert!(inline_html.contains("<em>em</em>"));
+    }
+}

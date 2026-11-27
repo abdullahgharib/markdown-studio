@@ -167,6 +167,7 @@ pub struct MarkdownApp {
     pub explorer_delete_modal: ExplorerDeleteConfirmModal,
     pub context_menu: ContextMenuState,
     pub last_copied_text: Option<String>,
+    pub last_copied_html: Option<String>,
     pub last_revealed_path: Option<PathBuf>,
     pub test_clipboard_text: Option<String>,
     pub test_clipboard_html: Option<String>,
@@ -505,6 +506,7 @@ impl MarkdownApp {
             explorer_delete_modal: ExplorerDeleteConfirmModal::default(),
             context_menu: ContextMenuState::default(),
             last_copied_text: None,
+            last_copied_html: None,
             last_revealed_path: None,
             test_clipboard_text: None,
             test_clipboard_html: None,
@@ -3237,6 +3239,19 @@ impl MarkdownApp {
                     });
                 }
 
+        if !modal_before_toolbar
+            && !self.context_menu.is_open()
+            && self.view_mode == ViewMode::Reader
+            && self.reader_state.image_lightbox.is_none()
+            && !self.toolbar_state.renaming_file
+            && !self.find_bar.has_input_focus(ctx)
+            && !ctx.wants_keyboard_input()
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::A))
+        {
+            self.select_all_in_reader();
+            ctx.request_repaint();
+        }
+
         let shortcut_action = self.handle_shortcuts(ctx);
         if shortcut_action != ToolbarAction::None {
             self.dispatch_action(ctx, shortcut_action);
@@ -4279,6 +4294,9 @@ impl MarkdownApp {
             ReaderAction::OpenLink(url) => {
                 self.open_link_target(ctx, &url);
             }
+            ReaderAction::CopyRich { plain, markdown } => {
+                self.copy_rich_to_clipboard(ctx, plain, &markdown);
+            }
             ReaderAction::OpenContextMenu { pos, target } => {
                 self.context_menu
                     .open_at(pos, target, ctx.cumulative_pass_nr());
@@ -4291,6 +4309,9 @@ impl MarkdownApp {
             EditorAction::None => {}
             EditorAction::OpenLink(url) => {
                 self.open_link_target(ctx, &url);
+            }
+            EditorAction::CopySelection(sel) | EditorAction::CutSelection(sel) => {
+                self.copy_rich_to_clipboard(ctx, sel.clone(), &sel);
             }
             EditorAction::OpenContextMenu {
                 pos,
@@ -4314,6 +4335,39 @@ impl MarkdownApp {
                 );
             }
         }
+    }
+
+    /// Copies both plain text (`CF_UNICODETEXT`) and styled HTML (`CF_HTML`) derived from `markdown_source`.
+    pub fn copy_rich_to_clipboard(
+        &mut self,
+        ctx: &egui::Context,
+        plain_text: String,
+        markdown_source: &str,
+    ) {
+        if plain_text.is_empty() {
+            return;
+        }
+        let html = crate::export::html::render_clipboard_html_fragment(markdown_source);
+        self.last_copied_text = Some(plain_text.clone());
+        self.last_copied_html = (!html.is_empty()).then_some(html.clone());
+        if self.open_external_links_with_os {
+            // Avoid calling `ctx.copy_text(...)` on success so eframe does not overwrite `CF_HTML` at frame end.
+            if !crate::document::clipboard::write_os_clipboard_rich(&plain_text, &html) {
+                ctx.copy_text(plain_text);
+            }
+        } else {
+            ctx.copy_text(plain_text);
+        }
+    }
+
+    /// Selects all rendered document text in Reader mode.
+    pub fn select_all_in_reader(&mut self) {
+        let plain = markdown_to_plain_text(&self.buffer.as_string());
+        self.reader_state.reader_sel_all = true;
+        self.reader_state.reader_sel_anchor = None;
+        self.reader_state.reader_sel_focus = None;
+        self.reader_state.reader_sel_dragging = false;
+        self.reader_state.reader_selected_text = (!plain.is_empty()).then_some(plain);
     }
 
     /// Builds the context menu item hierarchy for the currently open `ContextMenuTarget`.
@@ -4384,8 +4438,7 @@ impl MarkdownApp {
                 self.buffer.restore_cached_selection();
                 if let Some(sel) = self.buffer.selection_range() {
                     let selected = self.buffer.selected_text();
-                    ctx.copy_text(selected.clone());
-                    self.last_copied_text = Some(selected);
+                    self.copy_rich_to_clipboard(ctx, selected.clone(), &selected);
                     self.buffer.remove(sel.clone());
                     self.buffer.set_cursor(sel.start, false);
                     self.sync_ast_if_needed();
@@ -4398,22 +4451,27 @@ impl MarkdownApp {
                     if let Some(txt) = self.reader_state.reader_selected_text.clone()
                         && !txt.is_empty()
                     {
-                        ctx.copy_text(txt.clone());
-                        self.last_copied_text = Some(txt);
+                        let md = self
+                            .reader_state
+                            .selected_markdown_for_copy(&self.buffer)
+                            .unwrap_or_else(|| txt.clone());
+                        self.copy_rich_to_clipboard(ctx, txt, &md);
                         self.exporter.status_text = "Copied selection".to_string();
                     }
                 } else {
                     self.buffer.restore_cached_selection();
                     if self.buffer.selection_range().is_some() {
                         let txt = self.buffer.selected_text();
-                        ctx.copy_text(txt.clone());
-                        self.last_copied_text = Some(txt);
+                        self.copy_rich_to_clipboard(ctx, txt.clone(), &txt);
                         self.exporter.status_text = "Copied selection".to_string();
                     } else if let Some(txt) = self.reader_state.reader_selected_text.clone()
                         && !txt.is_empty()
                     {
-                        ctx.copy_text(txt.clone());
-                        self.last_copied_text = Some(txt);
+                        let md = self
+                            .reader_state
+                            .selected_markdown_for_copy(&self.buffer)
+                            .unwrap_or_else(|| txt.clone());
+                        self.copy_rich_to_clipboard(ctx, txt, &md);
                         self.exporter.status_text = "Copied selection".to_string();
                     }
                 }
@@ -4435,6 +4493,7 @@ impl MarkdownApp {
                     let plain = markdown_to_plain_text(&raw);
                     ctx.copy_text(plain.clone());
                     self.last_copied_text = Some(plain);
+                    self.last_copied_html = None;
                     self.exporter.status_text = "Copied as plain text".to_string();
                 }
             }
@@ -4491,11 +4550,7 @@ impl MarkdownApp {
                 let from_reader = read_only
                     || matches!(self.context_menu.target, Some(ContextMenuTarget::Reader { .. }));
                 if from_reader {
-                    let plain = markdown_to_plain_text(&self.buffer.as_string());
-                    self.reader_state.reader_sel_all = true;
-                    self.reader_state.reader_sel_anchor = None;
-                    self.reader_state.reader_sel_focus = None;
-                    self.reader_state.reader_selected_text = (!plain.is_empty()).then_some(plain);
+                    self.select_all_in_reader();
                 } else {
                     let total = self.buffer.len_chars();
                     if total > 0 {

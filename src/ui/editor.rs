@@ -21,6 +21,8 @@ use crate::ui::theme::{ThemeMode, WordTheme};
 pub enum EditorAction {
     None,
     OpenLink(String),
+    CopySelection(String),
+    CutSelection(String),
     OpenContextMenu {
         pos: egui::Pos2,
         link_url: Option<String>,
@@ -320,7 +322,7 @@ pub fn render_virtual_editor(
 
     // Handle keyboard & clipboard input when focused and no modal dialog blocks shortcuts.
     if has_focus && !block_shortcuts {
-        handle_editor_input(ui, buf, state);
+        handle_editor_input(ui, buf, state, &mut editor_action);
     }
 
     let (cursor_line, cursor_col) = buf.char_to_line_col(buf.cursor_char);
@@ -1060,6 +1062,7 @@ fn handle_editor_input(
     ui: &mut egui::Ui,
     buf: &mut DocumentBuffer,
     state: &mut VirtualEditorState,
+    editor_action: &mut EditorAction,
 ) {
     let shift_held_global = ui.input(|i| i.modifiers.shift);
     let mut pasted_this_frame = false;
@@ -1119,16 +1122,18 @@ fn handle_editor_input(
             egui::Event::Copy => {
                 let selected = buf.selected_text();
                 if !selected.is_empty() {
-                    ui.ctx().copy_text(selected);
+                    *editor_action = EditorAction::CopySelection(selected);
                 }
             }
             egui::Event::Cut => {
                 if let Some(sel) = buf.selection_range() {
                     let selected = buf.selected_text();
-                    ui.ctx().copy_text(selected);
                     buf.remove(sel);
                     state.desired_col = None;
                     state.scroll_to_cursor = true;
+                    if !selected.is_empty() {
+                        *editor_action = EditorAction::CutSelection(selected);
+                    }
                 }
             }
             egui::Event::Key {

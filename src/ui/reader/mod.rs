@@ -51,6 +51,10 @@ pub enum ReaderAction {
     JumpToAnchor(String),
     JumpToFootnote(String),
     OpenLink(String),
+    CopyRich {
+        plain: String,
+        markdown: String,
+    },
     OpenContextMenu {
         pos: egui::Pos2,
         target: ContextMenuTarget,
@@ -259,6 +263,49 @@ impl VirtualReaderState {
         self.reader_sel_dragging = false;
         self.reader_sel_all = false;
         self.reader_sel_anchor_y = 0.0;
+    }
+
+    /// Returns the Markdown source corresponding to the current Reader selection when available.
+    pub fn selected_markdown_for_copy(&self, buf: &DocumentBuffer) -> Option<String> {
+        if self.reader_sel_all {
+            let full = buf.as_string();
+            return (!full.is_empty()).then_some(full);
+        }
+        let plain = self.reader_selected_text.as_deref()?.trim();
+        if plain.is_empty() {
+            return None;
+        }
+        if let (Some(a), Some(b)) = (self.reader_sel_anchor, self.reader_sel_focus)
+            && a != b
+        {
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+            let total_lines = buf.len_lines();
+            if lo.doc_line < total_lines {
+                let end_line = hi.doc_line.min(total_lines.saturating_sub(1));
+                if lo.doc_line < end_line {
+                    let mut out = String::new();
+                    for l in lo.doc_line..=end_line {
+                        if !out.is_empty() {
+                            out.push('\n');
+                        }
+                        let line = buf.line_text(l);
+                        out.push_str(line.trim_end_matches(['\r', '\n']));
+                    }
+                    if !out.trim().is_empty() {
+                        return Some(out);
+                    }
+                } else {
+                    let raw = buf.line_text(lo.doc_line);
+                    let raw_trimmed = raw.trim_end_matches(['\r', '\n']);
+                    let line_plain =
+                        crate::ui::context_menu::markdown_to_plain_text(raw_trimmed);
+                    if !line_plain.trim().is_empty() && line_plain.trim() == plain {
+                        return Some(raw_trimmed.to_string());
+                    }
+                }
+            }
+        }
+        self.reader_selected_text.clone()
     }
 
     /// Requests fluid eased scrolling toward vertical offset `y` inside the active reader pane.
@@ -1830,13 +1877,20 @@ pub fn render_virtual_reader(
             }
         }
 
-        if !state.modal_open
+        if action == ReaderAction::None
+            && !state.modal_open
             && !ui.ctx().wants_keyboard_input()
             && ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy)))
             && let Some(ref txt) = state.reader_selected_text
             && !txt.is_empty()
         {
-            ui.ctx().copy_text(txt.clone());
+            let md = state
+                .selected_markdown_for_copy(buf)
+                .unwrap_or_else(|| txt.clone());
+            action = ReaderAction::CopyRich {
+                plain: txt.clone(),
+                markdown: md,
+            };
         }
     }
 
@@ -3892,6 +3946,8 @@ fn render_inline_wysiwyg_block(
                 }
 
                 if has_inline_focus && !is_code {
+                    let mut intercepted_copy_or_cut: Option<(String, bool)> = None;
+                    let has_buf_sel = buf.selection_range().is_some();
                     ui.input_mut(|i| {
                         let shift_held = i.modifiers.shift;
                         let mut has_paste_event = false;
@@ -3929,7 +3985,35 @@ fn render_inline_wysiwyg_block(
                                 && !plain.is_empty() {
                                     i.events.push(egui::Event::Paste(plain));
                                 }
+                        if has_buf_sel {
+                            i.events.retain(|ev| match ev {
+                                egui::Event::Copy => {
+                                    intercepted_copy_or_cut = Some((buf.selected_text(), false));
+                                    false
+                                }
+                                egui::Event::Cut => {
+                                    intercepted_copy_or_cut = Some((buf.selected_text(), true));
+                                    false
+                                }
+                                _ => true,
+                            });
+                        }
                     });
+                    if let Some((sel_md, is_cut)) = intercepted_copy_or_cut
+                        && !sel_md.is_empty()
+                    {
+                        if is_cut && let Some(sel) = buf.selection_range() {
+                            buf.remove(sel.clone());
+                            buf.set_cursor(sel.start, false);
+                            sync_active_block_from_buf(buf, show_markup, state);
+                            state.focus_inline_editor = true;
+                            state.sync_cursor_from_buf = true;
+                        }
+                        action = ReaderAction::CopyRich {
+                            plain: sel_md.clone(),
+                            markdown: sel_md,
+                        };
+                    }
                 }
 
                 let is_empty_block_text = state.active_block_text.is_empty();
@@ -4004,8 +4088,13 @@ fn render_inline_wysiwyg_block(
                             && ui.input(|i| {
                                 i.pointer.button_clicked(egui::PointerButton::Secondary)
                             })));
+                let secondary_pressed = !secondary_click
+                    && !state.modal_open
+                    && !ui.ctx().memory(|m| m.any_popup_open())
+                    && in_text_rect
+                    && ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Secondary));
 
-                if secondary_click {
+                if secondary_pressed || secondary_click {
                     let click_log_idx = if let Some(pos) = pointer_pos_opt {
                         let rel = pos - output.galley_pos;
                         let vis_idx = output
@@ -4020,51 +4109,79 @@ fn render_inline_wysiwyg_block(
                             .map(|cr| cr.primary.index.min(text_chars))
                             .unwrap_or(text_chars)
                     };
-                    let preserve_selection = prev_logical_cr.is_some_and(|cr| {
+                    let block_start = buf.line_to_char(src_lines.start);
+                    let prefix_chars = state.active_block_prefix.chars().count();
+                    let buf_local_cr = buf.selection_range().and_then(|sel| {
+                        let text_start_doc = block_start + prefix_chars;
+                        let lo = doc_to_local_chars(
+                            sel.start.saturating_sub(text_start_doc),
+                            &state.active_block_text,
+                            is_crlf,
+                        )
+                        .min(text_chars);
+                        let hi = doc_to_local_chars(
+                            sel.end.saturating_sub(text_start_doc),
+                            &state.active_block_text,
+                            is_crlf,
+                        )
+                        .min(text_chars);
+                        (lo < hi).then(|| {
+                            egui::text::CCursorRange::two(
+                                egui::text::CCursor::new(lo),
+                                egui::text::CCursor::new(hi),
+                            )
+                        })
+                    });
+                    let effective_cr = prev_logical_cr
+                        .filter(|cr| cr.primary.index != cr.secondary.index)
+                        .or(buf_local_cr);
+                    let preserve_selection = effective_cr.is_some_and(|cr| {
                         let lo = cr.primary.index.min(cr.secondary.index).min(text_chars);
                         let hi = cr.primary.index.max(cr.secondary.index).min(text_chars);
                         lo < hi && click_log_idx >= lo && click_log_idx <= hi
                     });
                     if preserve_selection {
-                        output.state.cursor.set_char_range(prev_logical_cr);
+                        output.state.cursor.set_char_range(effective_cr);
                         output.state.clone().store(ui.ctx(), inline_id);
-                        state.last_cursor_range = prev_logical_cr;
-                    } else {
+                        state.last_cursor_range = effective_cr;
+                        output.response.request_focus();
+                        did_click_select = true;
+                    } else if secondary_click {
                         let cr = egui::text::CCursorRange::one(egui::text::CCursor::new(
                             click_log_idx,
                         ));
                         output.state.cursor.set_char_range(Some(cr));
                         output.state.clone().store(ui.ctx(), inline_id);
                         state.last_cursor_range = Some(cr);
-                        let block_start = buf.line_to_char(src_lines.start);
-                        let prefix_chars = state.active_block_prefix.chars().count();
                         let click_doc =
                             local_to_doc_chars(click_log_idx, &state.active_block_text, is_crlf);
                         buf.set_cursor(
                             (block_start + prefix_chars + click_doc).min(buf.len_chars()),
                             false,
                         );
+                        output.response.request_focus();
+                        did_click_select = true;
                     }
-                    output.response.request_focus();
-                    did_click_select = true;
-                    let link_url = if !is_code && in_text_rect {
-                        extract_markdown_link_at_char(&state.active_block_text, click_log_idx)
-                            .filter(|u| classify_link_url(u).is_some())
-                    } else {
-                        None
-                    };
-                    let cursor_line = buf.char_to_line(buf.cursor_char);
-                    let sel = buf.selection_range().map(|_| buf.selected_text());
-                    action = ReaderAction::OpenContextMenu {
-                        pos: pointer_pos_opt.unwrap_or_else(|| output.response.rect.center()),
-                        target: ContextMenuTarget::Editor {
-                            from_wysiwyg: true,
-                            has_selection: sel.is_some(),
-                            selected_text: sel,
-                            link_url,
-                            cursor_line,
-                        },
-                    };
+                    if secondary_click {
+                        let link_url = if !is_code && in_text_rect {
+                            extract_markdown_link_at_char(&state.active_block_text, click_log_idx)
+                                .filter(|u| classify_link_url(u).is_some())
+                        } else {
+                            None
+                        };
+                        let cursor_line = buf.char_to_line(buf.cursor_char);
+                        let sel = buf.selection_range().map(|_| buf.selected_text());
+                        action = ReaderAction::OpenContextMenu {
+                            pos: pointer_pos_opt.unwrap_or_else(|| output.response.rect.center()),
+                            target: ContextMenuTarget::Editor {
+                                from_wysiwyg: true,
+                                has_selection: sel.is_some(),
+                                selected_text: sel,
+                                link_url,
+                                cursor_line,
+                            },
+                        };
+                    }
                 } else if is_triple {
                     let cr = egui::text::CCursorRange::two(
                         egui::text::CCursor::new(0),
@@ -4420,9 +4537,13 @@ fn render_inline_wysiwyg_block(
                     }
                 }
 
-                if !did_mutate_sync && !did_click_select && !state.sync_cursor_from_buf
+                if !did_mutate_sync
+                    && !did_click_select
+                    && !state.sync_cursor_from_buf
+                    && !state.modal_open
                     && let Some(cr) = output.state.cursor.char_range()
-                        && output.response.has_focus() {
+                    && output.response.has_focus()
+                {
                             state.last_cursor_range = Some(cr);
                             let block_start_char = buf.line_to_char(src_lines.start);
                             let prefix_chars = state.active_block_prefix.chars().count();
@@ -4536,13 +4657,38 @@ fn render_inline_wysiwyg_block(
                 });
                 let p_log = active_cr.primary.index.min(text_chars);
                 let s_log = active_cr.secondary.index.min(text_chars);
-                let (sel_min, sel_max) = if s_log <= p_log {
+                let (mut sel_min, mut sel_max) = if s_log <= p_log {
                     (s_log, p_log)
                 } else {
                     (p_log, s_log)
                 };
-                let show_unfocused_sel =
-                    !output.response.has_focus() && !src_lines.is_empty() && buf.selection_range().is_some();
+                let show_unfocused_sel = (!output.response.has_focus() || state.modal_open)
+                    && !src_lines.is_empty()
+                    && buf.selection_range().is_some();
+                if sel_min == sel_max
+                    && show_unfocused_sel
+                    && let Some(buf_sel) = buf.selection_range()
+                {
+                    let block_start_char = buf.line_to_char(src_lines.start);
+                    let prefix_chars = state.active_block_prefix.chars().count();
+                    let text_start_doc = block_start_char + prefix_chars;
+                    let lo = doc_to_local_chars(
+                        buf_sel.start.saturating_sub(text_start_doc),
+                        &state.active_block_text,
+                        is_crlf,
+                    )
+                    .min(text_chars);
+                    let hi = doc_to_local_chars(
+                        buf_sel.end.saturating_sub(text_start_doc),
+                        &state.active_block_text,
+                        is_crlf,
+                    )
+                    .min(text_chars);
+                    if lo < hi {
+                        sel_min = lo;
+                        sel_max = hi;
+                    }
+                }
                 if sel_min < sel_max && (output.response.has_focus() || show_unfocused_sel) {
                     for vr in bidi.visual_ranges_for_logical_span(sel_min, sel_max) {
                         let c_min = output

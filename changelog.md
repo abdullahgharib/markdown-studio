@@ -5,6 +5,15 @@ For architecture, features, shortcuts, and build instructions, see [README.md](R
 
 ---
 
+### `v0.8.3` (2026-11-27) — Context Menu Submenu Stability, WYSIWYG Selection, Reader `Ctrl+A` & Rich HTML Copy
+- **Fixed Submenu Hover Crash (`src/ui/context_menu.rs`)**: Snapshotted `open_submenu_path` into `render_path` before rendering nested panels in `ContextMenuState::render_panels`, preventing an out-of-bounds slice panic when moving from an open `Formatting ▸` / `Headings ▸` submenu back onto root items, and added immediate repaint requests on submenu transitions.
+- **Preserved WYSIWYG Right-Click Selections (`src/ui/reader/mod.rs`)**: Preserved `output.state.cursor` and `buf.selection_range()` across `PointerButton::Secondary` press frames and open context-menu overlays, and rendered custom selection highlights from `buf.selection_range()` while `TextEdit` is unfocused or a context menu is active.
+- **Enabled `Ctrl+A` in Reader Mode (`src/ui/mod.rs`)**: Added `MarkdownApp::select_all_in_reader()` and wired `Ctrl+A` (`Modifiers::COMMAND + Key::A`) in `ViewMode::Reader` so pressing `Ctrl+A` selects all rendered document content (ready for `Ctrl+C` or `Copy` menu actions).
+- **Rich Styled HTML + Plain Text Clipboard Copy (`src/export/html.rs`, `src/document/clipboard.rs`, `src/ui/editor.rs`, `src/ui/reader/mod.rs`, `src/ui/mod.rs`)**:
+  - Added `render_clipboard_html_fragment` generating inline-CSS HTML preserving headings, bold/italic/underline/strikethrough, inline code, links, lists/checklists, blockquotes, code blocks, bordered shaded tables, Mermaid/Math raster images, alignment, and RTL `dir="rtl"`.
+  - Added `build_cf_html_payload` and Win32 `write_os_clipboard_rich` writing both `CF_UNICODETEXT` and `CF_HTML` so pasting into Word, Google Docs, or Outlook preserves rich formatting and styling (while `Copy as Plain Text` continues writing plain text only).
+- **Tests (`src/export/html.rs`, `src/document/clipboard.rs`, `tests/ui_integration_tests.rs`)**: Added unit tests and `test_submenu_hover_no_panic_wysiwyg_selection_reader_ctrl_a_and_rich_copy` verifying submenu hover transitions, WYSIWYG selection preservation & highlight painting, Reader `Ctrl+A`, and rich HTML clipboard output.
+
 ### `v0.8.2` (2026-11-27) — Professional Context-Aware Right-Click Menus
 - **Modular Right-Click Menu System (`src/ui/context_menu.rs`, `src/ui/mod.rs`)**:
   - Built `ContextMenuState`, semantic `ContextMenuTarget` snapshots, `ContextMenuAction`, nested cascading submenus (`Formatting ▸` / `Headings ▸`), screen-edge flipping (`compute_root_menu_pos`, `compute_submenu_pos`), keyboard navigation (`ArrowUp`/`ArrowDown`/`ArrowRight`/`ArrowLeft`/`Enter`/`Space`/`Escape`), outside-click dismissal, shortcut hints, disabled states, and theme-matched Light/Sepia/Dark panels.
