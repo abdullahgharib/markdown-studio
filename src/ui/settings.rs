@@ -153,6 +153,8 @@ pub struct AppSettings {
     pub explorer_root: Option<PathBuf>,
     pub custom_exe_path: Option<PathBuf>,
     pub auto_sync_exe_path: bool,
+    pub check_updates_on_startup: bool,
+    pub skipped_update_version: Option<String>,
     pub auto_calc_math: bool,
     pub auto_calc_tables: bool,
     pub word_goal: usize,
@@ -193,6 +195,8 @@ impl Default for AppSettings {
             explorer_root: None,
             custom_exe_path: None,
             auto_sync_exe_path: true,
+            check_updates_on_startup: true,
+            skipped_update_version: None,
             auto_calc_math: false,
             auto_calc_tables: true,
             word_goal: 0,
@@ -340,9 +344,10 @@ impl AppSettings {
         let ui_font_json = opt_str_json(&self.ui_font_name);
         let editor_font_json = opt_str_json(&self.editor_font_name);
         let reader_font_json = opt_str_json(&self.reader_font_name);
+        let skipped_update_json = opt_str_json(&self.skipped_update_version);
 
         format!(
-            "{{\n  \"dark_mode\": {},\n  \"theme_mode\": \"{}\",\n  \"page_width\": \"{}\",\n  \"line_spacing\": \"{}\",\n  \"view_mode\": \"{}\",\n  \"show_markup\": {},\n  \"outline_open\": {},\n  \"split_ratio\": {:.3},\n  \"sync_scroll\": {},\n  \"zoom_factor\": {:.2},\n  \"ui_font_size\": {:.1},\n  \"ui_font_name\": {},\n  \"editor_font_family\": \"{}\",\n  \"editor_font_size\": {:.1},\n  \"editor_font_name\": {},\n  \"reader_font_family\": \"{}\",\n  \"reader_font_size\": {:.1},\n  \"reader_font_name\": {},\n  \"allow_external_links\": {},\n  \"allow_local_file_links\": {},\n  \"allow_executable_links\": {},\n  \"allow_unc_network_links\": {},\n  \"allow_ntfs_ads_links\": {},\n  \"allow_javascript_uri\": {},\n  \"allow_vbscript_uri\": {},\n  \"allow_data_uri\": {},\n  \"allow_remote_images\": {},\n  \"recent_files\": {},\n  \"explorer_root\": {},\n  \"custom_exe_path\": {},\n  \"auto_sync_exe_path\": {},\n  \"auto_calc_math\": {},\n  \"auto_calc_tables\": {},\n  \"word_goal\": {},\n  \"char_goal\": {}\n}}\n",
+            "{{\n  \"dark_mode\": {},\n  \"theme_mode\": \"{}\",\n  \"page_width\": \"{}\",\n  \"line_spacing\": \"{}\",\n  \"view_mode\": \"{}\",\n  \"show_markup\": {},\n  \"outline_open\": {},\n  \"split_ratio\": {:.3},\n  \"sync_scroll\": {},\n  \"zoom_factor\": {:.2},\n  \"ui_font_size\": {:.1},\n  \"ui_font_name\": {},\n  \"editor_font_family\": \"{}\",\n  \"editor_font_size\": {:.1},\n  \"editor_font_name\": {},\n  \"reader_font_family\": \"{}\",\n  \"reader_font_size\": {:.1},\n  \"reader_font_name\": {},\n  \"allow_external_links\": {},\n  \"allow_local_file_links\": {},\n  \"allow_executable_links\": {},\n  \"allow_unc_network_links\": {},\n  \"allow_ntfs_ads_links\": {},\n  \"allow_javascript_uri\": {},\n  \"allow_vbscript_uri\": {},\n  \"allow_data_uri\": {},\n  \"allow_remote_images\": {},\n  \"recent_files\": {},\n  \"explorer_root\": {},\n  \"custom_exe_path\": {},\n  \"auto_sync_exe_path\": {},\n  \"check_updates_on_startup\": {},\n  \"skipped_update_version\": {},\n  \"auto_calc_math\": {},\n  \"auto_calc_tables\": {},\n  \"word_goal\": {},\n  \"char_goal\": {}\n}}\n",
             self.dark_mode || self.theme_mode == ThemeMode::Dark,
             tm,
             pw,
@@ -374,6 +379,8 @@ impl AppSettings {
             explorer_json,
             exe_json,
             self.auto_sync_exe_path,
+            self.check_updates_on_startup,
+            skipped_update_json,
             self.auto_calc_math,
             self.auto_calc_tables,
             self.word_goal,
@@ -527,6 +534,15 @@ impl AppSettings {
         }
         if let Some(v) = extract_bool_field(raw, "auto_sync_exe_path") {
             s.auto_sync_exe_path = v;
+        }
+        if let Some(v) = extract_bool_field(raw, "check_updates_on_startup") {
+            s.check_updates_on_startup = v;
+        }
+        if let Some(ver) = extract_str_field(raw, "skipped_update_version") {
+            let trimmed = ver.trim();
+            if !trimmed.is_empty() {
+                s.skipped_update_version = Some(trimmed.to_string());
+            }
         }
         if let Some(v) = extract_bool_field(raw, "auto_calc_math") {
             s.auto_calc_math = v;
@@ -808,9 +824,13 @@ mod tests {
             allow_vbscript_uri: true,
             allow_data_uri: true,
             allow_remote_images: false,
+            check_updates_on_startup: false,
+            skipped_update_version: Some("0.9.0".to_string()),
             ..Default::default()
         };
         let parsed = AppSettings::from_json_str(&custom.to_json_string());
+        assert!(!parsed.check_updates_on_startup);
+        assert_eq!(parsed.skipped_update_version.as_deref(), Some("0.9.0"));
         assert!((parsed.ui_font_size - 14.0).abs() < 0.01);
         assert_eq!(parsed.ui_font_name.as_deref(), Some("Segoe UI"));
         assert_eq!(parsed.editor_font_family, FontPreference::Serif);

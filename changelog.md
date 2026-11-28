@@ -5,6 +5,18 @@ For architecture, features, shortcuts, and build instructions, see [README.md](R
 
 ---
 
+### `v0.8.8` (2026-11-28) — Immediate WYSIWYG `Enter` New Lines & GitHub Auto-Updater
+- **Immediate Word/Notepad-Style `Enter` & Symmetric `Backspace` in WYSIWYG (`src/ui/reader/mod.rs`)**:
+  - Fixed single `Enter` in WYSIWYG mode so pressing `Enter` once immediately creates a new visible paragraph/line (`\n\n` after non-empty lines, or `1` newline at the top of a file / directly below a blank gap), and each subsequent `Enter` immediately adds one visible blank line (`DocBlock::BlankLines`) without needing multiple presses or jumping.
+  - Enabled `Enter` splitting inside multi-line WYSIWYG paragraphs (`inserted_newline_byte_offset`), prevented newly typed text on an empty blank line directly above another paragraph from merging into the block below, and made `Backspace` on a newly inserted empty paragraph remove `\n\n` cleanly in one keystroke.
+- **Built-In GitHub Auto-Updater & Settings Preferences (`src/ui/updater.rs`, `src/ui/settings.rs`, `src/ui/settings_modal.rs`, `src/ui/toolbar.rs`, `src/ui/dialogs.rs`, `src/ui/mod.rs`)**:
+  - Added `src/ui/updater.rs` querying GitHub Releases (`releases/latest` with zero-serde depth-aware JSON parsing, semver comparison, and `changelog.md` fallback) over a strict HTTPS allowlist (`api.github.com`, `github.com`, `raw.githubusercontent.com`, `objects.githubusercontent.com`, `release-assets.githubusercontent.com`).
+  - Added a non-blocking top-bar **`↑ vX.Y.Z`** pill (`ToolbarAction::OpenUpdateModal`) and a dedicated **Software Update** modal showing **"What's Changed"** release notes, progress bar download, **Skip This Version**, and manual **GitHub Page** link.
+  - Implemented cross-platform download verification (Windows `MZ` / Linux `ELF` / macOS Mach-O `.tar.gz` extraction), unsaved-tab prompt (`PendingDiscardAction::InstallUpdate`), session snapshot save, atomic executable swap (`<exe>.old` cleanup on next launch), and automatic relaunch.
+  - Added **Settings -> Updates** (`SettingsTab::Updates`) with `check_updates_on_startup`, `skipped_update_version` (`Clear Skipped Version`), manual **Check for Updates Now**, and inline release notes preview.
+- **Tests (`src/ui/updater.rs`, `src/ui/settings.rs`, `tests/ui_integration_tests.rs`)**:
+  - Added unit tests for semver comparison, GitHub release JSON parsing, changelog fallback extraction, trusted host filtering, executable magic checks, `.tar.gz` extraction, and settings round-trips, plus `test_wysiwyg_enter_immediate_newline_blank_lines_and_backspace` and `test_updates_tab_top_bar_badge_and_skip_version`.
+
 ### `v0.8.7` (2026-11-28) — Blank-Line Spacing Preservation & Word/Notepad Multi-Block WYSIWYG Selection
 - **Visual Blank-Line Preservation Across Views & Exports (`src/export/ir.rs`, `src/document/ast.rs`, `src/document/viewport.rs`, `src/ui/reader/mod.rs`, `src/export/{pdf,docx,html,json}.rs`)**:
   - Added `DocBlock::BlankLines { count, source_lines }` and `insert_blank_line_blocks` (executed cleanly after AST chunk merging so serial `parse_to_ir` and parallel `parse_rope_to_ir_cancellable` stay identical) to preserve intentional extra blank lines (2+ consecutive empty lines between or after blocks, or 1+ leading empty lines) without inserting `<br>` clutter into clean `.md` source files.

@@ -107,6 +107,7 @@ pub enum ToolbarAction {
     SetViewMode(ViewMode),
     OpenSettings,
     OpenOsIntegrationModal,
+    OpenUpdateModal,
 }
 
 /// Persistent state for interactive toolbar popups and responsive layout measurement.
@@ -137,6 +138,7 @@ pub fn render_toolbar(
     active_fmt: &ActiveFormatState,
     theme: &WordTheme,
     export_busy: bool,
+    available_update: Option<&str>,
     state: &mut ToolbarState,
 ) -> ToolbarAction {
     let mut action = ToolbarAction::None;
@@ -189,6 +191,9 @@ pub fn render_toolbar(
                             .rect
                             .width()
                             + 2.5;
+                        if let Some(upd_ver) = available_update {
+                            right_w += render_update_pill(ui, upd_ver, theme, &mut action) + 2.5;
+                        }
                     });
                 });
             } else {
@@ -208,6 +213,9 @@ pub fn render_toolbar(
                         .rect
                         .width()
                         + 2.5;
+                    if let Some(upd_ver) = available_update {
+                        right_w += render_update_pill(ui, upd_ver, theme, &mut action) + 2.5;
+                    }
                     right_w += ui.separator().rect.width() + 2.5;
                     right_w += render_workspace_toggles(
                         ui,
@@ -769,6 +777,32 @@ fn render_history_split_button(
 
     let total_w = main_r.rect.width() + arrow_r.rect.width();
     (total_w, chosen)
+}
+
+fn render_update_pill(
+    ui: &mut egui::Ui,
+    version: &str,
+    theme: &WordTheme,
+    action: &mut ToolbarAction,
+) -> f32 {
+    let tip = format!("Update v{version} available on GitHub — Click to review what's changed");
+    let r = vivid_button(
+        ui,
+        RichText::new(format!("↑ v{version}"))
+            .size(11.5)
+            .strong(),
+        Vec2::ZERO,
+        12,
+        false,
+        true,
+        ToolbarButtonKind::AccentSoft,
+        &tip,
+        theme,
+    );
+    if r.clicked() {
+        *action = ToolbarAction::OpenUpdateModal;
+    }
+    r.rect.width()
 }
 
 fn render_view_mode_switcher(

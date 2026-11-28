@@ -2,10 +2,12 @@ use std::path::Path;
 
 use egui::{Align2, Color32, CornerRadius, Key, Margin, RichText, Stroke, Vec2};
 
+use crate::APP_VERSION;
 use crate::ui::fonts::installed_system_fonts;
 use crate::ui::os_integration::OsIntegrationModal;
 use crate::ui::settings::{AppSettings, FontPreference, LineSpacing, PageWidth};
 use crate::ui::theme::{ThemeMode, WordTheme};
+use crate::ui::updater::{render_release_notes_box, UpdateManager, UpdateStatus, RELEASES_PAGE_URL};
 
 /// Tabs inside the unified Settings & Preferences modal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -14,6 +16,7 @@ pub enum SettingsTab {
     Appearance,
     Security,
     OsIntegration,
+    Updates,
 }
 
 /// Result returned from `SettingsModal::show` when user edits preferences or triggers OS integration actions.
@@ -22,6 +25,9 @@ pub struct SettingsModalOutcome {
     pub settings_changed: bool,
     pub theme_changed: bool,
     pub status_message: Option<String>,
+    pub check_updates_now: bool,
+    pub open_update_modal: bool,
+    pub open_release_page: Option<String>,
 }
 
 /// Unified tabbed Preferences, Security, and OS Integration dialog (`Ctrl+,`).
@@ -48,6 +54,7 @@ impl SettingsModal {
         os_modal.open = false;
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn show(
         &mut self,
         ctx: &egui::Context,
@@ -55,6 +62,7 @@ impl SettingsModal {
         settings: &mut AppSettings,
         settings_path: &Path,
         os_modal: &mut OsIntegrationModal,
+        updater: &UpdateManager,
     ) -> SettingsModalOutcome {
         let mut outcome = SettingsModalOutcome::default();
         if !self.open {
@@ -81,6 +89,7 @@ impl SettingsModal {
                         (SettingsTab::Appearance, "Appearance & Fonts"),
                         (SettingsTab::Security, "Security"),
                         (SettingsTab::OsIntegration, "OS Integration"),
+                        (SettingsTab::Updates, "Updates"),
                     ] {
                         let active = self.active_tab == tab;
                         let btn = egui::Button::new(
@@ -135,6 +144,9 @@ impl SettingsModal {
                                 outcome.settings_changed = true;
                                 outcome.status_message = Some(msg);
                             }
+                        }
+                        SettingsTab::Updates => {
+                            Self::show_updates_tab(ui, theme, settings, updater, &mut outcome);
                         }
                     });
 
@@ -659,6 +671,150 @@ impl SettingsModal {
             settings.allow_remote_images = def.allow_remote_images;
             outcome.settings_changed = true;
             outcome.status_message = Some("Restored safe security defaults".to_string());
+        }
+    }
+
+    fn show_updates_tab(
+        ui: &mut egui::Ui,
+        theme: &WordTheme,
+        settings: &mut AppSettings,
+        updater: &UpdateManager,
+        outcome: &mut SettingsModalOutcome,
+    ) {
+        ui.label(
+            RichText::new("GitHub Releases & Auto-Update")
+                .strong()
+                .size(13.5)
+                .color(theme.text_primary),
+        );
+        ui.label(
+            RichText::new(format!(
+                "Installed version: v{APP_VERSION}  ·  Repository: github.com/abdullahgharib/markdown-studio"
+            ))
+            .size(11.5)
+            .color(theme.text_muted),
+        );
+        ui.add_space(8.0);
+
+        if ui
+            .checkbox(
+                &mut settings.check_updates_on_startup,
+                "Check for updates automatically on startup",
+            )
+            .changed()
+        {
+            outcome.settings_changed = true;
+        }
+
+        if let Some(skipped) = settings.skipped_update_version.clone() {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("Skipped version: v{skipped}"))
+                        .size(12.0)
+                        .color(theme.text_muted),
+                );
+                if ui.small_button("Clear Skipped Version").clicked() {
+                    settings.skipped_update_version = None;
+                    outcome.settings_changed = true;
+                    outcome.status_message = Some(format!("Cleared skipped version v{skipped}"));
+                }
+            });
+        }
+
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            let busy = updater.is_busy();
+            let check_btn = egui::Button::new(
+                RichText::new(if matches!(updater.status, UpdateStatus::Checking { .. }) {
+                    "Checking..."
+                } else {
+                    "Check for Updates Now"
+                })
+                .strong()
+                .color(Color32::WHITE),
+            )
+            .fill(theme.accent)
+            .stroke(Stroke::NONE)
+            .corner_radius(CornerRadius::same(6));
+            if ui.add_enabled(!busy, check_btn).clicked() {
+                outcome.check_updates_now = true;
+            }
+            if ui.button("Open GitHub Releases").clicked() {
+                outcome.open_release_page = Some(RELEASES_PAGE_URL.to_string());
+            }
+        });
+
+        ui.add_space(10.0);
+        match &updater.status {
+            UpdateStatus::Idle => {
+                ui.label(
+                    RichText::new("Click \"Check for Updates Now\" to query GitHub Releases.")
+                        .size(12.0)
+                        .color(theme.text_muted),
+                );
+            }
+            UpdateStatus::Checking { .. } => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(
+                        RichText::new("Checking GitHub Releases...")
+                            .size(12.5)
+                            .color(theme.text_primary),
+                    );
+                });
+            }
+            UpdateStatus::UpToDate { checked_version } => {
+                ui.label(
+                    RichText::new(format!(
+                        "You are up to date (v{APP_VERSION}, latest on GitHub: v{checked_version})."
+                    ))
+                    .size(12.5)
+                    .color(theme.accent),
+                );
+            }
+            UpdateStatus::Available(info)
+            | UpdateStatus::Downloading { info, .. }
+            | UpdateStatus::ReadyToInstall { info, .. } => {
+                ui.label(
+                    RichText::new(format!("Update v{} is available — What's Changed:", info.version))
+                        .strong()
+                        .size(12.5)
+                        .color(theme.accent),
+                );
+                ui.add_space(4.0);
+                render_release_notes_box(ui, &info.body, theme, 180.0);
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let install_btn = egui::Button::new(
+                        RichText::new("View & Install Update...")
+                            .strong()
+                            .color(Color32::WHITE),
+                    )
+                    .fill(theme.accent)
+                    .stroke(Stroke::NONE)
+                    .corner_radius(CornerRadius::same(6));
+                    if ui.add(install_btn).clicked() {
+                        outcome.open_update_modal = true;
+                    }
+                    let is_skipped = settings.skipped_update_version.as_deref().is_some_and(|s| {
+                        crate::ui::updater::normalize_version_str(s)
+                            == crate::ui::updater::normalize_version_str(&info.version)
+                    });
+                    if !is_skipped && ui.button("Skip This Version").clicked() {
+                        settings.skipped_update_version = Some(info.version.clone());
+                        outcome.settings_changed = true;
+                        outcome.status_message = Some(format!("Skipped update v{}", info.version));
+                    }
+                });
+            }
+            UpdateStatus::Error { message, .. } => {
+                ui.label(
+                    RichText::new(format!("Update check error: {message}"))
+                        .size(12.0)
+                        .color(theme.warning_amber),
+                );
+            }
         }
     }
 }

@@ -13,6 +13,7 @@ pub mod settings_modal;
 pub mod tabs;
 pub mod theme;
 pub mod toolbar;
+pub mod updater;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -166,6 +167,7 @@ pub struct MarkdownApp {
     pub print_modal: PrintDialogModal,
     pub os_modal: OsIntegrationModal,
     pub settings_modal: SettingsModal,
+    pub updater: updater::UpdateManager,
     pub external_diff_modal: ExternalDiffModal,
     pub explorer_rename_modal: ExplorerRenameModal,
     pub explorer_delete_modal: ExplorerDeleteConfirmModal,
@@ -295,6 +297,13 @@ impl MarkdownApp {
                 }
             });
             app.os_sync_rx = Some(rx);
+        }
+        updater::cleanup_old_binary_on_startup();
+        let disable_auto_update = std::env::var_os("MD_STUDIO_SCREENSHOT_OUT").is_some()
+            || std::env::var_os("MD_STUDIO_DISABLE_UPDATE_CHECK")
+                .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+        if app.settings.check_updates_on_startup && !disable_auto_update {
+            app.updater.start_check(&cc.egui_ctx, true);
         }
         app
     }
@@ -516,6 +525,7 @@ impl MarkdownApp {
             print_modal: PrintDialogModal::default(),
             os_modal: OsIntegrationModal::default(),
             settings_modal: SettingsModal::default(),
+            updater: updater::UpdateManager::default(),
             external_diff_modal: ExternalDiffModal::default(),
             explorer_rename_modal: ExplorerRenameModal::default(),
             explorer_delete_modal: ExplorerDeleteConfirmModal::default(),
@@ -1724,6 +1734,51 @@ impl MarkdownApp {
                 self.allow_close_now = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
+            PendingDiscardAction::InstallUpdate => {
+                self.finalize_and_relaunch_update(ctx);
+            }
+        }
+    }
+
+    pub fn request_install_staged_update(&mut self, ctx: &egui::Context) {
+        if self.has_any_dirty_tab() {
+            if let Some(dirty_idx) = self.first_dirty_tab_index() {
+                self.switch_to_tab(dirty_idx);
+            }
+            self.updater.modal_open = false;
+            self.unsaved_modal.open(PendingDiscardAction::InstallUpdate);
+            ctx.request_repaint();
+        } else {
+            self.finalize_and_relaunch_update(ctx);
+        }
+    }
+
+    fn finalize_and_relaunch_update(&mut self, ctx: &egui::Context) {
+        let Some(staged_path) = (match &self.updater.status {
+            updater::UpdateStatus::ReadyToInstall { staged_path, .. } => {
+                Some(staged_path.clone())
+            }
+            _ => None,
+        }) else {
+            return;
+        };
+        if self.pending_zoom_save_at.take().is_some() {
+            self.persist_settings();
+        }
+        self.save_session_and_recovery_now();
+        match updater::apply_staged_update_and_relaunch(&staged_path) {
+            Ok(()) => {
+                self.allow_close_now = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Err(err) => {
+                self.updater.status = updater::UpdateStatus::Error {
+                    message: err.clone(),
+                    open_releases_fallback: true,
+                };
+                self.updater.modal_open = true;
+                self.exporter.status_text = err;
+            }
         }
     }
 
@@ -1736,6 +1791,7 @@ impl MarkdownApp {
             || self.insert_link_modal.open
             || self.os_modal.open
             || self.settings_modal.open
+            || self.updater.modal_open
             || self.external_diff_modal.open
             || self.explorer_rename_modal.open
             || self.explorer_delete_modal.open
@@ -2374,6 +2430,16 @@ impl MarkdownApp {
                     &self.settings,
                 );
             }
+            ToolbarAction::OpenUpdateModal => {
+                self.updater.modal_open = true;
+                if matches!(
+                    self.updater.status,
+                    updater::UpdateStatus::Idle | updater::UpdateStatus::Error { .. }
+                ) {
+                    self.updater.start_check(ctx, false);
+                }
+                ctx.request_repaint();
+            }
         }
 
         if mutation_for_wysiwyg && self.view_mode == ViewMode::Wysiwyg {
@@ -2915,6 +2981,13 @@ impl MarkdownApp {
 
     pub fn update_ui(&mut self, ctx: &egui::Context) {
         self.buffer.poll_dirty_check();
+        let (upd_msg, auto_install_update) = self.updater.poll();
+        if let Some(msg) = upd_msg {
+            self.exporter.status_text = msg;
+        }
+        if auto_install_update {
+            self.request_install_staged_update(ctx);
+        }
         if self.context_menu.is_open() {
             let items = self.build_active_context_menu_items();
             if let Some(act) = self.context_menu.process_open_input(ctx, &items) {
@@ -3216,6 +3289,7 @@ impl MarkdownApp {
             || self.insert_link_modal.open
             || self.os_modal.open
             || self.settings_modal.open
+            || self.updater.modal_open
             || self.external_diff_modal.open
             || self.explorer_rename_modal.open
             || self.explorer_delete_modal.open;
@@ -3415,6 +3489,10 @@ impl MarkdownApp {
                         self.outline_open && self.sidebar_tab == SidebarTab::Explorer;
                     let outline_active =
                         self.outline_open && self.sidebar_tab == SidebarTab::Outline;
+                    let available_update = self
+                        .updater
+                        .visible_badge_version(self.settings.skipped_update_version.as_deref())
+                        .map(str::to_string);
                     let action = render_toolbar(
                         ui,
                         &self.buffer,
@@ -3429,6 +3507,7 @@ impl MarkdownApp {
                         &active_fmt_snapshot,
                         &self.theme,
                         self.exporter.busy,
+                        available_update.as_deref(),
                         &mut self.toolbar_state,
                     );
                     if action != ToolbarAction::None {
@@ -3577,6 +3656,7 @@ impl MarkdownApp {
             || self.insert_link_modal.open
             || self.os_modal.open
             || self.settings_modal.open
+            || self.updater.modal_open
             || self.external_diff_modal.open
             || self.explorer_rename_modal.open
             || self.explorer_delete_modal.open;
@@ -4077,6 +4157,14 @@ impl MarkdownApp {
                                     self.apply_pending_discard_action(ctx, pending);
                                 }
                             }
+                            PendingDiscardAction::InstallUpdate => {
+                                if let Some(dirty_idx) = self.first_dirty_tab_index() {
+                                    self.switch_to_tab(dirty_idx);
+                                    self.unsaved_modal.open(PendingDiscardAction::InstallUpdate);
+                                } else {
+                                    self.apply_pending_discard_action(ctx, pending);
+                                }
+                            }
                             PendingDiscardAction::CloseTabs(mut ids) => {
                                 let cur_id = self.tabs.get(self.active_tab).map(|t| t.id);
                                 if let Some(cid) = cur_id {
@@ -4100,6 +4188,16 @@ impl MarkdownApp {
                             if let Some(dirty_idx) = self.first_dirty_tab_index() {
                                 self.switch_to_tab(dirty_idx);
                                 self.unsaved_modal.open(PendingDiscardAction::CloseWindow);
+                            } else {
+                                self.apply_pending_discard_action(ctx, pending);
+                            }
+                        }
+                        PendingDiscardAction::InstallUpdate if self.tabs.len() > 1 => {
+                            let cur = self.active_tab;
+                            self.close_tab_discard(ctx, cur);
+                            if let Some(dirty_idx) = self.first_dirty_tab_index() {
+                                self.switch_to_tab(dirty_idx);
+                                self.unsaved_modal.open(PendingDiscardAction::InstallUpdate);
                             } else {
                                 self.apply_pending_discard_action(ctx, pending);
                             }
@@ -4144,6 +4242,7 @@ impl MarkdownApp {
             &mut self.settings,
             &self.settings_path,
             &mut self.os_modal,
+            &self.updater,
         );
         if settings_outcome.theme_changed {
             self.theme = WordTheme::from_mode(self.settings.theme_mode);
@@ -4159,6 +4258,39 @@ impl MarkdownApp {
         }
         if let Some(msg) = settings_outcome.status_message {
             self.exporter.status_text = msg;
+        }
+        if settings_outcome.check_updates_now {
+            self.updater.start_check(ctx, false);
+        }
+        if settings_outcome.open_update_modal {
+            self.settings_modal.open = false;
+            self.updater.modal_open = true;
+        }
+        if let Some(url) = settings_outcome.open_release_page {
+            self.open_link_target(ctx, &url);
+        }
+
+        match self.updater.show_modal(
+            ctx,
+            &self.theme,
+            self.settings.skipped_update_version.as_deref(),
+        ) {
+            updater::UpdateModalAction::None => {}
+            updater::UpdateModalAction::DownloadAndInstall => {
+                self.updater.start_download(ctx);
+            }
+            updater::UpdateModalAction::InstallAndRestart => {
+                self.request_install_staged_update(ctx);
+            }
+            updater::UpdateModalAction::SkipVersion(ver) => {
+                self.settings.skipped_update_version = Some(ver.clone());
+                self.persist_settings();
+                self.updater.modal_open = false;
+                self.exporter.status_text = format!("Skipped update v{ver}");
+            }
+            updater::UpdateModalAction::OpenReleasePage(url) => {
+                self.open_link_target(ctx, &url);
+            }
         }
 
         if let Some(msg) =

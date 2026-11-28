@@ -3741,6 +3741,36 @@ fn apply_code_block_tab(
     }
 }
 
+fn inserted_newline_byte_offset(
+    after_text: &str,
+    prev_text: &str,
+    cursor_range: Option<egui::text::CCursorRange>,
+) -> Option<usize> {
+    if let Some(cr) = cursor_range {
+        let p = cr.primary.index;
+        if p > 0
+            && let Some((byte_idx, ch)) = after_text.char_indices().nth(p - 1)
+            && ch == '\n'
+        {
+            return Some(byte_idx);
+        }
+        if let Some((byte_idx, ch)) = after_text.char_indices().nth(p)
+            && ch == '\n'
+        {
+            return Some(byte_idx);
+        }
+    }
+    let mut prev_chars = prev_text.char_indices();
+    for (byte_idx, ch) in after_text.char_indices() {
+        match prev_chars.next() {
+            Some((_, pc)) if pc == ch => {}
+            _ if ch == '\n' => return Some(byte_idx),
+            _ => {}
+        }
+    }
+    after_text.find('\n')
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_inline_wysiwyg_block(
     ui: &mut egui::Ui,
@@ -4188,7 +4218,7 @@ fn render_inline_wysiwyg_block(
                                     && !i.modifiers.command
                                     && !i.modifiers.alt
                             });
-                            enter_pressed = src_lines.len() == 1
+                            enter_pressed = !src_lines.is_empty()
                                 && ui.input(|i| {
                                     i.key_pressed(egui::Key::Enter)
                                         && !i.modifiers.shift
@@ -4675,8 +4705,10 @@ fn render_inline_wysiwyg_block(
                 if text_mutated && !src_lines.is_empty() && src_lines.end <= buf.len_lines() {
                     let le = buf.line_ending();
                     if enter_pressed {
-                        if let Some(next_marker) =
-                            next_list_continuation_marker(&state.active_block_prefix)
+                        ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+                        if src_lines.len() == 1
+                            && let Some(next_marker) =
+                                next_list_continuation_marker(&state.active_block_prefix)
                         {
                             let (_, _, struct_prefix) =
                                 parse_line_block_meta(&state.active_block_prefix);
@@ -4715,25 +4747,64 @@ fn render_inline_wysiwyg_block(
                                 did_mutate_sync = true;
                             }
                         } else {
-                            let (before, after) = state
-                                .active_block_text
-                                .split_once('\n')
-                                .unwrap_or((state.active_block_text.as_str(), ""));
-                            let after_buf = if is_crlf {
+                            let split_byte = if src_lines.len() == 1 {
+                                state.active_block_text.find('\n')
+                            } else {
+                                inserted_newline_byte_offset(
+                                    &state.active_block_text,
+                                    &prev_block_text,
+                                    output.state.cursor.char_range(),
+                                )
+                            };
+                            let (before, after) = match split_byte {
+                                Some(idx) => (
+                                    &state.active_block_text[..idx],
+                                    &state.active_block_text[idx + 1..],
+                                ),
+                                None => (state.active_block_text.as_str(), ""),
+                            };
+                            let (sep_count, next_line_delta) = if was_empty_text {
+                                (1usize, 1usize)
+                            } else if before.trim().is_empty() && !after.trim().is_empty() {
+                                let prev_is_blank_or_top = src_lines.start == 0
+                                    || buf.line_text(src_lines.start - 1).trim().is_empty();
+                                if prev_is_blank_or_top { (1, 1) } else { (2, 2) }
+                            } else if after.trim().is_empty()
+                                && src_lines.end < buf.len_lines()
+                                && buf.line_text(src_lines.end).trim().is_empty()
+                            {
+                                (1usize, 2usize)
+                            } else {
+                                (2usize, 2usize)
+                            };
+                            let sep = if sep_count == 2 {
+                                format!("{le}{le}")
+                            } else {
+                                le.to_string()
+                            };
+                            let before_buf: std::borrow::Cow<'_, str> =
+                                if is_crlf && before.contains('\n') {
+                                    std::borrow::Cow::Owned(before.replace('\n', "\r\n"))
+                                } else {
+                                    std::borrow::Cow::Borrowed(before)
+                                };
+                            let after_buf: std::borrow::Cow<'_, str> = if is_crlf {
                                 std::borrow::Cow::Owned(after.replace('\n', "\r\n"))
                             } else {
                                 std::borrow::Cow::Borrowed(after)
                             };
                             let full_text = format!(
-                                "{}{}{le}{}{}",
+                                "{}{}{}{}{}",
                                 state.active_block_prefix,
-                                before,
+                                before_buf,
+                                sep,
                                 after_buf,
                                 state.active_block_suffix
                             );
+                            let before_newlines = before.matches('\n').count();
                             let range = buf.line_range_chars(src_lines.start, src_lines.end - 1);
                             buf.replace_range(range, &full_text);
-                            let next_line = src_lines.start + 1;
+                            let next_line = src_lines.start + before_newlines + next_line_delta;
                             let next_cursor = buf.line_to_char(next_line);
                             buf.set_cursor(next_cursor.min(buf.len_chars()), false);
                             state.active_block_lines = Some(next_line..(next_line + 1));
@@ -4759,10 +4830,20 @@ fn render_inline_wysiwyg_block(
                         } else {
                             std::borrow::Cow::Borrowed(state.active_block_text.as_str())
                         };
+                        let need_trailing_blank = !show_markup
+                            && !is_code
+                            && src_lines.len() == 1
+                            && was_empty_text
+                            && !state.active_block_text.trim().is_empty()
+                            && !state.active_block_text.contains('\n')
+                            && src_lines.end < buf.len_lines()
+                            && !buf.line_text(src_lines.end).trim().is_empty();
+                        let trailing_sep = if need_trailing_blank { le } else { "" };
                         let full_text = format!(
-                            "{}{}{}",
+                            "{}{}{}{}",
                             state.active_block_prefix,
                             body_for_buf,
+                            trailing_sep,
                             state.active_block_suffix
                         );
                         let old_lines = src_lines.end - src_lines.start;
@@ -4774,7 +4855,16 @@ fn render_inline_wysiwyg_block(
 
                         if !show_markup && !is_code {
                             let cursor_line = buf.char_to_line(next_cursor_char);
-                            if new_line_count != old_lines {
+                            if need_trailing_blank {
+                                state.active_block_lines =
+                                    Some(src_lines.start..(src_lines.start + 1));
+                                state.active_block_kind = infer_heading_level_from_raw(&full_text)
+                                    .map(ActiveBlockKind::Heading)
+                                    .or(Some(ActiveBlockKind::Paragraph));
+                                sync_active_block_from_buf(buf, show_markup, state);
+                                state.focus_inline_editor = true;
+                                did_mutate_sync = true;
+                            } else if new_line_count != old_lines {
                                 state.active_block_lines = Some(cursor_line..(cursor_line + 1));
                                 state.active_block_kind = Some(ActiveBlockKind::Paragraph);
                                 sync_active_block_from_buf(buf, show_markup, state);
@@ -4837,22 +4927,46 @@ fn render_inline_wysiwyg_block(
                         ui.ctx().request_repaint();
                     } else if !is_code && src_lines.start > 0 {
                         let prev_line = src_lines.start - 1;
-                        let prev_end =
-                            buf.line_to_char(prev_line) + buf.line_len_without_newline(prev_line);
                         let cur_start = buf.line_to_char(src_lines.start);
-                        if cur_start > prev_end {
-                            buf.remove(prev_end..cur_start);
-                            buf.set_cursor(prev_end, false);
-                            let merged_raw = buf.line_text(prev_line);
-                            let next_kind = infer_heading_level_from_raw(&merged_raw)
-                                .map(ActiveBlockKind::Heading)
-                                .unwrap_or(ActiveBlockKind::Paragraph);
-                            state.active_block_lines = Some(prev_line..(prev_line + 1));
-                            state.active_block_kind = Some(next_kind);
-                            sync_active_block_from_buf(buf, show_markup, state);
-                            state.focus_inline_editor = true;
-                            did_mutate_sync = true;
-                            ui.ctx().request_repaint();
+                        if was_empty_text
+                            && src_lines.start >= 2
+                            && buf.line_text(prev_line).trim().is_empty()
+                            && !buf.line_text(src_lines.start - 2).trim().is_empty()
+                        {
+                            let target_line = src_lines.start - 2;
+                            let target_end = buf.line_to_char(target_line)
+                                + buf.line_len_without_newline(target_line);
+                            if cur_start > target_end {
+                                buf.remove(target_end..cur_start);
+                                buf.set_cursor(target_end, false);
+                                let merged_raw = buf.line_text(target_line);
+                                let next_kind = infer_heading_level_from_raw(&merged_raw)
+                                    .map(ActiveBlockKind::Heading)
+                                    .unwrap_or(ActiveBlockKind::Paragraph);
+                                state.active_block_lines = Some(target_line..(target_line + 1));
+                                state.active_block_kind = Some(next_kind);
+                                sync_active_block_from_buf(buf, show_markup, state);
+                                state.focus_inline_editor = true;
+                                did_mutate_sync = true;
+                                ui.ctx().request_repaint();
+                            }
+                        } else {
+                            let prev_end = buf.line_to_char(prev_line)
+                                + buf.line_len_without_newline(prev_line);
+                            if cur_start > prev_end {
+                                buf.remove(prev_end..cur_start);
+                                buf.set_cursor(prev_end, false);
+                                let merged_raw = buf.line_text(prev_line);
+                                let next_kind = infer_heading_level_from_raw(&merged_raw)
+                                    .map(ActiveBlockKind::Heading)
+                                    .unwrap_or(ActiveBlockKind::Paragraph);
+                                state.active_block_lines = Some(prev_line..(prev_line + 1));
+                                state.active_block_kind = Some(next_kind);
+                                sync_active_block_from_buf(buf, show_markup, state);
+                                state.focus_inline_editor = true;
+                                did_mutate_sync = true;
+                                ui.ctx().request_repaint();
+                            }
                         }
                     }
                 } else if (arrow_up_pressed
@@ -5628,8 +5742,10 @@ fn render_doc_block(
             source_lines,
         } => {
             let kind = ActiveBlockKind::Heading(*level);
-            let is_active =
-                wysiwyg && !read_only && state.active_block_lines.as_ref() == Some(source_lines);
+            let is_active = !*rendered_active
+                && wysiwyg
+                && !read_only
+                && state.active_block_lines.as_ref() == Some(source_lines);
             if is_active {
                 *rendered_active = true;
                 let a = render_inline_wysiwyg_block(
@@ -5752,8 +5868,10 @@ fn render_doc_block(
             source_lines,
         } => {
             let kind = ActiveBlockKind::Paragraph;
-            let is_active =
-                wysiwyg && !read_only && state.active_block_lines.as_ref() == Some(source_lines);
+            let is_active = !*rendered_active
+                && wysiwyg
+                && !read_only
+                && state.active_block_lines.as_ref() == Some(source_lines);
             if is_active {
                 *rendered_active = true;
                 let a = render_inline_wysiwyg_block(
@@ -5926,7 +6044,8 @@ fn render_doc_block(
             code,
             source_lines,
         } => {
-            let is_active = wysiwyg
+            let is_active = !*rendered_active
+                && wysiwyg
                 && !read_only
                 && state.active_block_kind == Some(ActiveBlockKind::CodeBlock)
                 && state
@@ -6680,8 +6799,10 @@ fn render_doc_block(
             });
         }
         DocBlock::ThematicBreak { source_lines } => {
-            let is_active =
-                wysiwyg && !read_only && state.active_block_lines.as_ref() == Some(source_lines);
+            let is_active = !*rendered_active
+                && wysiwyg
+                && !read_only
+                && state.active_block_lines.as_ref() == Some(source_lines);
             if is_active {
                 *rendered_active = true;
                 let a = render_inline_wysiwyg_block(
@@ -6754,7 +6875,7 @@ fn render_doc_block(
             source_lines,
         } => {
             let line_h = (state.reader_font_size * state.line_spacing.body_multiplier()).max(16.0);
-            let active_in_gap = if wysiwyg && !read_only {
+            let active_in_gap = if !*rendered_active && wysiwyg && !read_only {
                 state.active_block_lines.clone().filter(|a| {
                     !a.is_empty() && a.start >= source_lines.start && a.end <= source_lines.end
                 })

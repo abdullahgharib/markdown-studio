@@ -8073,7 +8073,8 @@ fn test_blank_lines_render_visually_in_reader_and_wysiwyg_and_enter_adds_space()
         w_pos_spaced.y
     );
 
-    // 3. Pressing Enter repeatedly in active WYSIWYG editing preserves real blank lines
+    // 3. Pressing Enter once in WYSIWYG creates a new visible paragraph immediately,
+    //    and additional Enters add real blank lines one by one.
     app.buffer = DocumentBuffer::from_str("Line One");
     t += 0.02;
     let _ = ui_step(&ctx, &mut app, t, vec![]);
@@ -8089,7 +8090,9 @@ fn test_blank_lines_render_visually_in_reader_and_wysiwyg_and_enter_adds_space()
     app.reader_state.focus_inline_editor = true;
     t += 0.02;
     let _ = ui_step(&ctx, &mut app, t, vec![]);
-    for _ in 0..3 {
+    let _ = press_key(&ctx, &mut app, &mut t, Key::Enter, Modifiers::NONE);
+    assert_eq!(app.buffer.as_string(), "Line One\n\n");
+    for _ in 0..2 {
         let _ = press_key(&ctx, &mut app, &mut t, Key::Enter, Modifiers::NONE);
     }
     t += 0.02;
@@ -8099,7 +8102,91 @@ fn test_blank_lines_render_visually_in_reader_and_wysiwyg_and_enter_adds_space()
         t,
         vec![egui::Event::Text("Line Two".to_string())],
     );
-    assert_eq!(app.buffer.as_string(), "Line One\n\n\nLine Two");
+    assert_eq!(app.buffer.as_string(), "Line One\n\n\n\nLine Two");
+}
+
+#[test]
+fn test_wysiwyg_enter_immediate_newline_blank_lines_and_backspace() {
+    let ctx = egui::Context::default();
+    let (_dir, mut app) = new_isolated_app(&ctx);
+    let mut t = 1.0_f64;
+    app.dispatch_action(&ctx, ToolbarAction::SetViewMode(ViewMode::Wysiwyg));
+
+    // A. Single Enter at end of "Hello" then typing "World" starts a separate paragraph immediately
+    app.buffer = DocumentBuffer::from_str("Hello");
+    t += 0.02;
+    let _ = ui_step(&ctx, &mut app, t, vec![]);
+    markdown_studio::ui::reader::activate_wysiwyg_at_line(
+        &mut app.buffer,
+        &app.block_index,
+        0,
+        false,
+        &mut app.reader_state,
+    );
+    app.buffer.set_cursor("Hello".len(), false);
+    app.reader_state.sync_cursor_from_buf = true;
+    app.reader_state.focus_inline_editor = true;
+    t += 0.02;
+    let _ = ui_step(&ctx, &mut app, t, vec![]);
+    let _ = press_key(&ctx, &mut app, &mut t, Key::Enter, Modifiers::NONE);
+    assert_eq!(app.buffer.as_string(), "Hello\n\n");
+    t += 0.02;
+    let _ = ui_step(
+        &ctx,
+        &mut app,
+        t,
+        vec![egui::Event::Text("World".to_string())],
+    );
+    assert_eq!(app.buffer.as_string(), "Hello\n\nWorld");
+
+    // B. Enter at end of "Hello" in middle of document ("Hello\n\nWorld") and typing "Middle"
+    //    must keep all 3 as separate paragraphs instead of merging "Middle" into "World"
+    app.buffer = DocumentBuffer::from_str("Hello\n\nWorld");
+    t += 0.02;
+    let _ = ui_step(&ctx, &mut app, t, vec![]);
+    markdown_studio::ui::reader::activate_wysiwyg_at_line(
+        &mut app.buffer,
+        &app.block_index,
+        0,
+        false,
+        &mut app.reader_state,
+    );
+    app.buffer.set_cursor("Hello".len(), false);
+    app.reader_state.sync_cursor_from_buf = true;
+    app.reader_state.focus_inline_editor = true;
+    t += 0.02;
+    let _ = ui_step(&ctx, &mut app, t, vec![]);
+    let _ = press_key(&ctx, &mut app, &mut t, Key::Enter, Modifiers::NONE);
+    assert_eq!(app.buffer.as_string(), "Hello\n\n\nWorld");
+    t += 0.02;
+    let _ = ui_step(
+        &ctx,
+        &mut app,
+        t,
+        vec![egui::Event::Text("Middle".to_string())],
+    );
+    assert_eq!(app.buffer.as_string(), "Hello\n\nMiddle\n\nWorld");
+
+    // C. Single Enter then Backspace symmetrically returns to original single line
+    app.buffer = DocumentBuffer::from_str("Alpha");
+    t += 0.02;
+    let _ = ui_step(&ctx, &mut app, t, vec![]);
+    markdown_studio::ui::reader::activate_wysiwyg_at_line(
+        &mut app.buffer,
+        &app.block_index,
+        0,
+        false,
+        &mut app.reader_state,
+    );
+    app.buffer.set_cursor("Alpha".len(), false);
+    app.reader_state.sync_cursor_from_buf = true;
+    app.reader_state.focus_inline_editor = true;
+    t += 0.02;
+    let _ = ui_step(&ctx, &mut app, t, vec![]);
+    let _ = press_key(&ctx, &mut app, &mut t, Key::Enter, Modifiers::NONE);
+    assert_eq!(app.buffer.as_string(), "Alpha\n\n");
+    let _ = press_key(&ctx, &mut app, &mut t, Key::Backspace, Modifiers::NONE);
+    assert_eq!(app.buffer.as_string(), "Alpha");
 }
 
 #[test]
@@ -8222,4 +8309,106 @@ fn test_wysiwyg_ctrl_a_and_multiblock_drag_selection_and_editing() {
         .selection_range()
         .expect("expected selection after Shift+ArrowDown");
     assert!(app.buffer.char_to_line(shift_sel.end) >= 1);
+}
+
+#[test]
+fn test_updates_tab_top_bar_badge_and_skip_version() {
+    use markdown_studio::ui::settings_modal::SettingsTab;
+    use markdown_studio::ui::updater::{ReleaseAsset, ReleaseInfo, UpdateStatus};
+
+    let ctx = egui::Context::default();
+    let (_dir, mut app) = new_isolated_app(&ctx);
+    assert!(app.settings.check_updates_on_startup);
+    assert!(app.settings.skipped_update_version.is_none());
+
+    app.updater.status = UpdateStatus::Available(ReleaseInfo {
+        tag_name: "v9.9.0".to_string(),
+        version: "9.9.0".to_string(),
+        title: "Markdown Studio v9.9.0".to_string(),
+        body: "## What's Changed\n- Instant WYSIWYG Enter\n- GitHub Auto-Updater".to_string(),
+        html_url: "https://github.com/abdullahgharib/markdown-studio/releases/tag/v9.9.0"
+            .to_string(),
+        published_at: "2026-12-01T00:00:00Z".to_string(),
+        asset: Some(ReleaseAsset {
+            name: "Markdown-Studio-windows-x86_64.exe".to_string(),
+            download_url: "https://github.com/abdullahgharib/markdown-studio/releases/download/v9.9.0/Markdown-Studio-windows-x86_64.exe".to_string(),
+            size: 12_582_912,
+        }),
+    });
+
+    let mut t = 1.0_f64;
+    let out0 = ui_step(&ctx, &mut app, t, vec![]);
+    let out1 = ui_step(&ctx, &mut app, t + 0.02, vec![]);
+    t += 0.02;
+    let _ = out0;
+    let pill_pos = find_rendered_text(&out1, "↑ v9.9.0", 0.0, 1280.0, 0.0);
+    assert!(pill_pos.y < 55.0, "expected update pill in Tier 1 toolbar");
+
+    // Clicking the pill opens the dedicated Software Update modal showing release notes
+    let _ = click_at(&ctx, &mut app, &mut t, pill_pos, Modifiers::NONE);
+    assert!(app.updater.modal_open);
+    let _ = ui_step(&ctx, &mut app, t + 0.02, vec![]);
+    t += 0.02;
+    let modal_out = ui_step(&ctx, &mut app, t + 0.02, vec![]);
+    t += 0.02;
+    assert!(
+        !find_rendered_text_shapes(&modal_out, "Instant WYSIWYG Enter").is_empty(),
+        "Update modal must display What's Changed release notes"
+    );
+    let later_pos = find_rendered_text(&modal_out, "Later", 0.0, 1280.0, 120.0);
+    let _ = click_at(&ctx, &mut app, &mut t, later_pos, Modifiers::NONE);
+    assert!(!app.updater.modal_open);
+
+    // Open Settings -> Updates tab and verify rendering + Skip / Clear Skipped Version
+    app.settings_modal.open_tab(
+        SettingsTab::Updates,
+        &mut app.os_modal,
+        &app.settings,
+    );
+    let _ = ui_step(&ctx, &mut app, t + 0.02, vec![]);
+    t += 0.02;
+    let settings_out = ui_step(&ctx, &mut app, t + 0.02, vec![]);
+    t += 0.02;
+    assert!(
+        !find_rendered_text_shapes(&settings_out, "Check for updates automatically on startup")
+            .is_empty()
+    );
+    assert!(
+        !find_rendered_text_shapes(&settings_out, "GitHub Auto-Updater").is_empty(),
+        "Settings -> Updates should show What's Changed preview"
+    );
+
+    // Responsive check at narrow 520px width (wrapped toolbar + update pill + Settings modal)
+    t += 0.02;
+    let _ = ctx.run(
+        RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(520.0, 800.0))),
+            time: Some(t),
+            ..Default::default()
+        },
+        |c| app.update_ui(c),
+    );
+    t += 0.02;
+    let settings_out = ui_step(&ctx, &mut app, t, vec![]);
+    let skip_pos = find_rendered_text(&settings_out, "Skip This Version", 0.0, 1280.0, 120.0);
+    let _ = click_at(&ctx, &mut app, &mut t, skip_pos, Modifiers::NONE);
+    assert_eq!(app.settings.skipped_update_version.as_deref(), Some("9.9.0"));
+
+    // After skipping, top-bar badge hides, while Settings shows Clear Skipped Version
+    let after_skip0 = ui_step(&ctx, &mut app, t + 0.02, vec![]);
+    let after_skip = ui_step(&ctx, &mut app, t + 0.04, vec![]);
+    t += 0.04;
+    let _ = after_skip0;
+    assert!(
+        find_rendered_text_shapes(&after_skip, "↑ v9.9.0").is_empty(),
+        "Skipped version must hide the top-bar update pill"
+    );
+    let clear_pos = find_rendered_text(&after_skip, "Clear Skipped Version", 0.0, 1280.0, 120.0);
+    let _ = click_at(&ctx, &mut app, &mut t, clear_pos, Modifiers::NONE);
+    assert!(app.settings.skipped_update_version.is_none());
+    let restored_out = ui_step(&ctx, &mut app, t + 0.02, vec![]);
+    assert!(
+        !find_rendered_text_shapes(&restored_out, "↑ v9.9.0").is_empty(),
+        "Clearing skipped version must show the top-bar update pill again"
+    );
 }

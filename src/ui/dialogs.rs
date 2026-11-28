@@ -519,6 +519,7 @@ pub enum PendingDiscardAction {
     CloseTab(usize),
     CloseTabs(Vec<u64>),
     CloseWindow,
+    InstallUpdate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -562,6 +563,7 @@ impl UnsavedChangesModal {
                 "closing this tab"
             }
             PendingDiscardAction::CloseWindow => "closing Markdown Studio",
+            PendingDiscardAction::InstallUpdate => "restarting to install the update",
         };
 
         egui::Window::new("Unsaved Changes")
