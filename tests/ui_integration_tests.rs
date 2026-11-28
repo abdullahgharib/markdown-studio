@@ -8031,3 +8031,195 @@ fn test_system_font_discovery_and_custom_font_selection_in_settings() {
     assert!(!app.editor_state.use_custom_font);
     assert!(!app.reader_state.reader_use_custom_font);
 }
+
+#[test]
+fn test_blank_lines_render_visually_in_reader_and_wysiwyg_and_enter_adds_space() {
+    let ctx = egui::Context::default();
+    let (_dir, mut app) = new_isolated_app(&ctx);
+    let mut t = 1.0_f64;
+
+    // 1. Reader mode: extra blank lines produce visibly larger vertical gap
+    app.dispatch_action(&ctx, ToolbarAction::SetViewMode(ViewMode::Reader));
+    app.buffer = DocumentBuffer::from_str("FirstLine\n\nSecondLine\n");
+    let out_std = ui_step(&ctx, &mut app, t, vec![]);
+    let pos_std = find_rendered_text(&out_std, "SecondLine", 0.0, 1280.0, 120.0);
+
+    app.buffer = DocumentBuffer::from_str("FirstLine\n\n\n\nSecondLine\n");
+    t += 0.02;
+    let out_spaced = ui_step(&ctx, &mut app, t, vec![]);
+    let pos_spaced = find_rendered_text(&out_spaced, "SecondLine", 0.0, 1280.0, 120.0);
+    assert!(
+        pos_spaced.y >= pos_std.y + 30.0,
+        "expected Reader mode blank lines to push SecondLine down (std_y={}, spaced_y={})",
+        pos_std.y,
+        pos_spaced.y
+    );
+
+    // 2. WYSIWYG mode: inactive view preserves the same blank-line vertical spacing
+    app.dispatch_action(&ctx, ToolbarAction::SetViewMode(ViewMode::Wysiwyg));
+    app.buffer = DocumentBuffer::from_str("FirstLine\n\nSecondLine\n");
+    t += 0.02;
+    let out_w_std = ui_step(&ctx, &mut app, t, vec![]);
+    let w_pos_std = find_rendered_text(&out_w_std, "SecondLine", 0.0, 1280.0, 120.0);
+
+    app.buffer = DocumentBuffer::from_str("FirstLine\n\n\n\nSecondLine\n");
+    t += 0.02;
+    let out_w_spaced = ui_step(&ctx, &mut app, t, vec![]);
+    let w_pos_spaced = find_rendered_text(&out_w_spaced, "SecondLine", 0.0, 1280.0, 120.0);
+    assert!(
+        w_pos_spaced.y >= w_pos_std.y + 30.0,
+        "expected WYSIWYG blank lines to push SecondLine down (std_y={}, spaced_y={})",
+        w_pos_std.y,
+        w_pos_spaced.y
+    );
+
+    // 3. Pressing Enter repeatedly in active WYSIWYG editing preserves real blank lines
+    app.buffer = DocumentBuffer::from_str("Line One");
+    t += 0.02;
+    let _ = ui_step(&ctx, &mut app, t, vec![]);
+    markdown_studio::ui::reader::activate_wysiwyg_at_line(
+        &mut app.buffer,
+        &app.block_index,
+        0,
+        false,
+        &mut app.reader_state,
+    );
+    app.buffer.set_cursor("Line One".len(), false);
+    app.reader_state.sync_cursor_from_buf = true;
+    app.reader_state.focus_inline_editor = true;
+    t += 0.02;
+    let _ = ui_step(&ctx, &mut app, t, vec![]);
+    for _ in 0..3 {
+        let _ = press_key(&ctx, &mut app, &mut t, Key::Enter, Modifiers::NONE);
+    }
+    t += 0.02;
+    let _ = ui_step(
+        &ctx,
+        &mut app,
+        t,
+        vec![egui::Event::Text("Line Two".to_string())],
+    );
+    assert_eq!(app.buffer.as_string(), "Line One\n\n\nLine Two");
+}
+
+#[test]
+fn test_wysiwyg_ctrl_a_and_multiblock_drag_selection_and_editing() {
+    let ctx = egui::Context::default();
+    let (_dir, mut app) = new_isolated_app(&ctx);
+    let doc = "Alpha first line\n\nBeta second line\n\nGamma third line";
+    app.buffer = DocumentBuffer::from_str(doc);
+    app.dispatch_action(&ctx, ToolbarAction::SetViewMode(ViewMode::Wysiwyg));
+    let mut t = 1.0_f64;
+    let out0 = ui_step(&ctx, &mut app, t, vec![]);
+
+    // 1. Click inside Alpha to activate inline single-line editing
+    let alpha_pos = find_rendered_text(&out0, "Alpha", 0.0, 1280.0, 120.0);
+    let _ = click_at(&ctx, &mut app, &mut t, alpha_pos, Modifiers::NONE);
+    assert_eq!(app.reader_state.active_block_lines, Some(0..1));
+
+    // 2. Ctrl+A inside active WYSIWYG paragraph selects the ENTIRE document (Word/Notepad behavior)
+    let _ = press_key(&ctx, &mut app, &mut t, Key::A, Modifiers::COMMAND);
+    assert_eq!(
+        app.buffer.selection_range(),
+        Some(0..app.buffer.len_chars()),
+        "Ctrl+A in WYSIWYG must select the full document, not only active line"
+    );
+    assert!(app.reader_state.reader_sel_all);
+    assert!(app.reader_state.active_block_lines.is_none());
+
+    // 3. Copy full-document selection produces plain + rich HTML
+    t += 0.02;
+    let _ = ui_step(&ctx, &mut app, t, vec![egui::Event::Copy]);
+    let copied = app.last_copied_text.as_deref().unwrap_or("");
+    assert!(copied.contains("Alpha") && copied.contains("Beta") && copied.contains("Gamma"));
+    assert!(app.last_copied_html.is_some());
+
+    // 4. Backspace deletes entire full-document selection; Undo restores it
+    let _ = press_key(&ctx, &mut app, &mut t, Key::Backspace, Modifiers::NONE);
+    assert_eq!(app.buffer.as_string(), "");
+    let _ = press_key(&ctx, &mut app, &mut t, Key::Z, Modifiers::COMMAND);
+    assert_eq!(app.buffer.as_string(), doc);
+
+    // 5. Cross-block mouse drag across Alpha -> Gamma selects multiple lines/blocks
+    app.reader_state.active_block_lines = None;
+    app.reader_state.clear_reader_selection();
+    t += 0.02;
+    let out_idle = ui_step(&ctx, &mut app, t, vec![]);
+    let drag_start = find_rendered_text(&out_idle, "Alpha", 0.0, 1280.0, 120.0);
+    let drag_end = find_rendered_text(&out_idle, "Gamma", 0.0, 1280.0, 120.0);
+    let _ = ui_step(
+        &ctx,
+        &mut app,
+        t + 0.02,
+        vec![
+            egui::Event::PointerMoved(drag_start),
+            egui::Event::PointerButton {
+                pos: drag_start,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+        ],
+    );
+    let _ = ui_step(
+        &ctx,
+        &mut app,
+        t + 0.04,
+        vec![egui::Event::PointerMoved(egui::pos2(
+            drag_end.x + 30.0,
+            drag_end.y,
+        ))],
+    );
+    t += 0.06;
+    let _ = ui_step(
+        &ctx,
+        &mut app,
+        t,
+        vec![egui::Event::PointerButton {
+            pos: egui::pos2(drag_end.x + 30.0, drag_end.y),
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        }],
+    );
+    let sel_text = app.reader_state.reader_selected_text.as_deref().unwrap_or("");
+    assert!(
+        sel_text.contains("Beta"),
+        "expected cross-block drag to select intermediate Beta block, got: {sel_text:?}"
+    );
+    let buf_sel = app
+        .buffer
+        .selection_range()
+        .expect("expected buffer selection synced from WYSIWYG drag");
+    assert!(app.buffer.char_to_line(buf_sel.start) < app.buffer.char_to_line(buf_sel.end));
+
+    // 6. Typing directly over cross-block selection replaces it cleanly (Notepad/Word UX)
+    t += 0.02;
+    let _ = ui_step(
+        &ctx,
+        &mut app,
+        t,
+        vec![egui::Event::Text("Replaced".to_string())],
+    );
+    assert!(app.buffer.as_string().contains("Replaced"));
+    assert!(!app.buffer.as_string().contains("Beta"));
+
+    // 7. Restore via Ctrl+Z, click line 0, and Shift+ArrowDown extends across block boundary
+    let _ = press_key(&ctx, &mut app, &mut t, Key::Z, Modifiers::COMMAND);
+    assert_eq!(app.buffer.as_string(), doc);
+    t += 0.02;
+    let out_restored = ui_step(&ctx, &mut app, t, vec![]);
+    let p_alpha = find_rendered_text(&out_restored, "Alpha", 0.0, 1280.0, 120.0);
+    let _ = click_at(&ctx, &mut app, &mut t, p_alpha, Modifiers::NONE);
+    assert_eq!(app.reader_state.active_block_lines, Some(0..1));
+    let _ = press_key(&ctx, &mut app, &mut t, Key::ArrowDown, Modifiers::SHIFT);
+    assert!(
+        app.reader_state.active_block_lines.is_none(),
+        "Shift+ArrowDown at bottom of line 0 should promote to cross-block selection"
+    );
+    let shift_sel = app
+        .buffer
+        .selection_range()
+        .expect("expected selection after Shift+ArrowDown");
+    assert!(app.buffer.char_to_line(shift_sel.end) >= 1);
+}

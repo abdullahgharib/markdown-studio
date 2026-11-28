@@ -5,6 +5,17 @@ For architecture, features, shortcuts, and build instructions, see [README.md](R
 
 ---
 
+### `v0.8.7` (2026-11-28) — Blank-Line Spacing Preservation & Word/Notepad Multi-Block WYSIWYG Selection
+- **Visual Blank-Line Preservation Across Views & Exports (`src/export/ir.rs`, `src/document/ast.rs`, `src/document/viewport.rs`, `src/ui/reader/mod.rs`, `src/export/{pdf,docx,html,json}.rs`)**:
+  - Added `DocBlock::BlankLines { count, source_lines }` and `insert_blank_line_blocks` (executed cleanly after AST chunk merging so serial `parse_to_ir` and parallel `parse_rope_to_ir_cancellable` stay identical) to preserve intentional extra blank lines (2+ consecutive empty lines between or after blocks, or 1+ leading empty lines) without inserting `<br>` clutter into clean `.md` source files.
+  - Rendered blank-line spacers in Reader, WYSIWYG, and Split modes (splitting cleanly around active WYSIWYG lines so pressing `Enter` repeatedly visibly adds blank vertical space), and preserved extra blank lines across Vector PDF, Word (`.docx`), HTML5/clipboard HTML, and structured JSON exports.
+- **Word/Notepad-Style Multi-Block Selection, Editing & Full-Document `Ctrl+A` in WYSIWYG (`src/ui/reader/mod.rs`, `src/ui/mod.rs`)**:
+  - Added `MarkdownApp::select_all_in_wysiwyg()` so `Ctrl+A` (and the right-click **Select All** action) anywhere in WYSIWYG selects the entire document (`0..len`) instead of only the active paragraph.
+  - Enabled cross-block mouse drag selection (including dragging vertically out of an active paragraph `TextEdit`), `Shift+Click`, and cross-block `Shift+ArrowUp` / `Shift+ArrowDown` promotion in WYSIWYG, mapping visual characters accurately onto `DocumentBuffer` offsets (`rendered_to_raw_char_offset` / `doc_char_for_reader_pos`).
+  - Added `handle_wysiwyg_doc_selection_input` so `Backspace`, `Delete`, `Enter`, typing replacement text, `Ctrl+C` (rich HTML + plain text), `Ctrl+X`, smart/plain `Ctrl+V` paste, arrow collapse/extend, and right-click context menu actions work directly on multi-block and full-document WYSIWYG selections.
+- **Tests (`src/document/ast.rs`, `tests/export_tests.rs`, `tests/ui_integration_tests.rs`)**:
+  - Added `preserves_extra_blank_lines_and_matches_parallel_parse`, `exports_preserve_extra_blank_lines_across_pdf_docx_html_and_json`, `test_blank_lines_render_visually_in_reader_and_wysiwyg_and_enter_adds_space`, and `test_wysiwyg_ctrl_a_and_multiblock_drag_selection_and_editing`.
+
 ### `v0.8.6` (2026-11-28) — CI Token Permissions Hardening & `lopdf`/`zip` Dependency Security Upgrades
 - **CI Workflow Least-Privilege Permissions (`.github/workflows/ci.yml`)**:
   - Added explicit top-level `permissions: contents: read` to the GitHub Actions CI workflow (resolving CodeQL `actions/missing-workflow-permissions` alert #1).

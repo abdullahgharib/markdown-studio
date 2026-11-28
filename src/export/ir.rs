@@ -114,6 +114,11 @@ pub enum DocBlock {
     ThematicBreak {
         source_lines: Range<usize>,
     },
+    /// Extra blank lines preserved intentionally by the author (1 = 2 consecutive empty lines).
+    BlankLines {
+        count: usize,
+        source_lines: Range<usize>,
+    },
     FootnoteDefinition {
         name: String,
         blocks: Vec<DocBlock>,
@@ -132,6 +137,7 @@ impl DocBlock {
             | DocBlock::List { source_lines, .. }
             | DocBlock::Table { source_lines, .. }
             | DocBlock::ThematicBreak { source_lines }
+            | DocBlock::BlankLines { source_lines, .. }
             | DocBlock::FootnoteDefinition { source_lines, .. } => source_lines.clone(),
         }
     }

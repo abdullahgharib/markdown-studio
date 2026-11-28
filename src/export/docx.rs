@@ -635,6 +635,13 @@ fn append_block(
             );
             docx = docx.add_paragraph(p);
         }
+        DocBlock::BlankLines { count, .. } => {
+            for _ in 0..*count {
+                docx = docx.add_paragraph(
+                    Paragraph::new().line_spacing(DocxLineSpacing::new().line(240).before(0).after(0)),
+                );
+            }
+        }
         DocBlock::FootnoteDefinition { name, blocks, .. } => {
             let fn_slug = heading_slug(name);
             let key = if fn_slug.is_empty() {

@@ -470,6 +470,7 @@ pub fn estimate_block_height(block: &DocBlock, content_width: f32) -> f32 {
             h + 8.0
         }
         DocBlock::ThematicBreak { .. } => 18.0,
+        DocBlock::BlankLines { count, .. } => (*count as f32 * 22.0).max(16.0),
         DocBlock::FootnoteDefinition { blocks, .. } => {
             let inner: f32 = blocks
                 .iter()

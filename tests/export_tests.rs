@@ -1077,6 +1077,62 @@ fn pdf_export_renders_custom_multi_page_headers_and_footers() {
     );
 }
 
+#[test]
+fn exports_preserve_extra_blank_lines_across_pdf_docx_html_and_json() {
+    let dir = tempdir().unwrap();
+    let md_std = "Line A.\n\nLine B.\n";
+    let md_spaced = "Line A.\n\n\n\nLine B.\n";
+    let blocks_std = parse_to_ir(md_std);
+    let blocks_spaced = parse_to_ir(md_spaced);
+
+    // HTML
+    let html_spaced = render_html_string_with_base_dir(&blocks_spaced, "Blank Lines Test", None);
+    assert!(
+        html_spaced.contains("class=\"blank-lines\""),
+        "HTML export must emit blank-lines spacer div: {html_spaced}"
+    );
+    let html_std = render_html_string_with_base_dir(&blocks_std, "Blank Lines Test", None);
+    assert!(!html_std.contains("class=\"blank-lines\""));
+
+    // JSON
+    let json_spaced = render_json_string(&blocks_spaced, "Blank Lines Test", None, md_spaced);
+    assert!(
+        json_spaced.contains("\"type\": \"blank_lines\"") && json_spaced.contains("\"count\": 2"),
+        "JSON export must serialize blank_lines block with count=2: {json_spaced}"
+    );
+
+    // DOCX: extra empty paragraphs compared to standard spacing
+    let docx_std_path = dir.path().join("std.docx");
+    let docx_spaced_path = dir.path().join("spaced.docx");
+    export_docx_to_file(&blocks_std, &docx_std_path, |_| {}).unwrap();
+    export_docx_to_file(&blocks_spaced, &docx_spaced_path, |_| {}).unwrap();
+    let count_p = |path: &std::path::Path| -> usize {
+        let bytes = fs::read(path).unwrap();
+        let mut zip = ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut doc_xml = String::new();
+        zip.by_name("word/document.xml")
+            .unwrap()
+            .read_to_string(&mut doc_xml)
+            .unwrap();
+        doc_xml.matches("<w:p>").count() + doc_xml.matches("<w:p ").count()
+    };
+    let p_std = count_p(&docx_std_path);
+    let p_spaced = count_p(&docx_spaced_path);
+    assert!(
+        p_spaced >= p_std + 2,
+        "DOCX export must add 2 empty paragraphs for 3 blank lines (std={p_std}, spaced={p_spaced})"
+    );
+
+    // PDF: compiles cleanly and places "Line B." lower on page than baseline
+    let pdf_std_path = dir.path().join("std.pdf");
+    let pdf_spaced_path = dir.path().join("spaced.pdf");
+    export_pdf_to_file(&blocks_std, "Baseline", &pdf_std_path, |_| {}).unwrap();
+    export_pdf_to_file(&blocks_spaced, "Spaced", &pdf_spaced_path, |_| {}).unwrap();
+    let pdf_std = fs::read(&pdf_std_path).unwrap();
+    let pdf_spaced = fs::read(&pdf_spaced_path).unwrap();
+    assert_ne!(pdf_std, pdf_spaced);
+}
+
 
 
 

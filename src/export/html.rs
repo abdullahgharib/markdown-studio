@@ -368,6 +368,13 @@ fn write_block_html<W: Write>(
             w.write_all(b"</tbody>\n</table></div>\n")
         }
         DocBlock::ThematicBreak { .. } => w.write_all(b"<hr>\n"),
+        DocBlock::BlankLines { count, .. } => {
+            let em = (*count as f32) * 1.4;
+            writeln!(
+                w,
+                "<div class=\"blank-lines\" aria-hidden=\"true\" style=\"height:{em:.2}em\"></div>"
+            )
+        }
         DocBlock::FootnoteDefinition { name, blocks, .. } => {
             let fn_slug = heading_slug(name);
             let id_val = if fn_slug.is_empty() {
@@ -934,6 +941,13 @@ fn write_clipboard_block_html<W: Write>(
         }
         DocBlock::ThematicBreak { .. } => {
             w.write_all(b"<hr style=\"border:none;border-top:1px solid #cbd5e1;margin:10pt 0;\">")
+        }
+        DocBlock::BlankLines { count, .. } => {
+            let pt = (*count as f32) * 12.0;
+            write!(
+                w,
+                "<div style=\"height:{pt:.1}pt;line-height:{pt:.1}pt;\">&nbsp;</div>"
+            )
         }
         DocBlock::FootnoteDefinition { name, blocks, .. } => {
             w.write_all(b"<div style=\"margin-top:8pt;padding-top:4pt;border-top:1px dashed #cbd5e1;font-size:9.5pt;color:#4b5563;\"><strong>[^")?;

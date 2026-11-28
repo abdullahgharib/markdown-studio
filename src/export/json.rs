@@ -286,7 +286,9 @@ fn collect_metadata(
                     collect_metadata(&item.blocks, slug_tracker, outline, links);
                 }
             }
-            DocBlock::CodeBlock { .. } | DocBlock::ThematicBreak { .. } => {}
+            DocBlock::CodeBlock { .. }
+            | DocBlock::ThematicBreak { .. }
+            | DocBlock::BlankLines { .. } => {}
         }
     }
 }
@@ -507,6 +509,15 @@ fn write_block_json<W: Write>(
         }
         DocBlock::ThematicBreak { source_lines } => {
             write_kv_str(w, c, "type", "thematic_break", true)?;
+            write_source_lines(w, c, source_lines.start, source_lines.end, false)?;
+        }
+        DocBlock::BlankLines {
+            count,
+            source_lines,
+        } => {
+            write_kv_str(w, c, "type", "blank_lines", true)?;
+            write_indent(w, c)?;
+            writeln!(w, "\"count\": {count},")?;
             write_source_lines(w, c, source_lines.start, source_lines.end, false)?;
         }
         DocBlock::FootnoteDefinition {

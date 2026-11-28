@@ -7,7 +7,7 @@
 [![Platforms](https://img.shields.io/badge/Platforms-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#installation)
 [![CI](https://github.com/abdullahgharib/markdown-studio/actions/workflows/ci.yml/badge.svg)](https://github.com/abdullahgharib/markdown-studio/actions/workflows/ci.yml)
 
-**Current Version:** `0.8.6` (`markdown_studio`)
+**Current Version:** `0.8.7` (`markdown_studio`)
 
 ---
 
@@ -19,7 +19,7 @@ Most modern Markdown editors bundle a full Chromium browser via Electron, consum
 
 - **No Electron, No Browser Runtime** — instant cold startup, low memory footprint, and smooth 60–120 FPS rendering.
 - **Built for Massive Files** — $O(\log n)$ `ropey::Rope` edits, $O(\log B)$ Fenwick-tree viewport virtualization, off-thread AST parsing ($\ge 32\text{ KB}$), and SIMD literal search via `memchr` let you open and edit 10 MB+ Markdown files smoothly.
-- **Four Synchronized Modes** — switch seamlessly between **WYSIWYG (`Ctrl+1`)**, **Split (`Ctrl+2`)**, **Reader (`Ctrl+3`)**, and **Source (`Ctrl+4`)**.
+- **Four Synchronized Modes with Natural Word/Notepad Editing** — switch seamlessly between **WYSIWYG (`Ctrl+1`)**, **Split (`Ctrl+2`)**, **Reader (`Ctrl+3`)**, and **Source (`Ctrl+4`)**, with **multi-line / cross-block selection (`Shift+Arrow`, mouse drag, and full-document `Ctrl+A`)** in WYSIWYG mode, full clipboard/delete/typing over selections, and **visual blank-line preservation** when pressing Enter multiple times.
 - **Native 2D LaTeX Math & Scientific Calculator** — render fractions, roots, matrices, integrals, and aligned equations natively, or click `= Calculate` / `⚡ Auto-Calc` to evaluate expressions and variables in place.
 - **Native 6-Type Mermaid Engine** — vector rendering for Flowchart, Sequence, State, Class, ER, and Pie diagrams with zero Node.js/browser dependencies.
 - **Excel-Like Table Formulas** — interactive 8×8 table picker, Formula Bar (`SUM`, `AVERAGE`, `MIN`, `MAX`, `COUNT`, `IF`, `A1:B3`, `ABOVE`/`LEFT`/`BELOW`/`RIGHT`), and lossless cached Markdown persistence (`<!-- =FORMULA -->`).

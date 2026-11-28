@@ -1527,7 +1527,7 @@ fn append_block_plain_text(block: &DocBlock, out: &mut Vec<String>) {
                 out.push(tsv);
             }
         }
-        DocBlock::ThematicBreak { .. } => {}
+        DocBlock::ThematicBreak { .. } | DocBlock::BlankLines { .. } => {}
         DocBlock::FootnoteDefinition { name, blocks, .. } => {
             let mut inner = Vec::new();
             for b in blocks {

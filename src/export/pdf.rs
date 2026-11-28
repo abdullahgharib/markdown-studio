@@ -1436,6 +1436,12 @@ fn render_block(pdf: &mut PdfCursor, block: &DocBlock, indent_mm: f32, in_quote:
             });
             pdf.y_mm -= 6.0;
         }
+        DocBlock::BlankLines { count, .. } => {
+            for _ in 0..*count {
+                pdf.ensure_space(5.5);
+                pdf.y_mm -= 5.5;
+            }
+        }
         DocBlock::FootnoteDefinition { name, blocks, .. } => {
             pdf.ensure_space(8.0);
             let y_pt = (pdf.y_mm / PT_TO_MM + 4.0).min(pdf.page_h_mm / PT_TO_MM);

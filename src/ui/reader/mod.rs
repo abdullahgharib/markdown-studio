@@ -157,6 +157,8 @@ pub struct VirtualReaderState {
     active_block_kind: Option<ActiveBlockKind>,
     pub active_code_lang_draft: String,
     active_code_lang_line: Option<usize>,
+    pub code_lang_has_focus: bool,
+    last_galley_row_info: Option<(egui::Id, usize, usize)>,
     pub last_synced_version: u64,
     pub last_synced_show_markup: bool,
     pub scroll_to_y: Option<f32>,
@@ -210,6 +212,8 @@ impl Default for VirtualReaderState {
             active_block_kind: None,
             active_code_lang_draft: String::new(),
             active_code_lang_line: None,
+            code_lang_has_focus: false,
+            last_galley_row_info: None,
             last_synced_version: 0,
             last_synced_show_markup: false,
             scroll_to_y: None,
@@ -314,6 +318,43 @@ impl VirtualReaderState {
             }
         }
         self.reader_selected_text.clone()
+    }
+
+    /// Synchronizes Reader/WYSIWYG highlight bounds directly from `buf.selection_anchor`/`cursor_char`.
+    pub fn sync_reader_sel_from_buf(&mut self, buf: &DocumentBuffer) {
+        let Some(sel) = buf.selection_range() else {
+            self.clear_reader_selection();
+            return;
+        };
+        let total = buf.len_chars();
+        if total > 0 && sel.start == 0 && sel.end == total {
+            let plain = crate::ui::context_menu::markdown_to_plain_text(&buf.as_string());
+            self.reader_sel_all = true;
+            self.reader_sel_anchor = None;
+            self.reader_sel_focus = None;
+            self.reader_sel_dragging = false;
+            self.reader_selected_text = (!plain.is_empty()).then_some(plain);
+            return;
+        }
+        let a_char = buf.selection_anchor.unwrap_or(sel.start).min(total);
+        let f_char = buf.cursor_char.min(total);
+        let (a_line, a_col) = buf.char_to_line_col(a_char);
+        let (f_line, f_col) = buf.char_to_line_col(f_char);
+        let a_raw = buf.line_text(a_line);
+        let f_raw = buf.line_text(f_line);
+        self.reader_sel_all = false;
+        self.reader_sel_anchor = Some(ReaderTextPos {
+            doc_line: a_line,
+            chunk_idx: 0,
+            char_idx: raw_to_rendered_char_offset(&a_raw, a_col),
+        });
+        self.reader_sel_focus = Some(ReaderTextPos {
+            doc_line: f_line,
+            chunk_idx: usize::MAX,
+            char_idx: raw_to_rendered_char_offset(&f_raw, f_col),
+        });
+        let plain = crate::ui::context_menu::markdown_to_plain_text(&buf.selected_text());
+        self.reader_selected_text = (!plain.is_empty()).then_some(plain);
     }
 
     /// Requests fluid eased scrolling toward vertical offset `y` inside the active reader pane.
@@ -1156,6 +1197,8 @@ fn sync_active_block_from_buf(
 }
 
 struct ReaderFrameTracker {
+    wysiwyg_mode: bool,
+    clear_active_block: bool,
     sel_anchor: Option<ReaderTextPos>,
     sel_focus: Option<ReaderTextPos>,
     sel_dragging: bool,
@@ -1175,8 +1218,14 @@ struct ReaderFrameTracker {
 }
 
 impl ReaderFrameTracker {
-    fn from_state(state: &VirtualReaderState, secondary_pos: Option<egui::Pos2>) -> Self {
+    fn from_state(
+        state: &VirtualReaderState,
+        secondary_pos: Option<egui::Pos2>,
+        wysiwyg_mode: bool,
+    ) -> Self {
         Self {
+            wysiwyg_mode,
+            clear_active_block: false,
             sel_anchor: state.reader_sel_anchor,
             sel_focus: state.reader_sel_focus,
             sel_dragging: state.reader_sel_dragging,
@@ -1217,6 +1266,157 @@ impl ReaderFrameTracker {
             Some((b, a))
         }
     }
+}
+
+fn line_prefix_char_len(raw_clean: &str) -> usize {
+    let (_, _, rest) = parse_line_block_meta(raw_clean);
+    let meta_chars = raw_clean
+        .chars()
+        .count()
+        .saturating_sub(rest.chars().count());
+    let mut s = rest;
+    let mut extra = 0usize;
+    loop {
+        if let Some(after) = s.strip_prefix("> ") {
+            extra += 2;
+            s = after;
+        } else if let Some(after) = s.strip_prefix('>') {
+            extra += 1;
+            s = after;
+        } else {
+            break;
+        }
+    }
+    let hashes = s.bytes().take_while(|&b| b == b'#').count();
+    if (1..=6).contains(&hashes) && s.as_bytes().get(hashes) == Some(&b' ') {
+        return meta_chars + extra + hashes + 1;
+    }
+    let indent_ws = s.chars().take_while(|c| *c == ' ' || *c == '\t').count();
+    let trimmed = &s[s
+        .char_indices()
+        .nth(indent_ws)
+        .map(|(b, _)| b)
+        .unwrap_or(s.len())..];
+    for p in ["- [ ] ", "- [x] ", "- [X] ", "* [ ] ", "* [x] ", "+ [ ] ", "+ [x] ", "- ", "* ", "+ "] {
+        if trimmed.starts_with(p) {
+            return meta_chars + extra + indent_ws + p.chars().count();
+        }
+    }
+    let digits = trimmed.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if digits > 0 {
+        let after_d = &trimmed.as_bytes()[digits..];
+        if (after_d.starts_with(b". ") || after_d.starts_with(b") ")) && extra + indent_ws + digits + 2 <= s.chars().count() {
+            return meta_chars + extra + indent_ws + digits + 2;
+        }
+    }
+    meta_chars + extra
+}
+
+fn map_inline_offsets(body: &str) -> Vec<(usize, usize)> {
+    // Returns sorted pairs `(raw_char_idx, vis_char_idx)` at start of each character plus end sentinel.
+    let mut map = Vec::with_capacity(body.chars().count() + 1);
+    let bytes = body.as_bytes();
+    let total_chars = body.chars().count();
+    let mut b_idx = 0usize;
+    let mut r_idx = 0usize;
+    let mut v_idx = 0usize;
+
+    while b_idx < bytes.len() {
+        map.push((r_idx, v_idx));
+        let rest = &body[b_idx..];
+        if rest.starts_with("**") || rest.starts_with("__") || rest.starts_with("~~") {
+            b_idx += 2;
+            r_idx += 2;
+            continue;
+        }
+        if rest.starts_with("<u>") {
+            b_idx += 3;
+            r_idx += 3;
+            continue;
+        }
+        if rest.starts_with("</u>") {
+            b_idx += 4;
+            r_idx += 4;
+            continue;
+        }
+        if rest.starts_with("](")
+            && let Some(close_rel) = rest[2..].find(')')
+        {
+            let skip_bytes = 2 + close_rel + 1;
+            let skip_chars = rest[..skip_bytes].chars().count();
+            b_idx += skip_bytes;
+            r_idx += skip_chars;
+            continue;
+        }
+        if bytes[b_idx] == b'[' || bytes[b_idx] == b'`' || bytes[b_idx] == b'$' {
+            b_idx += 1;
+            r_idx += 1;
+            continue;
+        }
+        let ch = rest.chars().next().unwrap();
+        b_idx += ch.len_utf8();
+        r_idx += 1;
+        v_idx += 1;
+    }
+    map.push((total_chars, v_idx));
+    map
+}
+
+fn raw_to_rendered_char_offset(raw_line: &str, raw_col: usize) -> usize {
+    let raw_clean = raw_line.trim_end_matches(['\r', '\n']);
+    let prefix_chars = line_prefix_char_len(raw_clean);
+    if raw_col <= prefix_chars {
+        return 0;
+    }
+    let prefix_bytes = raw_clean
+        .char_indices()
+        .nth(prefix_chars)
+        .map(|(b, _)| b)
+        .unwrap_or(raw_clean.len());
+    let body = &raw_clean[prefix_bytes..];
+    let target_body_col = raw_col - prefix_chars;
+    let map = map_inline_offsets(body);
+    for &(r, v) in &map {
+        if r >= target_body_col {
+            return v;
+        }
+    }
+    map.last().map(|&(_, v)| v).unwrap_or(0)
+}
+
+fn rendered_to_raw_char_offset(raw_line: &str, vis_col: usize) -> usize {
+    let raw_clean = raw_line.trim_end_matches(['\r', '\n']);
+    let total_raw = raw_clean.chars().count();
+    let prefix_chars = line_prefix_char_len(raw_clean);
+    let prefix_bytes = raw_clean
+        .char_indices()
+        .nth(prefix_chars)
+        .map(|(b, _)| b)
+        .unwrap_or(raw_clean.len());
+    let body = &raw_clean[prefix_bytes..];
+    let map = map_inline_offsets(body);
+    let total_vis = map.last().map(|&(_, v)| v).unwrap_or(0);
+    if vis_col >= total_vis && total_vis > 0 {
+        return total_raw;
+    }
+    for &(r, v) in &map {
+        if v >= vis_col {
+            return (prefix_chars + r).min(total_raw);
+        }
+    }
+    total_raw
+}
+
+fn doc_char_for_reader_pos(buf: &DocumentBuffer, pos: ReaderTextPos) -> usize {
+    let total_lines = buf.len_lines();
+    if total_lines == 0 {
+        return 0;
+    }
+    let line = pos.doc_line.min(total_lines - 1);
+    let line_start = buf.line_to_char(line);
+    let raw = buf.line_text(line);
+    let rel = rendered_to_raw_char_offset(&raw, pos.char_idx);
+    (line_start + rel).min(buf.len_chars())
 }
 
 fn join_selected_pieces(pieces: &[(usize, String)]) -> String {
@@ -1269,6 +1469,9 @@ pub fn render_virtual_reader(
 
     if read_only || !wysiwyg {
         state.active_block_lines = None;
+    }
+    if state.active_block_lines.is_none() {
+        state.code_lang_has_focus = false;
     }
     if !read_only {
         state.image_lightbox = None;
@@ -1395,7 +1598,7 @@ pub fn render_virtual_reader(
     let mut scroll_inner_rect = egui::Rect::NOTHING;
     let mut scroll_offset_y = state.last_scroll_offset_y;
     let mut scroll_max_y = state.last_max_scroll_y;
-    let mut tracker = ReaderFrameTracker::from_state(state, secondary_pos);
+    let mut tracker = ReaderFrameTracker::from_state(state, secondary_pos, wysiwyg && !read_only);
 
     egui::Frame::new()
         .fill(theme.desk_bg)
@@ -1679,7 +1882,7 @@ pub fn render_virtual_reader(
                                     if !read_only
                                         && !wysiwyg
                                         && !state.autoscroll_active
-                                        && matches!(block, DocBlock::ThematicBreak { .. })
+                                        && matches!(block, DocBlock::ThematicBreak { .. } | DocBlock::BlankLines { .. })
                                     {
                                         let click_resp = ui.interact(
                                             rect,
@@ -1873,28 +2076,59 @@ pub fn render_virtual_reader(
     state.last_scroll_offset_y = scroll_offset_y;
     state.last_max_scroll_y = scroll_max_y;
 
-    if !wysiwyg || read_only {
+    if !wysiwyg
+        || read_only
+        || state.active_block_lines.is_none()
+        || tracker.clear_active_block
+        || tracker.sel_dragging
+    {
+        if wysiwyg && !read_only && tracker.clear_active_block {
+            state.active_block_lines = None;
+            state.focus_inline_editor = false;
+        }
         if tracker.sel_cleared_by_click {
             state.clear_reader_selection();
         } else if tracker.sel_all {
             state.reader_sel_all = true;
+            if wysiwyg && !read_only {
+                let total = buf.len_chars();
+                if total > 0 {
+                    buf.selection_anchor = Some(0);
+                    buf.cursor_char = total;
+                    buf.cache_current_selection();
+                }
+            }
         } else {
             state.reader_sel_anchor = tracker.sel_anchor;
             state.reader_sel_focus = tracker.sel_focus;
             state.reader_sel_dragging = tracker.sel_dragging;
             state.reader_sel_anchor_y = tracker.sel_anchor_y;
-            if tracker.sel_anchor.is_some() && tracker.sel_focus.is_some() {
-                if tracker.sel_anchor != tracker.sel_focus {
+            if let (Some(a), Some(f)) = (tracker.sel_anchor, tracker.sel_focus) {
+                if a != f {
                     let joined = join_selected_pieces(&tracker.selected_pieces);
                     state.reader_selected_text = (!joined.is_empty()).then_some(joined);
+                    if wysiwyg && !read_only && tracker.sel_dragging {
+                        let a_doc = doc_char_for_reader_pos(buf, a);
+                        let f_doc = doc_char_for_reader_pos(buf, f);
+                        if a_doc != f_doc {
+                            buf.selection_anchor = Some(a_doc);
+                            buf.cursor_char = f_doc;
+                            buf.cache_current_selection();
+                        }
+                    }
                 } else {
                     state.reader_selected_text = None;
+                    if wysiwyg && !read_only && tracker.sel_dragging {
+                        let c_doc = doc_char_for_reader_pos(buf, a);
+                        buf.set_cursor(c_doc, false);
+                    }
                 }
             }
         }
 
         if action == ReaderAction::None
             && !state.modal_open
+            && (!wysiwyg || read_only)
             && !ui.ctx().wants_keyboard_input()
             && ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy)))
             && let Some(ref txt) = state.reader_selected_text
@@ -2433,6 +2667,11 @@ fn block_list_contains_source_lines(blocks: &[DocBlock], target: &Range<usize>) 
         DocBlock::Heading { source_lines, .. }
         | DocBlock::Paragraph { source_lines, .. }
         | DocBlock::ThematicBreak { source_lines } => source_lines == target,
+        DocBlock::BlankLines { source_lines, .. } => {
+            !target.is_empty()
+                && target.start >= source_lines.start
+                && target.end <= source_lines.end
+        }
         DocBlock::CodeBlock { source_lines, .. } => source_lines.start == target.start,
         DocBlock::BlockQuote { blocks, .. } | DocBlock::FootnoteDefinition { blocks, .. } => {
             block_list_contains_source_lines(blocks, target)
@@ -2454,6 +2693,11 @@ fn index_has_leaf_block_for_lines(index: &ViewportBlockIndex, target: &Range<usi
         DocBlock::Heading { source_lines, .. }
         | DocBlock::Paragraph { source_lines, .. }
         | DocBlock::ThematicBreak { source_lines } => source_lines == target,
+        DocBlock::BlankLines { source_lines, .. } => {
+            !target.is_empty()
+                && target.start >= source_lines.start
+                && target.end <= source_lines.end
+        }
         DocBlock::CodeBlock { source_lines, .. } => source_lines.start == target.start,
         DocBlock::BlockQuote { blocks, .. } | DocBlock::FootnoteDefinition { blocks, .. } => {
             block_list_contains_source_lines(blocks, target)
@@ -2483,8 +2727,15 @@ fn find_leaf_block_at_line(
         {
             Some((source_lines.clone(), ActiveBlockKind::Paragraph))
         }
-        DocBlock::CodeBlock { source_lines, .. } if source_lines.contains(&line_idx) => {
-            Some((source_lines.clone(), ActiveBlockKind::CodeBlock))
+        DocBlock::BlankLines { source_lines, .. } if source_lines.contains(&line_idx) => {
+            Some((line_idx..(line_idx + 1), ActiveBlockKind::Paragraph))
+        }
+        DocBlock::CodeBlock { source_lines, .. } => {
+            if source_lines.contains(&line_idx) {
+                Some((source_lines.clone(), ActiveBlockKind::CodeBlock))
+            } else {
+                None
+            }
         }
         DocBlock::BlockQuote { blocks, .. } | DocBlock::FootnoteDefinition { blocks, .. } => {
             blocks
@@ -3643,6 +3894,7 @@ fn render_inline_wysiwyg_block(
                                 .font(FontId::new(11.5, FontFamily::Monospace))
                                 .hint_text("custom..."),
                         );
+                        state.code_lang_has_focus = lang_resp.has_focus();
                         if lang_resp.has_focus()
                             || lang_resp.gained_focus()
                             || lang_resp.lost_focus()
@@ -3860,6 +4112,8 @@ fn render_inline_wysiwyg_block(
                 let mut enter_pressed = false;
                 let mut arrow_up_pressed = false;
                 let mut arrow_down_pressed = false;
+                let mut shift_arrow_up_pressed = false;
+                let mut shift_arrow_down_pressed = false;
                 if has_inline_focus && is_code {
                     ui.memory_mut(|m| {
                         m.set_focus_lock_filter(
@@ -3954,6 +4208,60 @@ fn render_inline_wysiwyg_block(
                                     && !i.modifiers.command
                                     && !i.modifiers.alt
                             });
+                            if let Some((saved_id, cur_row, total_rows)) = state.last_galley_row_info
+                                && saved_id == inline_id
+                            {
+                                if cur_row == 0
+                                    && src_lines.start > 0
+                                    && ui.input_mut(|i| {
+                                        i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowUp)
+                                    })
+                                {
+                                    let anchor = buf.selection_anchor.unwrap_or(buf.cursor_char);
+                                    let prev_l = src_lines.start - 1;
+                                    let next_cur = buf.line_to_char(prev_l)
+                                        + buf.line_len_without_newline(prev_l);
+                                    buf.selection_anchor = Some(anchor);
+                                    buf.cursor_char = next_cur.min(buf.len_chars());
+                                    buf.cache_current_selection();
+                                    state.active_block_lines = None;
+                                    state.focus_inline_editor = false;
+                                    state.sync_reader_sel_from_buf(buf);
+                                    ui.ctx().request_repaint();
+                                } else if cur_row + 1 >= total_rows
+                                    && src_lines.end < buf.len_lines()
+                                    && ui.input_mut(|i| {
+                                        i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowDown)
+                                    })
+                                {
+                                    let anchor = buf.selection_anchor.unwrap_or(buf.cursor_char);
+                                    let next_l = src_lines.end;
+                                    let next_cur = buf.line_to_char(next_l);
+                                    buf.selection_anchor = Some(anchor);
+                                    buf.cursor_char = next_cur.min(buf.len_chars());
+                                    buf.cache_current_selection();
+                                    state.active_block_lines = None;
+                                    state.focus_inline_editor = false;
+                                    state.sync_reader_sel_from_buf(buf);
+                                    ui.ctx().request_repaint();
+                                }
+                            }
+                            if state.active_block_lines.is_some() {
+                                shift_arrow_up_pressed = ui.input(|i| {
+                                    i.key_pressed(egui::Key::ArrowUp)
+                                        && i.modifiers.shift
+                                        && !i.modifiers.ctrl
+                                        && !i.modifiers.command
+                                        && !i.modifiers.alt
+                                });
+                                shift_arrow_down_pressed = ui.input(|i| {
+                                    i.key_pressed(egui::Key::ArrowDown)
+                                        && i.modifiers.shift
+                                        && !i.modifiers.ctrl
+                                        && !i.modifiers.command
+                                        && !i.modifiers.alt
+                                });
+                            }
                         }
                     }
                 }
@@ -4547,7 +4855,10 @@ fn render_inline_wysiwyg_block(
                             ui.ctx().request_repaint();
                         }
                     }
-                } else if (arrow_up_pressed || arrow_down_pressed)
+                } else if (arrow_up_pressed
+                    || arrow_down_pressed
+                    || shift_arrow_up_pressed
+                    || shift_arrow_down_pressed)
                     && !text_mutated
                     && !src_lines.is_empty()
                     && src_lines.end <= buf.len_lines()
@@ -4595,6 +4906,53 @@ fn render_inline_wysiwyg_block(
                         state.focus_inline_editor = true;
                         did_mutate_sync = true;
                         ui.ctx().request_repaint();
+                    } else if shift_arrow_up_pressed
+                        && prev_row.is_some_and(|r| r == 0)
+                        && src_lines.start > 0
+                    {
+                        let anchor = buf.selection_anchor.unwrap_or_else(|| {
+                            let sec_local = prev_logical_cr
+                                .map(|cr| cr.secondary.index.min(text_chars))
+                                .unwrap_or(0);
+                            (buf.line_to_char(src_lines.start)
+                                + state.active_block_prefix.chars().count()
+                                + local_to_doc_chars(sec_local, &state.active_block_text, is_crlf))
+                            .min(buf.len_chars())
+                        });
+                        let prev_l = src_lines.start - 1;
+                        let next_cur = buf.line_to_char(prev_l)
+                            + buf.line_len_without_newline(prev_l);
+                        buf.selection_anchor = Some(anchor);
+                        buf.cursor_char = next_cur.min(buf.len_chars());
+                        buf.cache_current_selection();
+                        state.active_block_lines = None;
+                        state.focus_inline_editor = false;
+                        state.sync_reader_sel_from_buf(buf);
+                        did_mutate_sync = true;
+                        ui.ctx().request_repaint();
+                    } else if shift_arrow_down_pressed
+                        && prev_row.is_some_and(|r| r + 1 >= output.galley.rows.len().max(1))
+                        && src_lines.end < buf.len_lines()
+                    {
+                        let anchor = buf.selection_anchor.unwrap_or_else(|| {
+                            let sec_local = prev_logical_cr
+                                .map(|cr| cr.secondary.index.min(text_chars))
+                                .unwrap_or(0);
+                            (buf.line_to_char(src_lines.start)
+                                + state.active_block_prefix.chars().count()
+                                + local_to_doc_chars(sec_local, &state.active_block_text, is_crlf))
+                            .min(buf.len_chars())
+                        });
+                        let next_l = src_lines.end;
+                        let next_cur = buf.line_to_char(next_l);
+                        buf.selection_anchor = Some(anchor);
+                        buf.cursor_char = next_cur.min(buf.len_chars());
+                        buf.cache_current_selection();
+                        state.active_block_lines = None;
+                        state.focus_inline_editor = false;
+                        state.sync_reader_sel_from_buf(buf);
+                        did_mutate_sync = true;
+                        ui.ctx().request_repaint();
                     }
                 }
 
@@ -4602,6 +4960,7 @@ fn render_inline_wysiwyg_block(
                     && !did_click_select
                     && !state.sync_cursor_from_buf
                     && !state.modal_open
+                    && state.active_block_lines.is_some()
                     && let Some(cr) = output.state.cursor.char_range()
                     && output.response.has_focus()
                 {
@@ -4788,6 +5147,13 @@ fn render_inline_wysiwyg_block(
 
                 if output.response.has_focus() {
                     let vis_caret = bidi.visual_col_for_logical(p_log);
+                    let cur_row = output
+                        .galley
+                        .from_ccursor(egui::text::CCursor::new(vis_caret))
+                        .rcursor
+                        .row;
+                    state.last_galley_row_info =
+                        Some((inline_id, cur_row, output.galley.rows.len().max(1)));
                     let caret_rect = output
                         .galley
                         .pos_from_ccursor(egui::text::CCursor::new(vis_caret))
@@ -4803,6 +5169,47 @@ fn render_inline_wysiwyg_block(
                         ],
                         Stroke::new(2.0_f32, theme.accent),
                     );
+                }
+
+                if !is_code
+                    && !state.modal_open
+                    && !src_lines.is_empty()
+                    && ui.input(|i| i.pointer.primary_down())
+                    && let Some(press_orig) = ui.input(|i| i.pointer.press_origin())
+                    && let Some(ptr) =
+                        ui.input(|i| i.pointer.interact_pos().or(i.pointer.latest_pos()))
+                    && output.response.rect.contains(press_orig)
+                    && (ptr.y < output.response.rect.top() - 3.0
+                        || ptr.y > output.response.rect.bottom() + 3.0)
+                {
+                    let rel_press = press_orig - output.galley_pos;
+                    let vis_press = output
+                        .galley
+                        .cursor_from_pos(rel_press)
+                        .ccursor
+                        .index
+                        .min(text_chars);
+                    let log_press =
+                        bidi.logical_col_for_visual(&state.active_block_text, vis_press);
+                    let anchor_doc = buf.line_to_char(src_lines.start)
+                        + state.active_block_prefix.chars().count()
+                        + local_to_doc_chars(log_press, &state.active_block_text, is_crlf);
+                    let anchor_doc = anchor_doc.min(buf.len_chars());
+                    let (a_line, a_col) = buf.char_to_line_col(anchor_doc);
+                    let a_raw = buf.line_text(a_line);
+                    let anchor_pos = ReaderTextPos {
+                        doc_line: a_line,
+                        chunk_idx: 0,
+                        char_idx: raw_to_rendered_char_offset(&a_raw, a_col),
+                    };
+                    state.reader_sel_anchor = Some(anchor_pos);
+                    state.reader_sel_focus = Some(anchor_pos);
+                    state.reader_sel_anchor_y = press_orig.y;
+                    state.reader_sel_dragging = true;
+                    state.reader_sel_all = false;
+                    state.active_block_lines = None;
+                    state.focus_inline_editor = false;
+                    ui.ctx().request_repaint();
                 }
 
                 if !is_code && !state.autoscroll_active {
@@ -5072,6 +5479,7 @@ fn handle_inactive_wysiwyg_click(
     hitboxes: &[RenderedGalleyHitbox],
     state: &mut VirtualReaderState,
     has_hit_image: bool,
+    suppress_activate: bool,
 ) -> ReaderAction {
     let mut action = ReaderAction::None;
     let click = ui.interact(
@@ -5168,7 +5576,10 @@ fn handle_inactive_wysiwyg_click(
         } else {
             0
         };
-        if click_count > 0 {
+        if click_count > 0
+            && !suppress_activate
+            && !(ui.input(|i| i.modifiers.shift) && state.reader_sel_anchor.is_some())
+        {
             activate_wysiwyg_block(
                 Some(ui),
                 buf,
@@ -5182,6 +5593,7 @@ fn handle_inactive_wysiwyg_click(
                 click_count,
                 state,
             );
+            state.clear_reader_selection();
         }
     }
     action
@@ -5204,7 +5616,7 @@ fn render_doc_block(
     rendered_active: &mut bool,
 ) -> ReaderAction {
     let mut action = ReaderAction::None;
-    let label_selectable = !wysiwyg || read_only;
+    let label_selectable = true;
 
     match block {
         DocBlock::Heading {
@@ -5314,6 +5726,7 @@ fn render_doc_block(
                             &runs_res.hitboxes,
                             state,
                             tracker.hit_image.is_some(),
+                            tracker.sel_dragging || tracker.clear_active_block,
                         );
                         if a != ReaderAction::None {
                             action = a;
@@ -5433,6 +5846,7 @@ fn render_doc_block(
                             &runs_res.hitboxes,
                             state,
                             tracker.hit_image.is_some(),
+                            tracker.sel_dragging || tracker.clear_active_block,
                         );
                         if a != ReaderAction::None {
                             action = a;
@@ -6335,6 +6749,107 @@ fn render_doc_block(
                 }
             }
         }
+        DocBlock::BlankLines {
+            count,
+            source_lines,
+        } => {
+            let line_h = (state.reader_font_size * state.line_spacing.body_multiplier()).max(16.0);
+            let active_in_gap = if wysiwyg && !read_only {
+                state.active_block_lines.clone().filter(|a| {
+                    !a.is_empty() && a.start >= source_lines.start && a.end <= source_lines.end
+                })
+            } else {
+                None
+            };
+            if let Some(act) = active_in_gap {
+                *rendered_active = true;
+                let before_lines = act.start.saturating_sub(source_lines.start);
+                if before_lines > 0 {
+                    ui.add_space(before_lines as f32 * line_h);
+                }
+                let a = render_inline_wysiwyg_block(
+                    ui,
+                    buf,
+                    &act,
+                    ActiveBlockKind::Paragraph,
+                    content_w,
+                    theme,
+                    show_markup,
+                    workspace_top,
+                    state,
+                );
+                if a != ReaderAction::None {
+                    action = a;
+                }
+                let after_lines = source_lines.end.saturating_sub(act.end);
+                if after_lines > 0 {
+                    ui.add_space(after_lines as f32 * line_h);
+                }
+            } else {
+                let total_h = (*count as f32).max(1.0) * line_h;
+                let sense = if wysiwyg && !read_only && !state.autoscroll_active {
+                    Sense::click()
+                } else {
+                    Sense::hover()
+                };
+                let (rect, resp) = ui.allocate_exact_size(Vec2::new(content_w, total_h), sense);
+                let is_sel = if tracker.sel_all {
+                    true
+                } else if wysiwyg && !read_only {
+                    if let Some(sel) = buf.selection_range()
+                        && source_lines.start < buf.len_lines()
+                    {
+                        let g_start = buf.line_to_char(source_lines.start);
+                        let last_l = source_lines.end.min(buf.len_lines()).saturating_sub(1);
+                        let g_end = buf.line_to_char(last_l) + buf.line_len_without_newline(last_l);
+                        sel.start <= g_start && sel.end > g_end
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if is_sel {
+                    ui.painter().rect_filled(
+                        egui::Rect::from_min_size(
+                            rect.min,
+                            egui::vec2((content_w * 0.12).clamp(16.0, 48.0), total_h),
+                        ),
+                        2.0,
+                        theme.selection_bg,
+                    );
+                }
+                if wysiwyg && !read_only && !state.autoscroll_active {
+                    if resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+                    }
+                    if resp.clicked() && !source_lines.is_empty() {
+                        let click_y = resp
+                            .interact_pointer_pos()
+                            .map(|p| p.y)
+                            .unwrap_or(rect.center().y);
+                        let frac = ((click_y - rect.top()) / total_h.max(1.0)).clamp(0.0, 0.999);
+                        let line_idx = (source_lines.start
+                            + (frac * source_lines.len() as f32) as usize)
+                            .min(source_lines.end - 1);
+                        let single_line = line_idx..(line_idx + 1);
+                        activate_wysiwyg_block(
+                            Some(ui),
+                            buf,
+                            &single_line,
+                            ActiveBlockKind::Paragraph,
+                            content_w,
+                            theme,
+                            show_markup,
+                            Some(rect),
+                            resp.interact_pointer_pos(),
+                            1,
+                            state,
+                        );
+                    }
+                }
+            }
+        }
         DocBlock::FootnoteDefinition {
             name,
             blocks,
@@ -6769,13 +7284,13 @@ fn present_galley_text_chunk(
             {
                 tracker.primary_link_clicked = true;
                 outcome = RunsClickOutcome::Action(nav_target_action(target));
-            } else if !read_only && !cmd_down && !src_lines.is_empty() {
+            } else if !read_only && !tracker.wysiwyg_mode && !cmd_down && !src_lines.is_empty() {
                 outcome = RunsClickOutcome::Action(ReaderAction::JumpToSourceLine(src_lines.start));
             }
         }
 
         if !tracker.primary_link_clicked {
-            if resp.triple_clicked_by(egui::PointerButton::Primary) {
+            if !tracker.wysiwyg_mode && resp.triple_clicked_by(egui::PointerButton::Primary) {
                 tracker.sel_anchor = Some(ReaderTextPos {
                     doc_line,
                     chunk_idx,
@@ -6790,7 +7305,8 @@ fn present_galley_text_chunk(
                 tracker.sel_all = false;
                 tracker.sel_anchor_y = resp.rect.center().y;
                 tracker.sel_cleared_by_click = false;
-            } else if resp.double_clicked_by(egui::PointerButton::Primary) {
+            } else if !tracker.wysiwyg_mode && resp.double_clicked_by(egui::PointerButton::Primary)
+            {
                 if let Some(pos) = resp
                     .interact_pointer_pos()
                     .or_else(|| ui.input(|i| i.pointer.interact_pos()))
@@ -6832,6 +7348,9 @@ fn present_galley_text_chunk(
                     tracker.sel_dragging = true;
                     tracker.sel_all = false;
                     tracker.sel_cleared_by_click = false;
+                    if tracker.wysiwyg_mode {
+                        tracker.clear_active_block = true;
+                    }
                 }
             } else if tracker.sel_dragging && ui.input(|i| i.pointer.primary_down()) {
                 if let Some(ptr) =
@@ -6862,6 +7381,24 @@ fn present_galley_text_chunk(
                             tracker.sel_focus = Some(start_p);
                         }
                     }
+                }
+            } else if resp.clicked_by(egui::PointerButton::Primary)
+                && ui.input(|i| i.modifiers.shift)
+                && tracker.wysiwyg_mode
+                && tracker.sel_anchor.is_some()
+            {
+                if let Some(pos) = resp
+                    .interact_pointer_pos()
+                    .or_else(|| ui.input(|i| i.pointer.interact_pos()))
+                {
+                    tracker.sel_focus = Some(ReaderTextPos {
+                        doc_line,
+                        chunk_idx,
+                        char_idx: pos_to_log(pos),
+                    });
+                    tracker.sel_all = false;
+                    tracker.sel_cleared_by_click = false;
+                    tracker.clear_active_block = true;
                 }
             } else if resp.clicked_by(egui::PointerButton::Primary)
                 && !ui.input(|i| i.modifiers.shift)

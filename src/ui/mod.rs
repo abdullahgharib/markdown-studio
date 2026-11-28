@@ -2379,25 +2379,41 @@ impl MarkdownApp {
         if mutation_for_wysiwyg && self.view_mode == ViewMode::Wysiwyg {
             self.sync_ast_if_needed();
             let target_line = self.buffer.char_to_line(self.buffer.cursor_char);
-            let needs_reactivate = self.reader_state.active_block_lines.as_ref().is_none_or(|r| {
-                !r.contains(&target_line) || !block_index_contains_range(&self.block_index, r)
+            let sel_multiblock = self.buffer.selection_range().is_some_and(|r| {
+                let start_l = self.buffer.char_to_line(r.start);
+                let end_l = self.buffer.char_to_line(r.end.saturating_sub(1).max(r.start));
+                start_l != end_l
+                    && self
+                        .reader_state
+                        .active_block_lines
+                        .as_ref()
+                        .is_none_or(|b| start_l < b.start || end_l >= b.end)
             });
-            if needs_reactivate {
-                let saved_anchor = self.buffer.selection_anchor;
-                let saved_cursor = self.buffer.cursor_char;
-                let saved_cached = self.buffer.cached_selection;
-                activate_wysiwyg_at_line(
-                    &mut self.buffer,
-                    &self.block_index,
-                    target_line,
-                    self.show_markup,
-                    &mut self.reader_state,
-                );
-                self.buffer.selection_anchor = saved_anchor;
-                self.buffer.cursor_char = saved_cursor;
-                self.buffer.cached_selection = saved_cached;
-                self.reader_state.sync_cursor_from_buf = true;
-                self.reader_state.focus_inline_editor = true;
+            if sel_multiblock {
+                self.reader_state.active_block_lines = None;
+                self.reader_state.focus_inline_editor = false;
+                self.reader_state.sync_reader_sel_from_buf(&self.buffer);
+            } else {
+                let needs_reactivate = self.reader_state.active_block_lines.as_ref().is_none_or(|r| {
+                    !r.contains(&target_line) || !block_index_contains_range(&self.block_index, r)
+                });
+                if needs_reactivate {
+                    let saved_anchor = self.buffer.selection_anchor;
+                    let saved_cursor = self.buffer.cursor_char;
+                    let saved_cached = self.buffer.cached_selection;
+                    activate_wysiwyg_at_line(
+                        &mut self.buffer,
+                        &self.block_index,
+                        target_line,
+                        self.show_markup,
+                        &mut self.reader_state,
+                    );
+                    self.buffer.selection_anchor = saved_anchor;
+                    self.buffer.cursor_char = saved_cursor;
+                    self.buffer.cached_selection = saved_cached;
+                    self.reader_state.sync_cursor_from_buf = true;
+                    self.reader_state.focus_inline_editor = true;
+                }
             }
             ctx.request_repaint();
         }
@@ -3310,17 +3326,40 @@ impl MarkdownApp {
                     });
                 }
 
+        if !modal_before_toolbar && !self.context_menu.is_open() {
+            if self.view_mode == ViewMode::Reader
+                && self.reader_state.image_lightbox.is_none()
+                && !self.toolbar_state.renaming_file
+                && !self.find_bar.has_input_focus(ctx)
+                && !ctx.wants_keyboard_input()
+                && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::A))
+            {
+                self.select_all_in_reader();
+                ctx.request_repaint();
+            } else if self.view_mode == ViewMode::Wysiwyg
+                && self.reader_state.image_label_editor.is_none()
+                && !self.reader_state.code_lang_has_focus
+                && !self.toolbar_state.renaming_file
+                && !self.find_bar.has_input_focus(ctx)
+                && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::A))
+            {
+                self.select_all_in_wysiwyg();
+                ctx.request_repaint();
+            }
+        }
+
         if !modal_before_toolbar
             && !self.context_menu.is_open()
-            && self.view_mode == ViewMode::Reader
-            && self.reader_state.image_lightbox.is_none()
+            && self.view_mode == ViewMode::Wysiwyg
+            && self.reader_state.active_block_lines.is_none()
+            && self.reader_state.image_label_editor.is_none()
+            && !self.reader_state.code_lang_has_focus
             && !self.toolbar_state.renaming_file
             && !self.find_bar.has_input_focus(ctx)
             && !ctx.wants_keyboard_input()
-            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::A))
+            && self.buffer.selection_range().is_some()
         {
-            self.select_all_in_reader();
-            ctx.request_repaint();
+            self.handle_wysiwyg_doc_selection_input(ctx);
         }
 
         let shortcut_action = self.handle_shortcuts(ctx);
@@ -4569,6 +4608,243 @@ impl MarkdownApp {
         self.reader_state.reader_selected_text = (!plain.is_empty()).then_some(plain);
     }
 
+    /// Selects the entire document in WYSIWYG mode (Word/Notepad-style full-document selection).
+    pub fn select_all_in_wysiwyg(&mut self) {
+        let total = self.buffer.len_chars();
+        self.reader_state.active_block_lines = None;
+        self.reader_state.focus_inline_editor = false;
+        self.reader_state.sync_cursor_from_buf = false;
+        if total > 0 {
+            self.buffer.selection_anchor = Some(0);
+            self.buffer.cursor_char = total;
+            self.buffer.cache_current_selection();
+            let plain = markdown_to_plain_text(&self.buffer.as_string());
+            self.reader_state.reader_sel_all = true;
+            self.reader_state.reader_sel_anchor = None;
+            self.reader_state.reader_sel_focus = None;
+            self.reader_state.reader_sel_dragging = false;
+            self.reader_state.reader_selected_text = (!plain.is_empty()).then_some(plain);
+        } else {
+            self.buffer.set_cursor(0, false);
+            self.reader_state.clear_reader_selection();
+        }
+    }
+
+    fn handle_wysiwyg_doc_selection_input(&mut self, ctx: &egui::Context) {
+        let Some(sel) = self.buffer.selection_range() else {
+            return;
+        };
+
+        #[derive(Default)]
+        struct DocSelEvents {
+            copy: bool,
+            cut: bool,
+            paste: Option<String>,
+            plain_paste_shortcut: bool,
+            backspace: bool,
+            delete: bool,
+            enter: bool,
+            text: String,
+            arrow_dir: Option<(i8, bool)>, // (-1 left, 1 right, -2 up, 2 down), shift
+        }
+
+        let mut evs = DocSelEvents::default();
+        ctx.input_mut(|i| {
+            let mut keep = Vec::with_capacity(i.events.len());
+            for ev in i.events.drain(..) {
+                match ev {
+                    egui::Event::Copy => evs.copy = true,
+                    egui::Event::Cut => evs.cut = true,
+                    egui::Event::Paste(s) => {
+                        evs.paste = Some(s);
+                    }
+                    egui::Event::Text(ref s)
+                        if !s.is_empty()
+                            && !i.modifiers.ctrl
+                            && !i.modifiers.command
+                            && !i.modifiers.mac_cmd
+                            && !s.chars().all(|c| c.is_control()) =>
+                    {
+                        evs.text.push_str(s);
+                    }
+                    egui::Event::Key {
+                        key,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } => {
+                        let cmd = modifiers.command || modifiers.ctrl || modifiers.mac_cmd;
+                        if key == Key::V && cmd && modifiers.shift && !modifiers.alt {
+                            evs.plain_paste_shortcut = true;
+                        } else if key == Key::Backspace && !cmd && !modifiers.alt {
+                            evs.backspace = true;
+                        } else if key == Key::Delete && !cmd && !modifiers.alt {
+                            evs.delete = true;
+                        } else if key == Key::Enter && !cmd && !modifiers.alt {
+                            evs.enter = true;
+                        } else if matches!(
+                            key,
+                            Key::ArrowLeft | Key::ArrowRight | Key::ArrowUp | Key::ArrowDown
+                        ) && !cmd
+                            && !modifiers.alt
+                        {
+                            let dir = match key {
+                                Key::ArrowLeft => -1,
+                                Key::ArrowRight => 1,
+                                Key::ArrowUp => -2,
+                                Key::ArrowDown => 2,
+                                _ => 0,
+                            };
+                            evs.arrow_dir = Some((dir, modifiers.shift));
+                        } else {
+                            keep.push(ev);
+                        }
+                    }
+                    other => keep.push(other),
+                }
+            }
+            i.events = keep;
+        });
+
+        if evs.copy {
+            let sel_md = self.buffer.selected_text();
+            let plain = markdown_to_plain_text(&sel_md);
+            if !sel_md.is_empty() {
+                self.copy_rich_to_clipboard(ctx, plain, &sel_md);
+            }
+            return;
+        }
+
+        if evs.cut {
+            let sel_md = self.buffer.selected_text();
+            let plain = markdown_to_plain_text(&sel_md);
+            if !sel_md.is_empty() {
+                self.copy_rich_to_clipboard(ctx, plain, &sel_md);
+            }
+            self.buffer.remove(sel.clone());
+            self.buffer.set_cursor(sel.start.min(self.buffer.len_chars()), false);
+            self.reader_state.clear_reader_selection();
+            self.sync_ast_if_needed();
+            self.sync_wysiwyg_after_buffer_edit();
+            ctx.request_repaint();
+            return;
+        }
+
+        if evs.paste.is_some() || evs.plain_paste_shortcut {
+            let plain_only = evs.plain_paste_shortcut || ctx.input(|i| i.modifiers.shift);
+            let raw_opt = evs
+                .paste
+                .filter(|s| !s.is_empty())
+                .or_else(|| self.test_clipboard_text.clone())
+                .or_else(crate::document::clipboard::read_os_clipboard_plain_text);
+            if let Some(raw) = raw_opt
+                && !raw.is_empty()
+            {
+                let replacement = if plain_only {
+                    raw
+                } else {
+                    let html = self.test_clipboard_html.clone().or_else(|| {
+                        crate::document::clipboard::read_os_clipboard_html_matching(&raw)
+                    });
+                    crate::document::clipboard::smart_paste_markdown(&raw, html.as_deref())
+                };
+                let ins_chars = replacement.chars().count();
+                self.buffer.replace_range(sel.clone(), &replacement);
+                self.buffer
+                    .set_cursor((sel.start + ins_chars).min(self.buffer.len_chars()), false);
+                self.reader_state.clear_reader_selection();
+                self.sync_ast_if_needed();
+                self.sync_wysiwyg_after_buffer_edit();
+                ctx.request_repaint();
+            }
+            return;
+        }
+
+        if evs.backspace || evs.delete {
+            self.buffer.remove(sel.clone());
+            self.buffer.set_cursor(sel.start.min(self.buffer.len_chars()), false);
+            self.reader_state.clear_reader_selection();
+            self.sync_ast_if_needed();
+            self.sync_wysiwyg_after_buffer_edit();
+            ctx.request_repaint();
+            return;
+        }
+
+        if evs.enter {
+            let le = self.buffer.line_ending();
+            let le_chars = le.chars().count();
+            self.buffer.replace_range(sel.clone(), le);
+            self.buffer
+                .set_cursor((sel.start + le_chars).min(self.buffer.len_chars()), false);
+            self.reader_state.clear_reader_selection();
+            self.sync_ast_if_needed();
+            self.sync_wysiwyg_after_buffer_edit();
+            ctx.request_repaint();
+            return;
+        }
+
+        if !evs.text.is_empty() {
+            let ins_chars = evs.text.chars().count();
+            self.buffer.replace_range(sel.clone(), &evs.text);
+            self.buffer
+                .set_cursor((sel.start + ins_chars).min(self.buffer.len_chars()), false);
+            self.reader_state.clear_reader_selection();
+            self.sync_ast_if_needed();
+            self.sync_wysiwyg_after_buffer_edit();
+            ctx.request_repaint();
+            return;
+        }
+
+        if let Some((dir, shift)) = evs.arrow_dir {
+            if !shift {
+                let target_char = if dir < 0 { sel.start } else { sel.end };
+                self.buffer
+                    .set_cursor(target_char.min(self.buffer.len_chars()), false);
+                self.reader_state.clear_reader_selection();
+                self.sync_wysiwyg_after_buffer_edit();
+                ctx.request_repaint();
+            } else {
+                let anchor = self.buffer.selection_anchor.unwrap_or(sel.start);
+                let cur = self.buffer.cursor_char;
+                let total = self.buffer.len_chars();
+                let next_cur = match dir {
+                    -1 => cur.saturating_sub(1),
+                    1 => (cur + 1).min(total),
+                    -2 => {
+                        let (line, col) = self.buffer.char_to_line_col(cur);
+                        if line > 0 {
+                            let prev_len = self.buffer.line_len_without_newline(line - 1);
+                            self.buffer.line_to_char(line - 1) + col.min(prev_len)
+                        } else {
+                            0
+                        }
+                    }
+                    2 => {
+                        let (line, col) = self.buffer.char_to_line_col(cur);
+                        if line + 1 < self.buffer.len_lines() {
+                            let next_len = self.buffer.line_len_without_newline(line + 1);
+                            self.buffer.line_to_char(line + 1) + col.min(next_len)
+                        } else {
+                            total
+                        }
+                    }
+                    _ => cur,
+                };
+                self.buffer.selection_anchor = Some(anchor);
+                self.buffer.cursor_char = next_cur;
+                if anchor == next_cur {
+                    self.buffer.set_cursor(next_cur, false);
+                    self.reader_state.clear_reader_selection();
+                    self.sync_wysiwyg_after_buffer_edit();
+                } else {
+                    self.buffer.cache_current_selection();
+                    self.reader_state.sync_reader_sel_from_buf(&self.buffer);
+                }
+                ctx.request_repaint();
+            }
+        }
+    }
+
     /// Builds the context menu item hierarchy for the currently open `ContextMenuTarget`.
     pub fn build_active_context_menu_items(&self) -> Vec<ContextMenuItem<ContextMenuAction>> {
         let Some(ref target) = self.context_menu.target else {
@@ -4748,8 +5024,10 @@ impl MarkdownApp {
             ContextMenuAction::SelectAll => {
                 let from_reader = read_only
                     || matches!(self.context_menu.target, Some(ContextMenuTarget::Reader { .. }));
-                if from_reader {
+                if from_reader && self.view_mode != ViewMode::Wysiwyg {
                     self.select_all_in_reader();
+                } else if self.view_mode == ViewMode::Wysiwyg {
+                    self.select_all_in_wysiwyg();
                 } else {
                     let total = self.buffer.len_chars();
                     if total > 0 {
@@ -4758,10 +5036,6 @@ impl MarkdownApp {
                         self.buffer.cache_current_selection();
                     } else {
                         self.buffer.set_cursor(0, false);
-                    }
-                    if self.view_mode == ViewMode::Wysiwyg {
-                        self.reader_state.sync_cursor_from_buf = true;
-                        self.reader_state.focus_inline_editor = true;
                     }
                     self.refocus_active_editor();
                 }
@@ -4981,6 +5255,22 @@ impl MarkdownApp {
 
     fn sync_wysiwyg_after_buffer_edit(&mut self) {
         if self.view_mode == ViewMode::Wysiwyg {
+            let sel_multiblock = self.buffer.selection_range().is_some_and(|r| {
+                let start_l = self.buffer.char_to_line(r.start);
+                let end_l = self.buffer.char_to_line(r.end.saturating_sub(1).max(r.start));
+                start_l != end_l
+                    && self
+                        .reader_state
+                        .active_block_lines
+                        .as_ref()
+                        .is_none_or(|b| start_l < b.start || end_l >= b.end)
+            });
+            if sel_multiblock {
+                self.reader_state.active_block_lines = None;
+                self.reader_state.focus_inline_editor = false;
+                self.reader_state.sync_reader_sel_from_buf(&self.buffer);
+                return;
+            }
             let target_line = self.buffer.char_to_line(self.buffer.cursor_char);
             if !activate_wysiwyg_preserving_selection(
                 &self.buffer,
@@ -4990,7 +5280,12 @@ impl MarkdownApp {
                 &mut self.reader_state,
             ) {
                 self.reader_state.active_block_lines = None;
+                if self.buffer.selection_range().is_some() {
+                    self.reader_state.sync_reader_sel_from_buf(&self.buffer);
+                    return;
+                }
             }
+            self.reader_state.clear_reader_selection();
             self.reader_state.focus_inline_editor = true;
         }
         self.refocus_active_editor();

@@ -844,7 +844,8 @@ fn offset_block_source_lines(block: &mut DocBlock, delta: usize) {
         | DocBlock::Paragraph { source_lines, .. }
         | DocBlock::CodeBlock { source_lines, .. }
         | DocBlock::Table { source_lines, .. }
-        | DocBlock::ThematicBreak { source_lines } => {
+        | DocBlock::ThematicBreak { source_lines }
+        | DocBlock::BlankLines { source_lines, .. } => {
             source_lines.start += delta;
             source_lines.end += delta;
         }
@@ -990,6 +991,95 @@ fn preprocess_rope_for_ir_cancellable(
     Some((out, metas, split_points, has_cross_chunk_refs))
 }
 
+fn stripped_lines_for_blank_scan(stripped: &str) -> Vec<&str> {
+    if stripped.is_empty() {
+        return Vec::new();
+    }
+    let mut lines: Vec<&str> = stripped.split('\n').collect();
+    if stripped.ends_with('\n') {
+        lines.pop();
+    }
+    for l in &mut lines {
+        if let Some(clean) = l.strip_suffix('\r') {
+            *l = clean;
+        }
+    }
+    lines
+}
+
+fn push_blank_gap_blocks(
+    out: &mut Vec<DocBlock>,
+    lines: &[&str],
+    gap_start: usize,
+    gap_end: usize,
+    subtract_one_standard_gap: bool,
+) {
+    let end = gap_end.min(lines.len());
+    if gap_start >= end {
+        return;
+    }
+    let mut i = gap_start;
+    while i < end {
+        if !lines[i].trim().is_empty() {
+            i += 1;
+            continue;
+        }
+        let run_start = i;
+        while i < end && lines[i].trim().is_empty() {
+            i += 1;
+        }
+        let run_len = i - run_start;
+        let extra = if subtract_one_standard_gap {
+            run_len.saturating_sub(1)
+        } else {
+            run_len
+        };
+        if extra > 0 {
+            let src_start = if subtract_one_standard_gap {
+                run_start + 1
+            } else {
+                run_start
+            };
+            out.push(DocBlock::BlankLines {
+                count: extra,
+                source_lines: src_start..i,
+            });
+        }
+    }
+}
+
+/// Inserts `DocBlock::BlankLines` nodes for intentional extra blank lines (2+ consecutive empty lines
+/// between or after blocks, or 1+ leading empty lines before the first block) without mutating source.
+fn insert_blank_line_blocks(blocks: Vec<DocBlock>, stripped: &str) -> Vec<DocBlock> {
+    if blocks.is_empty() {
+        return blocks;
+    }
+    let lines = stripped_lines_for_blank_scan(stripped);
+    if lines.is_empty() {
+        return blocks;
+    }
+    let mut out = Vec::with_capacity(blocks.len() + 8);
+
+    let mut prev_end = 0usize;
+    for (idx, block) in blocks.into_iter().enumerate() {
+        let range = block.source_lines();
+        if idx == 0 {
+            if range.start > 0 {
+                push_blank_gap_blocks(&mut out, &lines, 0, range.start, false);
+            }
+        } else if range.start > prev_end {
+            push_blank_gap_blocks(&mut out, &lines, prev_end, range.start, true);
+        }
+        prev_end = prev_end.max(range.end);
+        out.push(block);
+    }
+
+    if prev_end < lines.len() {
+        push_blank_gap_blocks(&mut out, &lines, prev_end, lines.len(), true);
+    }
+    out
+}
+
 fn convert_preprocessed_to_ir(stripped: &str, line_metas: &[LineMeta]) -> Vec<DocBlock> {
     let arena = Arena::new();
     let opts = gfm_options();
@@ -1004,7 +1094,8 @@ fn convert_preprocessed_to_ir(stripped: &str, line_metas: &[LineMeta]) -> Vec<Do
 /// Parses a Markdown string into the shared `DocBlock` intermediate representation.
 pub fn parse_to_ir(markdown: &str) -> Vec<DocBlock> {
     let (stripped, line_metas) = preprocess_markdown_for_ir(markdown);
-    convert_preprocessed_to_ir(&stripped, &line_metas)
+    let blocks = convert_preprocessed_to_ir(&stripped, &line_metas);
+    insert_blank_line_blocks(blocks, &stripped)
 }
 
 /// Streams a `ropey::Rope` directly into the shared `DocBlock` intermediate representation
@@ -1030,7 +1121,8 @@ pub fn parse_rope_to_ir_cancellable(
 
     let workers = crate::document::adaptive_worker_count(8);
     if has_cross_chunk_refs || workers < 2 || split_points.len() < 2 || stripped.len() < 256 * 1024 {
-        return Some(convert_preprocessed_to_ir(&stripped, &line_metas));
+        let blocks = convert_preprocessed_to_ir(&stripped, &line_metas);
+        return Some(insert_blank_line_blocks(blocks, &stripped));
     }
 
     // Group heading split points into ~`workers` coarse contiguous chunks of >= 48 KB each.
@@ -1052,7 +1144,8 @@ pub fn parse_rope_to_ir_cancellable(
     }
 
     if chunks.len() < 2 {
-        return Some(convert_preprocessed_to_ir(&stripped, &line_metas));
+        let blocks = convert_preprocessed_to_ir(&stripped, &line_metas);
+        return Some(insert_blank_line_blocks(blocks, &stripped));
     }
 
     let mut parsed_chunks: Vec<Option<Vec<DocBlock>>> = vec![None; chunks.len()];
@@ -1087,7 +1180,7 @@ pub fn parse_rope_to_ir_cancellable(
         let blocks = slot?;
         all_blocks.extend(blocks);
     }
-    Some(all_blocks)
+    Some(insert_blank_line_blocks(all_blocks, &stripped))
 }
 
 /// Serializes a `comrak` AST back to canonical CommonMark + GFM Markdown.
@@ -2304,5 +2397,40 @@ mod tests {
         }
         let full_str = rope.to_string();
         assert_eq!(parse_rope_to_ir(&rope), parse_to_ir(&full_str));
+    }
+
+    #[test]
+    fn preserves_extra_blank_lines_and_matches_parallel_parse() {
+        // Standard 1 blank line between paragraphs emits no extra BlankLines block.
+        let standard = "First paragraph.\n\nSecond paragraph.\n";
+        let ir_std = parse_to_ir(standard);
+        assert!(
+            !ir_std
+                .iter()
+                .any(|b| matches!(b, DocBlock::BlankLines { .. })),
+            "standard single blank line should not emit BlankLines: {ir_std:?}"
+        );
+
+        // Two blank lines between paragraphs emits count = 1; leading 2 blank lines emits count = 2.
+        let spaced = "\n\nFirst paragraph.\n\n\nSecond paragraph.\n\n\n\nThird paragraph.\n\n\n";
+        let ir_spaced = parse_to_ir(spaced);
+        let blanks: Vec<(usize, std::ops::Range<usize>)> = ir_spaced
+            .iter()
+            .filter_map(|b| match b {
+                DocBlock::BlankLines {
+                    count,
+                    source_lines,
+                } => Some((*count, source_lines.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(blanks.len(), 4, "expected 4 blank gaps, got {blanks:?}");
+        assert_eq!(blanks[0].0, 2);
+        assert_eq!(blanks[1].0, 1);
+        assert_eq!(blanks[2].0, 2);
+        assert_eq!(blanks[3].0, 1);
+
+        let rope = ropey::Rope::from_str(spaced);
+        assert_eq!(parse_rope_to_ir(&rope), ir_spaced);
     }
 }
